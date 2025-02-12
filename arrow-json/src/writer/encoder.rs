@@ -44,14 +44,14 @@ pub struct EncoderOptions {
 ///
 /// This allows overriding the default encoders for specific data types,
 /// or adding new encoders for custom data types.
-pub trait EncoderFactory: std::fmt::Debug {
+pub trait EncoderFactory: std::fmt::Debug + Send + Sync {
     /// Make an encoder that if returned runs before all of the default encoders.
     /// This can be used to override how e.g. binary data is encoded so that it is an encoded string or an array of integers.
     fn make_default_encoder<'a>(
         &self,
-        _field: &FieldRef,
+        _field: &'a FieldRef,
         _array: &'a dyn Array,
-        _options: &EncoderOptions,
+        _options: &'a EncoderOptions,
     ) -> Result<Option<Box<dyn Encoder + 'a>>, ArrowError> {
         Ok(None)
     }
@@ -77,7 +77,7 @@ pub trait Encoder {
 pub fn make_encoder<'a>(
     field: &'a FieldRef,
     array: &'a dyn Array,
-    options: &EncoderOptions,
+    options: &'a EncoderOptions,
 ) -> Result<Box<dyn Encoder + 'a>, ArrowError> {
     let encoder = make_encoder_impl(field, array, options)?;
     for idx in 0..array.len() {
@@ -89,7 +89,7 @@ pub fn make_encoder<'a>(
 fn make_encoder_impl<'a>(
     field: &'a FieldRef,
     array: &'a dyn Array,
-    options: &EncoderOptions,
+    options: &'a EncoderOptions,
 ) -> Result<Box<dyn Encoder + 'a>, ArrowError> {
     macro_rules! primitive_helper {
         ($t:ty) => {{
@@ -442,7 +442,7 @@ impl<'a, O: OffsetSizeTrait> ListEncoder<'a, O> {
     fn try_new(
         field: &'a FieldRef,
         array: &'a GenericListArray<O>,
-        options: &EncoderOptions,
+        options: &'a EncoderOptions,
     ) -> Result<Self, ArrowError> {
         let nulls = array.logical_nulls();
         let encoder = make_encoder_impl(field, array.values().as_ref(), options)?;
@@ -490,7 +490,7 @@ impl<'a> FixedSizeListEncoder<'a> {
     fn try_new(
         field: &'a FieldRef,
         array: &'a FixedSizeListArray,
-        options: &EncoderOptions,
+        options: &'a EncoderOptions,
     ) -> Result<Self, ArrowError> {
         let nulls = array.logical_nulls();
         let encoder = make_encoder_impl(field, array.values().as_ref(), options)?;
@@ -539,7 +539,7 @@ impl<'a, K: ArrowDictionaryKeyType> DictionaryEncoder<'a, K> {
     fn try_new(
         field: &'a FieldRef,
         array: &'a DictionaryArray<K>,
-        options: &EncoderOptions,
+        options: &'a EncoderOptions,
     ) -> Result<Self, ArrowError> {
         let nulls = array.logical_nulls();
         let encoder = make_encoder_impl(field, array.values().as_ref(), options)?;
@@ -641,7 +641,7 @@ impl<'a> MapEncoder<'a> {
     fn try_new(
         field: &'a FieldRef,
         array: &'a MapArray,
-        options: &EncoderOptions,
+        options: &'a EncoderOptions,
     ) -> Result<Self, ArrowError> {
         let values = array.values();
         let keys = array.keys();
