@@ -28,10 +28,15 @@ use half::f16;
 use lexical_core::FormattedSize;
 use serde::Serializer;
 
+
+/// Configuration options for the JSON encoder.
 #[derive(Debug, Clone, Default)]
 pub struct EncoderOptions {
+    /// Whether to include nulls in the output or elide them.
     pub explicit_nulls: bool,
+    /// Whether to encode structs as JSON objects or JSON arrays of their values.
     pub struct_mode: StructMode,
+    /// An optional hook for customizing encoding behavior.
     pub encoder_factory: Option<Arc<dyn EncoderFactory>>,
 }
 
