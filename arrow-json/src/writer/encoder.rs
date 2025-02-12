@@ -73,6 +73,7 @@ pub trait Encoder {
     fn has_nulls(&self) -> bool;
 }
 
+/// Creates an encoder for the given array and field.
 pub fn make_encoder<'a>(
     field: &'a FieldRef,
     array: &'a dyn Array,

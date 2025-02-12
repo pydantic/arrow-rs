@@ -112,8 +112,7 @@ use crate::StructMode;
 use arrow_array::*;
 use arrow_schema::*;
 
-use encoder::make_encoder;
-pub use encoder::{Encoder, EncoderFactory, EncoderOptions};
+pub use encoder::{Encoder, EncoderFactory, EncoderOptions, make_encoder};
 
 /// This trait defines how to format a sequence of JSON objects to a
 /// byte stream.
