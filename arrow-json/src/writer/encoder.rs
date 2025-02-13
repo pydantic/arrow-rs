@@ -79,18 +79,6 @@ pub fn make_encoder<'a>(
     array: &'a dyn Array,
     options: &'a EncoderOptions,
 ) -> Result<Box<dyn Encoder + 'a>, ArrowError> {
-    let encoder = make_encoder_impl(field, array, options)?;
-    for idx in 0..array.len() {
-        assert!(!encoder.is_null(idx), "root cannot be nullable");
-    }
-    Ok(encoder)
-}
-
-fn make_encoder_impl<'a>(
-    field: &'a FieldRef,
-    array: &'a dyn Array,
-    options: &'a EncoderOptions,
-) -> Result<Box<dyn Encoder + 'a>, ArrowError> {
     macro_rules! primitive_helper {
         ($t:ty) => {{
             let array = array.as_primitive::<$t>();
@@ -168,7 +156,7 @@ fn make_encoder_impl<'a>(
         DataType::Struct(fields) => {
             let array = array.as_struct();
             let encoders = fields.iter().zip(array.columns()).map(|(field, array)| {
-                let encoder = make_encoder_impl(field, array, options)?;
+                let encoder = make_encoder(field, array, options)?;
                 Ok(FieldEncoder{
                     field: field.clone(),
                     encoder,
@@ -445,7 +433,7 @@ impl<'a, O: OffsetSizeTrait> ListEncoder<'a, O> {
         options: &'a EncoderOptions,
     ) -> Result<Self, ArrowError> {
         let nulls = array.logical_nulls();
-        let encoder = make_encoder_impl(field, array.values().as_ref(), options)?;
+        let encoder = make_encoder(field, array.values().as_ref(), options)?;
         Ok(Self {
             offsets: array.offsets().clone(),
             encoder,
@@ -493,7 +481,7 @@ impl<'a> FixedSizeListEncoder<'a> {
         options: &'a EncoderOptions,
     ) -> Result<Self, ArrowError> {
         let nulls = array.logical_nulls();
-        let encoder = make_encoder_impl(field, array.values().as_ref(), options)?;
+        let encoder = make_encoder(field, array.values().as_ref(), options)?;
         Ok(Self {
             encoder,
             value_length: array.value_length().as_usize(),
@@ -542,7 +530,7 @@ impl<'a, K: ArrowDictionaryKeyType> DictionaryEncoder<'a, K> {
         options: &'a EncoderOptions,
     ) -> Result<Self, ArrowError> {
         let nulls = array.logical_nulls();
-        let encoder = make_encoder_impl(field, array.values().as_ref(), options)?;
+        let encoder = make_encoder(field, array.values().as_ref(), options)?;
 
         Ok(Self {
             keys: array.keys().values().clone(),
@@ -654,8 +642,8 @@ impl<'a> MapEncoder<'a> {
             )));
         }
 
-        let keys = make_encoder_impl(field, keys, options)?;
-        let values = make_encoder_impl(field, values, options)?;
+        let keys = make_encoder(field, keys, options)?;
+        let values = make_encoder(field, values, options)?;
 
         // We sanity check nulls as these are currently not enforced by MapArray (#1697)
         if keys.has_nulls() {

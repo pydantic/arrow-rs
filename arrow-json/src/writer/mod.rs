@@ -365,7 +365,11 @@ where
             batch.schema().fields().iter().cloned().collect::<Vec<_>>(),
             false,
         ));
+
         let mut encoder = make_encoder(&field, &array, &self.options)?;
+        for idx in 0..array.len() {
+            assert!(!encoder.is_null(idx), "root cannot be nullable");
+        }
 
         for idx in 0..batch.num_rows() {
             self.format.start_row(&mut buffer, is_first_row)?;
