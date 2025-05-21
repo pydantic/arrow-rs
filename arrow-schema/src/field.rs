@@ -376,6 +376,10 @@ impl Field {
 
     /// Set [`DataType`] of the [`Field`] and returns self.
     ///
+    /// If the [`Field`] contains extension type metadata,
+    /// this information will be cleared, since it may no longer
+    /// be valid for the new [`DataType`].
+    ///
     /// ```
     /// # use arrow_schema::*;
     /// let field = Field::new("c1", DataType::Int64, false)
@@ -384,8 +388,18 @@ impl Field {
     /// assert_eq!(field.data_type(), &DataType::Utf8);
     /// ```
     pub fn with_data_type(mut self, data_type: DataType) -> Self {
+        // If the field has extension type metadata, clear it before updating the data type.
+        self.clear_extension_metadata();
+
         self.set_data_type(data_type);
         self
+    }
+
+    fn clear_extension_metadata(&mut self) {
+        if self.extension_type_name().is_some() || self.extension_type_metadata().is_some() {
+            let _ = self.metadata.remove(EXTENSION_TYPE_METADATA_KEY);
+            let _ = self.metadata.remove(EXTENSION_TYPE_NAME_KEY);
+        }
     }
 
     /// Returns the extension type name of this [`Field`], if set.
@@ -1246,6 +1260,21 @@ mod test {
             true,
         );
         assert!(field1.contains(&field2));
+    }
+
+    #[test]
+    fn test_with_data_type_clears_extension_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert(EXTENSION_TYPE_NAME_KEY.to_string(), "my_ext_type".to_string());
+        metadata.insert(EXTENSION_TYPE_METADATA_KEY.to_string(), "my_ext_metadata".to_string());
+
+        let field = Field::new("field1", DataType::Int64, false)
+            .with_metadata(metadata)
+            .with_data_type(DataType::Utf8);
+
+        assert!(field.extension_type_name().is_none());
+        assert!(field.extension_type_metadata().is_none());
+        assert_eq!(field.data_type(), &DataType::Utf8);
     }
 
     #[cfg(feature = "serde")]
