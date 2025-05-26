@@ -298,6 +298,22 @@ impl ParquetMetaData {
             + self.offset_index.heap_size()
     }
 
+    /// Returns the compressed file size in bytes.
+    pub fn compressed_file_size(&self) -> u64 {
+        self.row_groups
+            .iter()
+            .map(|rg| rg.compressed_size())
+            .sum::<i64>() as u64
+    }
+
+    /// Returns the uncompressed file size in bytes.
+    pub fn uncompressed_file_size(&self) -> u64 {
+        self.row_groups
+            .iter()
+            .map(|rg| rg.total_byte_size)
+            .sum::<i64>() as u64
+    }
+
     /// Override the column index
     pub(crate) fn set_column_index(&mut self, index: Option<ParquetColumnIndex>) {
         self.column_index = index;
