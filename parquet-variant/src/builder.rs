@@ -708,6 +708,19 @@ mod tests {
         let (metadata, value) = builder.finish();
         assert!(!metadata.is_empty());
         assert!(!value.is_empty());
+
+        let variant = Variant::try_new(&metadata, &value).unwrap();
+
+        match variant {
+            Variant::Object(object) => {
+                let val1 = object.field(0).unwrap();
+                assert_eq!(val1, Variant::Int8(42));
+
+                let val2 = object.field(1).unwrap();
+                assert_eq!(val2, Variant::ShortString("John"));
+            }
+            _ => panic!("Expected an object variant, got: {:?}", variant),
+        }
     }
 
     #[test]
