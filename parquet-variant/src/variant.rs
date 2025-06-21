@@ -82,6 +82,14 @@ impl<'a> AsRef<str> for ShortString<'a> {
     }
 }
 
+impl<'a> Deref for ShortString<'a> {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
 /// Represents a [Parquet Variant]
 ///
 /// The lifetimes `'m` and `'v` are for metadata and value buffers, respectively.
