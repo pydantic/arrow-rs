@@ -62,34 +62,6 @@ impl<'a> ShortString<'a> {
     }
 }
 
-impl<'a> From<ShortString<'a>> for &'a str {
-    fn from(value: ShortString<'a>) -> Self {
-        value.0
-    }
-}
-
-impl<'a> TryFrom<&'a str> for ShortString<'a> {
-    type Error = ArrowError;
-
-    fn try_from(value: &'a str) -> Result<Self, Self::Error> {
-        Self::try_new(value)
-    }
-}
-
-impl<'a> AsRef<str> for ShortString<'a> {
-    fn as_ref(&self) -> &str {
-        self.0
-    }
-}
-
-impl<'a> Deref for ShortString<'a> {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        self.0
-    }
-}
-
 /// Represents a [Parquet Variant]
 ///
 /// The lifetimes `'m` and `'v` are for metadata and value buffers, respectively.
@@ -489,7 +461,7 @@ impl<'m, 'v> Variant<'m, 'v> {
     /// # Examples
     ///
     /// ```
-    /// use parquet_variant::Variant;
+    /// use parquet_variant::{Variant};
     ///
     /// // you can extract a string from string variants
     /// let s = "hello!";
