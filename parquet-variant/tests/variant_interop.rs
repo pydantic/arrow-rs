@@ -206,16 +206,17 @@ fn variant_object_builder() {
     let mut builder = VariantBuilder::new();
 
     let mut obj = builder.new_object();
-    obj.append_value("int_field", 1i8);
+    obj.insert("int_field", 1i8).unwrap();
 
     // The double field is actually encoded as decimal4 with scale 8
     // Value: 123456789, Scale: 8 -> 1.23456789
-    obj.append_value("double_field", (123456789i32, 8u8));
-    obj.append_value("boolean_true_field", true);
-    obj.append_value("boolean_false_field", false);
-    obj.append_value("string_field", "Apache Parquet");
-    obj.append_value("null_field", ());
-    obj.append_value("timestamp_field", "2025-04-16T12:34:56.78");
+    obj.insert("double_field", (123456789i32, 8u8)).unwrap();
+    obj.insert("boolean_true_field", true).unwrap();
+    obj.insert("boolean_false_field", false).unwrap();
+    obj.insert("string_field", "Apache Parquet").unwrap();
+    obj.insert("null_field", ()).unwrap();
+    obj.insert("timestamp_field", "2025-04-16T12:34:56.78")
+        .unwrap();
 
     obj.finish();
 

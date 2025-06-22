@@ -1,3 +1,5 @@
+use arrow_schema::ArrowError;
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -308,6 +310,11 @@ impl VariantBuilder {
         }
     }
 
+    // Returns a reference to the ID corresponding to the key
+    fn get_key(&self, key: &str) -> Option<&u32> {
+        self.dict.get(key)
+    }
+
     fn offset(&self) -> usize {
         self.buffer.len()
     }
@@ -484,13 +491,33 @@ impl<'a> ObjectBuilder<'a> {
         }
     }
 
+    fn has_duplicate_field_name(&self, key: &str) -> Result<(), ArrowError> {
+        if let Some(field_name_id) = self.parent.get_key(key) {
+            if self.fields.contains_key(field_name_id) {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "field name {} already exists in this object",
+                    key
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Add a field with key and value to the object
-    pub fn append_value<'m, 'd, T: Into<Variant<'m, 'd>>>(&mut self, key: &str, value: T) {
-        let id = self.parent.add_key(key);
+    pub fn insert<'m, 'd, T: Into<Variant<'m, 'd>>>(
+        &mut self,
+        key: &str,
+        value: T,
+    ) -> Result<(), ArrowError> {
+        self.has_duplicate_field_name(key)?;
+
+        let field_id = self.parent.add_key(key);
         let field_start = self.parent.offset() - self.start_pos;
         self.parent.append_value(value);
-        let res = self.fields.insert(id, field_start);
-        debug_assert!(res.is_none());
+        self.fields.insert(field_id, field_start);
+
+        Ok(())
     }
 
     /// Finalize object with sorted fields
@@ -704,8 +731,8 @@ mod tests {
 
         {
             let mut obj = builder.new_object();
-            obj.append_value("name", "John");
-            obj.append_value("age", 42i8);
+            obj.insert("name", "John").unwrap();
+            obj.insert("age", 42i8).unwrap();
             obj.finish();
         }
 
@@ -720,9 +747,9 @@ mod tests {
 
         {
             let mut obj = builder.new_object();
-            obj.append_value("zebra", "stripes"); // ID = 0
-            obj.append_value("apple", "red"); // ID = 1
-            obj.append_value("banana", "yellow"); // ID = 2
+            obj.insert("zebra", "stripes").unwrap(); // ID = 0
+            obj.insert("apple", "red").unwrap(); // ID = 1
+            obj.insert("banana", "yellow").unwrap(); // ID = 2
             obj.finish();
         }
 
@@ -747,8 +774,8 @@ mod tests {
 
         let mut obj = builder.new_object();
 
-        obj.append_value("zebra", "stripes"); // ID = 0
-        obj.append_value("apple", "red"); // ID = 1
+        obj.insert("zebra", "stripes").unwrap(); // ID = 0
+        obj.insert("apple", "red").unwrap(); // ID = 1
 
         {
             // fields_map is ordered by insertion order (field id)
@@ -776,7 +803,7 @@ mod tests {
             assert_eq!(dict_keys, vec!["zebra", "apple"]);
         }
 
-        obj.append_value("banana", "yellow"); // ID = 2
+        obj.insert("banana", "yellow").unwrap(); // ID = 2
 
         {
             // fields_map is ordered by insertion order (field id)
@@ -810,5 +837,16 @@ mod tests {
         obj.finish();
 
         builder.finish();
+    }
+
+    #[test]
+    fn test_object_insert_duplicate_field_name() {
+        let mut builder = VariantBuilder::new();
+
+        let mut obj = builder.new_object();
+        obj.insert("name", "Ron Artest").unwrap();
+        let res = obj.insert("name", "Metta World Peace");
+
+        assert!(res.is_err());
     }
 }
