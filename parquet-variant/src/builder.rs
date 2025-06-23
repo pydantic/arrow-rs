@@ -72,7 +72,177 @@ fn make_room_for_header(buffer: &mut Vec<u8>, start_pos: usize, header_size: usi
     buffer.copy_within(src_start..src_end, dst_start);
 }
 
-/// Builder for [`Variant`] values
+#[derive(Default)]
+struct VariantBuffer(Vec<u8>);
+
+impl VariantBuffer {
+    fn append_null(&mut self) {
+        self.0.push(primitive_header(VariantPrimitiveType::Null));
+    }
+
+    fn append_bool(&mut self, value: bool) {
+        let primitive_type = if value {
+            VariantPrimitiveType::BooleanTrue
+        } else {
+            VariantPrimitiveType::BooleanFalse
+        };
+        self.0.push(primitive_header(primitive_type));
+    }
+
+    fn append_int8(&mut self, value: i8) {
+        self.0.push(primitive_header(VariantPrimitiveType::Int8));
+        self.0.push(value as u8);
+    }
+
+    fn append_int16(&mut self, value: i16) {
+        self.0.push(primitive_header(VariantPrimitiveType::Int16));
+        self.0.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn append_int32(&mut self, value: i32) {
+        self.0.push(primitive_header(VariantPrimitiveType::Int32));
+        self.0.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn append_int64(&mut self, value: i64) {
+        self.0.push(primitive_header(VariantPrimitiveType::Int64));
+        self.0.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn append_float(&mut self, value: f32) {
+        self.0.push(primitive_header(VariantPrimitiveType::Float));
+        self.0.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn append_double(&mut self, value: f64) {
+        self.0.push(primitive_header(VariantPrimitiveType::Double));
+        self.0.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn append_date(&mut self, value: chrono::NaiveDate) {
+        self.0.push(primitive_header(VariantPrimitiveType::Date));
+        let days_since_epoch = value.signed_duration_since(UNIX_EPOCH_DATE).num_days() as i32;
+        self.0.extend_from_slice(&days_since_epoch.to_le_bytes());
+    }
+
+    fn append_timestamp_micros(&mut self, value: chrono::DateTime<chrono::Utc>) {
+        self.0
+            .push(primitive_header(VariantPrimitiveType::TimestampMicros));
+        let micros = value.timestamp_micros();
+        self.0.extend_from_slice(&micros.to_le_bytes());
+    }
+
+    fn append_timestamp_ntz_micros(&mut self, value: chrono::NaiveDateTime) {
+        self.0
+            .push(primitive_header(VariantPrimitiveType::TimestampNtzMicros));
+        let micros = value.and_utc().timestamp_micros();
+        self.0.extend_from_slice(&micros.to_le_bytes());
+    }
+
+    fn append_decimal4(&mut self, integer: i32, scale: u8) {
+        self.0
+            .push(primitive_header(VariantPrimitiveType::Decimal4));
+        self.0.push(scale);
+        self.0.extend_from_slice(&integer.to_le_bytes());
+    }
+
+    fn append_decimal8(&mut self, integer: i64, scale: u8) {
+        self.0
+            .push(primitive_header(VariantPrimitiveType::Decimal8));
+        self.0.push(scale);
+        self.0.extend_from_slice(&integer.to_le_bytes());
+    }
+
+    fn append_decimal16(&mut self, integer: i128, scale: u8) {
+        self.0
+            .push(primitive_header(VariantPrimitiveType::Decimal16));
+        self.0.push(scale);
+        self.0.extend_from_slice(&integer.to_le_bytes());
+    }
+
+    fn append_binary(&mut self, value: &[u8]) {
+        self.0.push(primitive_header(VariantPrimitiveType::Binary));
+        self.0
+            .extend_from_slice(&(value.len() as u32).to_le_bytes());
+        self.0.extend_from_slice(value);
+    }
+
+    fn append_short_string(&mut self, value: ShortString) {
+        let inner = value.0;
+        self.0.push(short_string_header(inner.len()));
+        self.0.extend_from_slice(inner.as_bytes());
+    }
+
+    fn append_string(&mut self, value: &str) {
+        self.0.push(primitive_header(VariantPrimitiveType::String));
+        self.0
+            .extend_from_slice(&(value.len() as u32).to_le_bytes());
+        self.0.extend_from_slice(value.as_bytes());
+    }
+
+    fn offset(&self) -> usize {
+        self.0.len()
+    }
+
+    fn append_value<'m, 'd, T: Into<Variant<'m, 'd>>>(&mut self, value: T) {
+        let variant = value.into();
+        match variant {
+            Variant::Null => self.append_null(),
+            Variant::BooleanTrue => self.append_bool(true),
+            Variant::BooleanFalse => self.append_bool(false),
+            Variant::Int8(v) => self.append_int8(v),
+            Variant::Int16(v) => self.append_int16(v),
+            Variant::Int32(v) => self.append_int32(v),
+            Variant::Int64(v) => self.append_int64(v),
+            Variant::Date(v) => self.append_date(v),
+            Variant::TimestampMicros(v) => self.append_timestamp_micros(v),
+            Variant::TimestampNtzMicros(v) => self.append_timestamp_ntz_micros(v),
+            Variant::Decimal4 { integer, scale } => self.append_decimal4(integer, scale),
+            Variant::Decimal8 { integer, scale } => self.append_decimal8(integer, scale),
+            Variant::Decimal16 { integer, scale } => self.append_decimal16(integer, scale),
+            Variant::Float(v) => self.append_float(v),
+            Variant::Double(v) => self.append_double(v),
+            Variant::Binary(v) => self.append_binary(v),
+            Variant::String(s) => self.append_string(s),
+            Variant::ShortString(s) => self.append_short_string(s),
+            Variant::Object(_) | Variant::List(_) => {
+                unreachable!("Object and List variants cannot be created through Into<Variant>")
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct FieldMetadataDictionary {
+    field_name_to_id: BTreeMap<String, u32>,
+    field_names: Vec<String>,
+}
+
+impl FieldMetadataDictionary {
+    /// Add field name to dictionary, return its ID
+    fn add_field_name(&mut self, field_name: &str) -> u32 {
+        use std::collections::btree_map::Entry;
+        match self.field_name_to_id.entry(field_name.to_string()) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let id = self.field_names.len() as u32;
+                entry.insert(id);
+                self.field_names.push(field_name.to_string());
+                id
+            }
+        }
+    }
+
+    fn num_field_names(&self) -> usize {
+        self.field_names.len()
+    }
+
+    fn metadata_size(&self) -> usize {
+        self.field_names.iter().map(|k| k.len()).sum()
+    }
+}
+
+/// Top level builder for [`Variant`] values
 ///
 /// # Example: create a Primitive Int8
 /// ```
@@ -148,189 +318,112 @@ fn make_room_for_header(buffer: &mut Vec<u8>, start_pos: usize, header_size: usi
 ///
 /// # Example: [`Variant::List`] of  [`Variant::Object`]s
 ///
-/// THis example shows how to create an list  of objects:
+/// This example shows how to create an list of objects:
 /// ```json
 /// [
-///  {
-///   "first_name": "Jiaying",
-///  "last_name": "Li"
-/// },
 ///   {
-///    "first_name": "Malthe",
-///    "last_name": "Karbo"
-/// }
+///      "id": 1,
+///      "type": "Cauliflower"
+///   },
+///   {
+///      "id": 2,
+///      "type": "Beets"
+///   }
 /// ]
 /// ```
+/// ```
+/// use parquet_variant::{Variant, VariantBuilder};
+/// let mut builder = VariantBuilder::new();
 ///
-/// TODO
+/// // Create a builder that will write elements to the list
+/// let mut list_builder = builder.new_list();
 ///
+/// {
+///     let mut object_builder = list_builder.new_object();
+///     object_builder.append_value("id", 1);
+///     object_builder.append_value("type", "Cauliflower");
+///     object_builder.finish();
+/// }
+///
+/// {
+///     let mut object_builder = list_builder.new_object();
+///     object_builder.append_value("id", 2);
+///     object_builder.append_value("type", "Beets");
+///     object_builder.finish();
+/// }
+///
+/// list_builder.finish();
+/// // Finish the builder to get the metadata and value
+/// let (metadata, value) = builder.finish();
+/// // use the Variant API to verify the result
+/// let variant = Variant::try_new(&metadata, &value).unwrap();
+/// let Variant::List(variant_list) = variant else {
+///   panic!("unexpected variant type");
+/// };
+///
+/// let Variant::Object(obj1) = variant_list.get(0).unwrap() else {
+///     panic!("unexpected variant type");
+/// };
+///
+/// assert_eq!(
+///     obj1.field_by_name("id").unwrap(),
+///     Some(Variant::from(1))
+/// );
+/// assert_eq!(
+///     obj1.field_by_name("type").unwrap(),
+///     Some(Variant::from("Cauliflower"))
+/// );
+///
+/// let Variant::Object(obj2) = variant_list.get(1).unwrap() else {
+///     panic!("unexpected variant type");
+/// };
+///
+/// assert_eq!(
+///     obj2.field_by_name("id").unwrap(),
+///     Some(Variant::from(2))
+/// );
+/// assert_eq!(
+///     obj2.field_by_name("type").unwrap(),
+///     Some(Variant::from("Beets"))
+/// );
+///
+/// ```
 pub struct VariantBuilder {
-    buffer: Vec<u8>,
-    dict: BTreeMap<String, u32>,
-    dict_keys: Vec<String>,
+    buffer: VariantBuffer,
+    field_metadata_dictionary: FieldMetadataDictionary,
 }
 
 impl VariantBuilder {
     pub fn new() -> Self {
         Self {
-            buffer: Vec::new(),
-            dict: BTreeMap::new(),
-            dict_keys: Vec::new(),
+            buffer: VariantBuffer::default(),
+            field_metadata_dictionary: FieldMetadataDictionary::default(),
         }
-    }
-
-    fn append_null(&mut self) {
-        self.buffer
-            .push(primitive_header(VariantPrimitiveType::Null));
-    }
-
-    fn append_bool(&mut self, value: bool) {
-        let primitive_type = if value {
-            VariantPrimitiveType::BooleanTrue
-        } else {
-            VariantPrimitiveType::BooleanFalse
-        };
-        self.buffer.push(primitive_header(primitive_type));
-    }
-
-    fn append_int8(&mut self, value: i8) {
-        self.buffer
-            .push(primitive_header(VariantPrimitiveType::Int8));
-        self.buffer.push(value as u8);
-    }
-
-    fn append_int16(&mut self, value: i16) {
-        self.buffer
-            .push(primitive_header(VariantPrimitiveType::Int16));
-        self.buffer.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn append_int32(&mut self, value: i32) {
-        self.buffer
-            .push(primitive_header(VariantPrimitiveType::Int32));
-        self.buffer.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn append_int64(&mut self, value: i64) {
-        self.buffer
-            .push(primitive_header(VariantPrimitiveType::Int64));
-        self.buffer.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn append_float(&mut self, value: f32) {
-        self.buffer
-            .push(primitive_header(VariantPrimitiveType::Float));
-        self.buffer.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn append_double(&mut self, value: f64) {
-        self.buffer
-            .push(primitive_header(VariantPrimitiveType::Double));
-        self.buffer.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn append_date(&mut self, value: chrono::NaiveDate) {
-        self.buffer
-            .push(primitive_header(VariantPrimitiveType::Date));
-        let days_since_epoch = value.signed_duration_since(UNIX_EPOCH_DATE).num_days() as i32;
-        self.buffer
-            .extend_from_slice(&days_since_epoch.to_le_bytes());
-    }
-
-    fn append_timestamp_micros(&mut self, value: chrono::DateTime<chrono::Utc>) {
-        self.buffer
-            .push(primitive_header(VariantPrimitiveType::TimestampMicros));
-        let micros = value.timestamp_micros();
-        self.buffer.extend_from_slice(&micros.to_le_bytes());
-    }
-
-    fn append_timestamp_ntz_micros(&mut self, value: chrono::NaiveDateTime) {
-        self.buffer
-            .push(primitive_header(VariantPrimitiveType::TimestampNtzMicros));
-        let micros = value.and_utc().timestamp_micros();
-        self.buffer.extend_from_slice(&micros.to_le_bytes());
-    }
-
-    fn append_decimal4(&mut self, integer: i32, scale: u8) {
-        self.buffer
-            .push(primitive_header(VariantPrimitiveType::Decimal4));
-        self.buffer.push(scale);
-        self.buffer.extend_from_slice(&integer.to_le_bytes());
-    }
-
-    fn append_decimal8(&mut self, integer: i64, scale: u8) {
-        self.buffer
-            .push(primitive_header(VariantPrimitiveType::Decimal8));
-        self.buffer.push(scale);
-        self.buffer.extend_from_slice(&integer.to_le_bytes());
-    }
-
-    fn append_decimal16(&mut self, integer: i128, scale: u8) {
-        self.buffer
-            .push(primitive_header(VariantPrimitiveType::Decimal16));
-        self.buffer.push(scale);
-        self.buffer.extend_from_slice(&integer.to_le_bytes());
-    }
-
-    fn append_binary(&mut self, value: &[u8]) {
-        self.buffer
-            .push(primitive_header(VariantPrimitiveType::Binary));
-        self.buffer
-            .extend_from_slice(&(value.len() as u32).to_le_bytes());
-        self.buffer.extend_from_slice(value);
-    }
-
-    fn append_short_string(&mut self, value: ShortString) {
-        let inner = value.0;
-        self.buffer.push(short_string_header(inner.len()));
-        self.buffer.extend_from_slice(inner.as_bytes());
-    }
-
-    fn append_string(&mut self, value: &str) {
-        self.buffer
-            .push(primitive_header(VariantPrimitiveType::String));
-        self.buffer
-            .extend_from_slice(&(value.len() as u32).to_le_bytes());
-        self.buffer.extend_from_slice(value.as_bytes());
-    }
-
-    /// Add key to dictionary, return its ID
-    fn add_key(&mut self, key: &str) -> u32 {
-        use std::collections::btree_map::Entry;
-        match self.dict.entry(key.to_string()) {
-            Entry::Occupied(entry) => *entry.get(),
-            Entry::Vacant(entry) => {
-                let id = self.dict_keys.len() as u32;
-                entry.insert(id);
-                self.dict_keys.push(key.to_string());
-                id
-            }
-        }
-    }
-
-    fn offset(&self) -> usize {
-        self.buffer.len()
     }
 
     /// Create an [`ListBuilder`] for creating [`Variant::List`] values.
     ///
     /// See the examples on [`VariantBuilder`] for usage.
     pub fn new_list(&mut self) -> ListBuilder {
-        ListBuilder::new(self)
+        ListBuilder::new(&mut self.buffer, &mut self.field_metadata_dictionary)
     }
 
     /// Create an [`ObjectBuilder`] for creating [`Variant::Object`] values.
     ///
     /// See the examples on [`VariantBuilder`] for usage.
     pub fn new_object(&mut self) -> ObjectBuilder {
-        ObjectBuilder::new(self)
+        ObjectBuilder::new(&mut self.buffer, &mut self.field_metadata_dictionary)
+    }
+
+    pub fn append_value<'m, 'd, T: Into<Variant<'m, 'd>>>(&mut self, value: T) {
+        self.buffer.append_value(value);
     }
 
     pub fn finish(self) -> (Vec<u8>, Vec<u8>) {
-        let nkeys = self.dict_keys.len();
+        let nkeys = self.field_metadata_dictionary.num_field_names();
 
         // Calculate metadata size
-        let total_dict_size: usize = self.dict_keys.iter().map(|k| k.len()).sum();
+        let total_dict_size: usize = self.field_metadata_dictionary.metadata_size();
 
         // Determine appropriate offset size based on the larger of dict size or total string size
         let max_offset = std::cmp::max(total_dict_size, nkeys);
@@ -351,7 +444,12 @@ impl VariantBuilder {
 
         // Write offsets and string data
         let mut cur_offset = 0;
-        for (i, key) in self.dict_keys.iter().enumerate() {
+        for (i, key) in self
+            .field_metadata_dictionary
+            .field_names
+            .iter()
+            .enumerate()
+        {
             write_offset(
                 &mut metadata[offset_start + i * offset_size as usize..],
                 cur_offset,
@@ -368,34 +466,7 @@ impl VariantBuilder {
             offset_size,
         );
 
-        (metadata, self.buffer)
-    }
-
-    pub fn append_value<'m, 'd, T: Into<Variant<'m, 'd>>>(&mut self, value: T) {
-        let variant = value.into();
-        match variant {
-            Variant::Null => self.append_null(),
-            Variant::BooleanTrue => self.append_bool(true),
-            Variant::BooleanFalse => self.append_bool(false),
-            Variant::Int8(v) => self.append_int8(v),
-            Variant::Int16(v) => self.append_int16(v),
-            Variant::Int32(v) => self.append_int32(v),
-            Variant::Int64(v) => self.append_int64(v),
-            Variant::Date(v) => self.append_date(v),
-            Variant::TimestampMicros(v) => self.append_timestamp_micros(v),
-            Variant::TimestampNtzMicros(v) => self.append_timestamp_ntz_micros(v),
-            Variant::Decimal4 { integer, scale } => self.append_decimal4(integer, scale),
-            Variant::Decimal8 { integer, scale } => self.append_decimal8(integer, scale),
-            Variant::Decimal16 { integer, scale } => self.append_decimal16(integer, scale),
-            Variant::Float(v) => self.append_float(v),
-            Variant::Double(v) => self.append_double(v),
-            Variant::Binary(v) => self.append_binary(v),
-            Variant::String(s) => self.append_string(s),
-            Variant::ShortString(s) => self.append_short_string(s),
-            Variant::Object(_) | Variant::List(_) => {
-                unreachable!("Object and List variants cannot be created through Into<Variant>")
-            }
-        }
+        (metadata, self.buffer.0)
     }
 }
 
@@ -409,59 +480,105 @@ impl Default for VariantBuilder {
 ///
 /// See the examples on [`VariantBuilder`] for usage.
 pub struct ListBuilder<'a> {
-    parent: &'a mut VariantBuilder,
-    start_pos: usize,
+    parent_buffer: &'a mut VariantBuffer,
+    field_metadata_dictionary: &'a mut FieldMetadataDictionary,
     offsets: Vec<usize>,
+
+    buffer: VariantBuffer,
+    pending: bool,
 }
 
 impl<'a> ListBuilder<'a> {
-    fn new(parent: &'a mut VariantBuilder) -> Self {
-        let start_pos = parent.offset();
+    fn new(
+        parent_buffer: &'a mut VariantBuffer,
+        field_metadata_dictionary: &'a mut FieldMetadataDictionary,
+    ) -> Self {
         Self {
-            parent,
-            start_pos,
+            parent_buffer,
+            field_metadata_dictionary,
             offsets: vec![0],
+            buffer: VariantBuffer::default(),
+            pending: false,
         }
     }
 
+    fn check_new_offset(&mut self) {
+        if !self.pending {
+            return;
+        }
+
+        let element_end = self.buffer.offset();
+        self.offsets.push(element_end);
+
+        self.pending = false;
+    }
+
+    pub fn new_object(&mut self) -> ObjectBuilder {
+        self.check_new_offset();
+
+        let obj_builder = ObjectBuilder::new(&mut self.buffer, self.field_metadata_dictionary);
+        self.pending = true;
+
+        obj_builder
+    }
+
+    pub fn new_list(&mut self) -> ListBuilder {
+        self.check_new_offset();
+
+        let list_builder = ListBuilder::new(&mut self.buffer, self.field_metadata_dictionary);
+        self.pending = true;
+
+        list_builder
+    }
+
     pub fn append_value<'m, 'd, T: Into<Variant<'m, 'd>>>(&mut self, value: T) {
-        self.parent.append_value(value);
-        let element_end = self.parent.offset() - self.start_pos;
+        self.check_new_offset();
+
+        self.buffer.append_value(value);
+        let element_end = self.buffer.offset();
         self.offsets.push(element_end);
     }
 
-    pub fn finish(self) {
-        let data_size = self.parent.offset() - self.start_pos;
+    pub fn finish(mut self) {
+        self.check_new_offset();
+
+        let data_size = self.buffer.offset();
         let num_elements = self.offsets.len() - 1;
         let is_large = num_elements > u8::MAX as usize;
         let size_bytes = if is_large { 4 } else { 1 };
         let offset_size = int_size(data_size);
         let header_size = 1 + size_bytes + (num_elements + 1) * offset_size as usize;
 
-        make_room_for_header(&mut self.parent.buffer, self.start_pos, header_size);
+        let parent_start_pos = self.parent_buffer.offset();
+
+        make_room_for_header(&mut self.parent_buffer.0, parent_start_pos, header_size);
 
         // Write header
-        let mut pos = self.start_pos;
-        self.parent.buffer[pos] = array_header(is_large, offset_size);
+        let mut pos = parent_start_pos;
+        self.parent_buffer.0[pos] = array_header(is_large, offset_size);
         pos += 1;
 
         if is_large {
-            self.parent.buffer[pos..pos + 4].copy_from_slice(&(num_elements as u32).to_le_bytes());
+            self.parent_buffer.0[pos..pos + 4]
+                .copy_from_slice(&(num_elements as u32).to_le_bytes());
             pos += 4;
         } else {
-            self.parent.buffer[pos] = num_elements as u8;
+            self.parent_buffer.0[pos] = num_elements as u8;
             pos += 1;
         }
 
         // Write offsets
         for offset in &self.offsets {
             write_offset(
-                &mut self.parent.buffer[pos..pos + offset_size as usize],
+                &mut self.parent_buffer.0[pos..pos + offset_size as usize],
                 *offset,
                 offset_size,
             );
             pos += offset_size as usize;
         }
+
+        // Append values
+        self.parent_buffer.0.extend_from_slice(&self.buffer.0);
     }
 }
 
@@ -469,40 +586,46 @@ impl<'a> ListBuilder<'a> {
 ///
 /// See the examples on [`VariantBuilder`] for usage.
 pub struct ObjectBuilder<'a> {
-    parent: &'a mut VariantBuilder,
-    start_pos: usize,
+    parent_buffer: &'a mut VariantBuffer,
+    field_metadata_dictionary: &'a mut FieldMetadataDictionary,
     fields: BTreeMap<u32, usize>, // (field_id, offset)
+
+    buffer: VariantBuffer,
 }
 
 impl<'a> ObjectBuilder<'a> {
-    fn new(parent: &'a mut VariantBuilder) -> Self {
-        let start_pos = parent.offset();
+    fn new(
+        parent_buffer: &'a mut VariantBuffer,
+        field_metadata_dictionary: &'a mut FieldMetadataDictionary,
+    ) -> Self {
         Self {
-            parent,
-            start_pos,
+            parent_buffer,
+            field_metadata_dictionary,
             fields: BTreeMap::new(),
+
+            buffer: VariantBuffer::default(),
         }
     }
 
     /// Add a field with key and value to the object
     pub fn append_value<'m, 'd, T: Into<Variant<'m, 'd>>>(&mut self, key: &str, value: T) {
-        let id = self.parent.add_key(key);
-        let field_start = self.parent.offset() - self.start_pos;
-        self.parent.append_value(value);
-        let res = self.fields.insert(id, field_start);
+        let field_id = self.field_metadata_dictionary.add_field_name(key);
+        let field_start = self.buffer.offset();
+        self.buffer.append_value(value);
+        let res = self.fields.insert(field_id, field_start);
         debug_assert!(res.is_none());
     }
 
     /// Finalize object with sorted fields
     pub fn finish(self) {
-        let data_size = self.parent.offset() - self.start_pos;
+        let data_size = self.buffer.offset();
         let num_fields = self.fields.len();
         let is_large = num_fields > u8::MAX as usize;
         let size_bytes = if is_large { 4 } else { 1 };
 
         let field_ids_by_sorted_field_name = self
-            .parent
-            .dict
+            .field_metadata_dictionary
+            .field_name_to_id
             .iter()
             .filter_map(|(_, id)| self.fields.contains_key(id).then_some(*id))
             .collect::<Vec<_>>();
@@ -517,25 +640,27 @@ impl<'a> ObjectBuilder<'a> {
             + num_fields * id_size as usize
             + (num_fields + 1) * offset_size as usize;
 
-        make_room_for_header(&mut self.parent.buffer, self.start_pos, header_size);
+        let parent_start_pos = self.parent_buffer.offset();
+
+        make_room_for_header(&mut self.parent_buffer.0, parent_start_pos, header_size);
 
         // Write header
-        let mut pos = self.start_pos;
-        self.parent.buffer[pos] = object_header(is_large, id_size, offset_size);
+        let mut pos = parent_start_pos;
+        self.parent_buffer.0[pos] = object_header(is_large, id_size, offset_size);
         pos += 1;
 
         if is_large {
-            self.parent.buffer[pos..pos + 4].copy_from_slice(&(num_fields as u32).to_le_bytes());
+            self.parent_buffer.0[pos..pos + 4].copy_from_slice(&(num_fields as u32).to_le_bytes());
             pos += 4;
         } else {
-            self.parent.buffer[pos] = num_fields as u8;
+            self.parent_buffer.0[pos] = num_fields as u8;
             pos += 1;
         }
 
         // Write field IDs (sorted order)
         for id in &field_ids_by_sorted_field_name {
             write_offset(
-                &mut self.parent.buffer[pos..pos + id_size as usize],
+                &mut self.parent_buffer.0[pos..pos + id_size as usize],
                 *id as usize,
                 id_size,
             );
@@ -546,17 +671,19 @@ impl<'a> ObjectBuilder<'a> {
         for id in &field_ids_by_sorted_field_name {
             let &offset = self.fields.get(id).unwrap();
             write_offset(
-                &mut self.parent.buffer[pos..pos + offset_size as usize],
+                &mut self.parent_buffer.0[pos..pos + offset_size as usize],
                 offset,
                 offset_size,
             );
             pos += offset_size as usize;
         }
         write_offset(
-            &mut self.parent.buffer[pos..pos + offset_size as usize],
+            &mut self.parent_buffer.0[pos..pos + offset_size as usize],
             data_size,
             offset_size,
         );
+
+        self.parent_buffer.0.extend_from_slice(&self.buffer.0);
     }
 }
 
@@ -758,8 +885,8 @@ mod tests {
             // dict is ordered by field names
             // NOTE: when we support nested objects, we'll want to perform a filter by fields_map field ids
             let dict_metadata = obj
-                .parent
-                .dict
+                .field_metadata_dictionary
+                .field_name_to_id
                 .iter()
                 .map(|(f, i)| (f.as_str(), *i))
                 .collect::<Vec<_>>();
@@ -768,8 +895,8 @@ mod tests {
 
             // dict_keys is ordered by insertion order (field id)
             let dict_keys = obj
-                .parent
-                .dict_keys
+                .field_metadata_dictionary
+                .field_names
                 .iter()
                 .map(|k| k.as_str())
                 .collect::<Vec<_>>();
@@ -786,8 +913,8 @@ mod tests {
             // dict is ordered by field names
             // NOTE: when we support nested objects, we'll want to perform a filter by fields_map field ids
             let dict_metadata = obj
-                .parent
-                .dict
+                .field_metadata_dictionary
+                .field_name_to_id
                 .iter()
                 .map(|(f, i)| (f.as_str(), *i))
                 .collect::<Vec<_>>();
@@ -799,8 +926,8 @@ mod tests {
 
             // dict_keys is ordered by insertion order (field id)
             let dict_keys = obj
-                .parent
-                .dict_keys
+                .field_metadata_dictionary
+                .field_names
                 .iter()
                 .map(|k| k.as_str())
                 .collect::<Vec<_>>();
@@ -810,5 +937,278 @@ mod tests {
         obj.finish();
 
         builder.finish();
+    }
+
+    #[test]
+    fn test_nested_list() {
+        let mut builder = VariantBuilder::new();
+
+        let mut outer_list_builder = builder.new_list();
+
+        {
+            let mut inner_list_builder = outer_list_builder.new_list();
+
+            inner_list_builder.append_value("a");
+            inner_list_builder.append_value("b");
+            inner_list_builder.append_value("c");
+            inner_list_builder.append_value("d");
+
+            inner_list_builder.finish();
+        }
+
+        outer_list_builder.finish();
+
+        let (metadata, value) = builder.finish();
+
+        let Variant::List(outer_list) = Variant::try_new(&metadata, &value).unwrap() else {
+            panic!()
+        };
+
+        assert_eq!(outer_list.len(), 1);
+
+        let Variant::List(inner_list) = outer_list.get(0).unwrap() else {
+            panic!()
+        };
+
+        assert_eq!(
+            vec![
+                Variant::from("a"),
+                Variant::from("b"),
+                Variant::from("c"),
+                Variant::from("d"),
+            ],
+            inner_list.iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_super_nested_list() {
+        /*
+        [[[[[1]]]]]
+        */
+
+        let mut builder = VariantBuilder::new();
+        {
+            let mut list_builder1 = builder.new_list();
+            {
+                let mut list_builder2 = list_builder1.new_list();
+                {
+                    let mut list_builder3 = list_builder2.new_list();
+                    {
+                        let mut list_builder4 = list_builder3.new_list();
+                        {
+                            let mut list_builder5 = list_builder4.new_list();
+                            list_builder5.append_value(1);
+                            list_builder5.finish();
+                        }
+                        list_builder4.finish();
+                    }
+                    list_builder3.finish();
+                }
+                list_builder2.finish();
+            }
+            list_builder1.finish();
+        }
+
+        let (metadata, value) = builder.finish();
+
+        let Variant::List(list1) = Variant::try_new(&metadata, &value).unwrap() else {
+            panic!("expected");
+        };
+
+        assert_eq!(list1.len(), 1);
+
+        let Variant::List(list2) = list1.get(0).unwrap() else {
+            panic!("");
+        };
+
+        assert_eq!(list2.len(), 1);
+
+        let Variant::List(list3) = list2.get(0).unwrap() else {
+            panic!("");
+        };
+
+        assert_eq!(list3.len(), 1);
+        let Variant::List(list4) = list3.get(0).unwrap() else {
+            panic!("");
+        };
+
+        assert_eq!(list4.len(), 1);
+        let Variant::List(list5) = list4.get(0).unwrap() else {
+            panic!("");
+        };
+
+        assert_eq!(list5.len(), 1);
+
+        assert_eq!(list5.get(0).unwrap(), Variant::from(1));
+    }
+
+    #[test]
+    fn test_object_list() {
+        let mut builder = VariantBuilder::new();
+
+        let mut list_builder = builder.new_list();
+
+        {
+            let mut object_builder = list_builder.new_object();
+            object_builder.append_value("id", 1);
+            object_builder.append_value("type", "Cauliflower");
+            object_builder.finish();
+        }
+
+        {
+            let mut object_builder = list_builder.new_object();
+            object_builder.append_value("id", 2);
+            object_builder.append_value("type", "Beets");
+            object_builder.finish();
+        }
+
+        list_builder.finish();
+
+        let (metadata, value) = builder.finish();
+
+        let Variant::List(list) = Variant::try_new(&metadata, &value).unwrap() else {
+            panic!()
+        };
+
+        assert_eq!(list.len(), 2);
+
+        let Variant::Object(obj1) = list.get(0).unwrap() else {
+            panic!()
+        };
+
+        assert_eq!(
+            vec![
+                ("id", Variant::from(1)),
+                ("type", Variant::from("Cauliflower")),
+            ],
+            obj1.iter().collect::<Vec<_>>()
+        );
+
+        let Variant::Object(obj2) = list.get(1).unwrap() else {
+            panic!()
+        };
+
+        assert_eq!(
+            vec![("id", Variant::from(2)), ("type", Variant::from("Beets")),],
+            obj2.iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_object_list2() {
+        let mut builder = VariantBuilder::new();
+
+        let mut list_builder = builder.new_list();
+
+        {
+            let mut object_builder = list_builder.new_object();
+            object_builder.append_value("a", 1);
+            object_builder.finish();
+        }
+
+        {
+            let mut object_builder = list_builder.new_object();
+            object_builder.append_value("b", 2);
+            object_builder.finish();
+        }
+
+        list_builder.finish();
+
+        let (metadata, value) = builder.finish();
+
+        let Variant::List(list) = Variant::try_new(&metadata, &value).unwrap() else {
+            panic!()
+        };
+
+        assert_eq!(list.len(), 2);
+
+        let Variant::Object(obj1) = list.get(0).unwrap() else {
+            panic!()
+        };
+
+        assert_eq!(
+            vec![("a", Variant::from(1)),],
+            obj1.iter().collect::<Vec<_>>()
+        );
+
+        let Variant::Object(obj2) = list.get(1).unwrap() else {
+            panic!()
+        };
+
+        assert_eq!(
+            vec![("b", Variant::from(2)),],
+            obj2.iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_hetergenous_list() {
+        /*
+        [
+            1,
+            { "a": 1 },
+            2,
+            { "b": 2},
+            3
+        ]
+
+        */
+
+        let mut builder = VariantBuilder::new();
+
+        let mut list_builder = builder.new_list();
+
+        list_builder.append_value(1);
+
+        {
+            let mut object_builder = list_builder.new_object();
+            object_builder.append_value("a", 1);
+            object_builder.finish();
+        }
+
+        list_builder.append_value(2);
+
+        {
+            let mut object_builder = list_builder.new_object();
+            object_builder.append_value("b", 2);
+            object_builder.finish();
+        }
+
+        list_builder.append_value(3);
+
+        list_builder.finish();
+
+        let (metadata, value) = builder.finish();
+
+        let Variant::List(list) = Variant::try_new(&metadata, &value).unwrap() else {
+            panic!()
+        };
+
+        assert_eq!(list.len(), 5);
+
+        assert_eq!(list.get(0).unwrap(), Variant::from(1));
+
+        let Variant::Object(obj1) = list.get(1).unwrap() else {
+            panic!()
+        };
+
+        assert_eq!(
+            vec![("a", Variant::from(1)),],
+            obj1.iter().collect::<Vec<_>>()
+        );
+
+        assert_eq!(list.get(2).unwrap(), Variant::from(2));
+
+        let Variant::Object(obj2) = list.get(3).unwrap() else {
+            panic!()
+        };
+
+        assert_eq!(
+            vec![("b", Variant::from(2)),],
+            obj2.iter().collect::<Vec<_>>()
+        );
+
+        assert_eq!(list.get(4).unwrap(), Variant::from(3));
     }
 }
