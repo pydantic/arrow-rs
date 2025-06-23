@@ -591,6 +591,7 @@ pub struct ObjectBuilder<'a> {
     fields: BTreeMap<u32, usize>, // (field_id, offset)
 
     buffer: VariantBuffer,
+    pending: Option<(String, usize)>,
 }
 
 impl<'a> ObjectBuilder<'a> {
@@ -604,11 +605,45 @@ impl<'a> ObjectBuilder<'a> {
             fields: BTreeMap::new(),
 
             buffer: VariantBuffer::default(),
+            pending: None,
         }
+    }
+
+    fn check_pending_new_field(&mut self) {
+        let Some((field_name, field_start)) = self.pending.as_ref() else {
+            return;
+        };
+
+        let field_id = self.field_metadata_dictionary.add_field_name(field_name);
+        self.fields.insert(field_id, *field_start);
+
+        self.pending = None;
+    }
+
+    pub fn new_object(&mut self, key: &str) -> ObjectBuilder {
+        self.check_pending_new_field();
+
+        let field_start = self.buffer.offset();
+        let obj_builder = ObjectBuilder::new(&mut self.buffer, self.field_metadata_dictionary);
+        self.pending = Some((key.to_string(), field_start));
+
+        obj_builder
+    }
+
+    pub fn new_list(&mut self, key: &str) -> ListBuilder {
+        self.check_pending_new_field();
+
+        let field_start = self.buffer.offset();
+        let list_builder = ListBuilder::new(&mut self.buffer, self.field_metadata_dictionary);
+        self.pending = Some((key.to_string(), field_start));
+
+        list_builder
     }
 
     /// Add a field with key and value to the object
     pub fn append_value<'m, 'd, T: Into<Variant<'m, 'd>>>(&mut self, key: &str, value: T) {
+        self.check_pending_new_field();
+
         let field_id = self.field_metadata_dictionary.add_field_name(key);
         let field_start = self.buffer.offset();
         self.buffer.append_value(value);
@@ -617,7 +652,9 @@ impl<'a> ObjectBuilder<'a> {
     }
 
     /// Finalize object with sorted fields
-    pub fn finish(self) {
+    pub fn finish(mut self) {
+        self.check_pending_new_field();
+
         let data_size = self.buffer.offset();
         let num_fields = self.fields.len();
         let is_large = num_fields > u8::MAX as usize;
@@ -1210,5 +1247,101 @@ mod tests {
         );
 
         assert_eq!(list.get(4).unwrap(), Variant::from(3));
+    }
+
+    #[test]
+    fn test_nested_object() {
+        /*
+        {
+            "a": {
+                "b": "c"
+            }
+        }
+        */
+
+        let mut builder = VariantBuilder::new();
+
+        let mut object_builder = builder.new_object();
+
+        {
+            let mut inner_object_builder = object_builder.new_object("a");
+            inner_object_builder.append_value("b", "c");
+            inner_object_builder.finish();
+        }
+
+        object_builder.finish();
+
+        let (metadata, value) = builder.finish();
+
+        let Variant::Object(object) = Variant::try_new(&metadata, &value).unwrap() else {
+            panic!()
+        };
+
+        assert_eq!(object.len(), 1);
+        let Some(inner_object) = object.field_by_name("a").unwrap() else {
+            panic!()
+        };
+
+        let Variant::Object(inner_object) = inner_object else {
+            panic!()
+        };
+
+        assert_eq!(inner_object.len(), 1);
+        assert_eq!(
+            vec![("b", Variant::from("c"))],
+            inner_object.iter().collect::<Vec<_>>()
+        )
+    }
+
+    #[test]
+    fn test_object_with_list_field() {
+        /*
+        {
+            grocery_basket_id: 1,
+            items: ["Cauliflower", "Beets", "Kale"]
+        }
+        */
+
+        let mut builder = VariantBuilder::new();
+
+        let mut object_builder = builder.new_object();
+
+        object_builder.append_value("grocery_basket_id", 1);
+
+        {
+            let mut list_builder = object_builder.new_list("items");
+            list_builder.append_value("Cauliflower");
+            list_builder.append_value("Beets");
+            list_builder.append_value("Kale");
+            list_builder.finish();
+        }
+
+        object_builder.finish();
+
+        let (metadata, value) = builder.finish();
+
+        let Variant::Object(object) = Variant::try_new(&metadata, &value).unwrap() else {
+            panic!()
+        };
+
+        assert_eq!(object.len(), 2);
+
+        assert_eq!(
+            object.field_by_name("grocery_basket_id").unwrap(),
+            Some(Variant::from(1))
+        );
+
+        let Some(Variant::List(items)) = object.field_by_name("items").unwrap() else {
+            panic!()
+        };
+
+        assert_eq!(
+            vec![
+                Variant::from("Cauliflower"),
+                Variant::from("Beets"),
+                Variant::from("Kale")
+            ],
+            items.iter().collect::<Vec<_>>()
+        )
     }
 }
