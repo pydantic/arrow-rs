@@ -589,10 +589,9 @@ impl<'a, 'b> ObjectBuilder<'a, 'b> {
     }
 
     fn upsert_field(&mut self, field_id: u32, field_start: usize) {
-        if let Ok(i) = self.fields.binary_search_by(|(id, _)| id.cmp(&field_id)) {
-            self.fields[i] = (field_id, field_start);
-        } else {
-            self.fields.push((field_id, field_start));
+        match self.fields.iter().position(|&(id, _)| id == field_id) {
+            Some(i) => self.fields[i] = (field_id, field_start),
+            None => self.fields.push((field_id, field_start)),
         }
     }
 
@@ -1183,8 +1182,10 @@ mod tests {
         /*
         {
             "c": {
+                "b": false,
                 "c": "a"
-            }
+            },
+            "b": false,
         }
 
         */
@@ -1194,9 +1195,16 @@ mod tests {
             let mut outer_object_builder = builder.new_object();
             {
                 let mut inner_object_builder = outer_object_builder.new_object("c");
+                inner_object_builder.insert("b", false);
                 inner_object_builder.insert("c", "a");
+
                 inner_object_builder.finish();
             }
+
+            outer_object_builder.insert("b", false);
+
+            // note, we can't guarantee an Objects field is sorted by field id.
+            assert_eq!(outer_object_builder.fields, vec![(1, 0), (0, 10)]);
 
             outer_object_builder.finish();
         }
@@ -1205,15 +1213,17 @@ mod tests {
         let variant = Variant::try_new(&metadata, &value).unwrap();
         let outer_object = variant.as_object().unwrap();
 
-        assert_eq!(outer_object.len(), 1);
-        assert_eq!(outer_object.field_name(0).unwrap(), "c");
+        assert_eq!(outer_object.len(), 2);
+        assert_eq!(outer_object.field_name(0).unwrap(), "b");
 
-        let inner_object_variant = outer_object.field(0).unwrap();
+        let inner_object_variant = outer_object.field(1).unwrap();
         let inner_object = inner_object_variant.as_object().unwrap();
 
-        assert_eq!(inner_object.len(), 1);
-        assert_eq!(inner_object.field_name(0).unwrap(), "c");
-        assert_eq!(inner_object.field(0).unwrap(), Variant::from("a"));
+        assert_eq!(inner_object.len(), 2);
+        assert_eq!(inner_object.field_name(0).unwrap(), "b");
+        assert_eq!(inner_object.field(0).unwrap(), Variant::from(false));
+        assert_eq!(inner_object.field_name(1).unwrap(), "c");
+        assert_eq!(inner_object.field(1).unwrap(), Variant::from("a"));
     }
 
     #[test]
