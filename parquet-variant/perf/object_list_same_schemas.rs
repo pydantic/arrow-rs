@@ -38,7 +38,7 @@ fn main() {
 
     let mut list_builder = variant.new_list();
 
-    for _ in 0..10_000 {
+    for _ in 0..25_000 {
         let mut object_builder = list_builder.new_object();
         object_builder.insert("name", random_string(&mut rng).as_str());
         object_builder.insert("age", random::<u32>(&mut rng, 18..100) as i32);

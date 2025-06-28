@@ -60,9 +60,9 @@ fn bench_object_field_names_reverse_order(c: &mut Criterion) {
             let mut variant = VariantBuilder::new();
             let mut object_builder = variant.new_object();
 
-            for i in 0..1000 {
+            for i in 0..10_000 {
                 object_builder.insert(
-                    format!("{}", 1000 - i).as_str(),
+                    format!("{}", 10_000 - i).as_str(),
                     random_string(&mut rng).as_str(),
                 );
             }
@@ -92,7 +92,7 @@ fn bench_object_list_same_schemas(c: &mut Criterion) {
 
             let mut list_builder = variant.new_list();
 
-            for _ in 0..100 {
+            for _ in 0..200 {
                 let mut object_builder = list_builder.new_object();
                 object_builder.insert("name", random_string(&mut rng).as_str());
                 object_builder.insert("age", random::<u32>(&mut rng, 18..100) as i32);
