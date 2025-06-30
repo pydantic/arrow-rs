@@ -37,9 +37,30 @@ arrow-schema = { workspace = true }
 chrono = { workspace = true }
 serde_json = "1.0"
 base64 = "0.22"
+rand = { version = "0.9", default-features = false, features = [
+    "std",
+    "std_rng",
+    "thread_rng",
+] }
+
+[dev-dependencies]
+criterion = { version = "0.6", default-features = false }
+
 
 [dev-dependencies]
 paste = { version = "1.0" }
 
 
 [lib]
+
+[[bin]]
+name = "object_list_same_schemas"
+path = "./perf/object_list_same_schemas.rs"
+
+[[bin]]
+name = "object_list_unknown_schemas"
+path = "./perf/object_list_unknown_schemas.rs"
+
+[[bench]]
+name = "builder"
+harness = false
