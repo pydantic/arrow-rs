@@ -54,6 +54,10 @@ rand = { version = "0.9", default-features = false, features = [
 ] }
 
 
+[[bin]]
+name = "large"
+path = "perf/large.rs"
+
 [[bench]]
 name = "variant_builder"
 harness = false
