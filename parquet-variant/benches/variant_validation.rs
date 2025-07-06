@@ -19,65 +19,48 @@ extern crate parquet_variant;
 
 use criterion::*;
 
-use parquet_variant::{Variant, VariantBuilder};
+use parquet_variant::{json_to_variant, ObjectBuilder, Variant, VariantBuilder};
 use rand::{distr::Alphanumeric, rngs::StdRng, Rng, SeedableRng};
 
-// generates a string with a 50/50 chance whether it's a short or a long string
-fn random_string(rng: &mut StdRng) -> String {
-    let len = rng.random_range::<usize, _>(1..128);
-
-    rng.sample_iter(&Alphanumeric)
-        .take(len)
-        .map(char::from)
-        .collect()
-}
-
-struct RandomStringGenerator {
-    cursor: usize,
-    table: Vec<String>,
-}
-
-impl RandomStringGenerator {
-    pub fn new(rng: &mut StdRng, capacity: usize) -> Self {
-        let table = (0..capacity)
-            .map(|_| random_string(rng))
-            .collect::<Vec<_>>();
-
-        Self { cursor: 0, table }
-    }
-
-    pub fn next(&mut self) -> &str {
-        let this = &self.table[self.cursor];
-
-        self.cursor = (self.cursor + 1) % self.table.len();
-
-        this
-    }
-}
-
-// generates a large object variant
-// contains 1000 fields
-fn build_large_object(rng: &mut StdRng) -> (Vec<u8>, Vec<u8>) {
-    let mut string_table = RandomStringGenerator::new(rng, 1001);
-
-    let mut builder = VariantBuilder::new();
-    {
-        let mut obj = builder.new_object();
-        for _ in 0..1_000 {
-            let k = string_table.next();
-            obj.insert(k, k);
-        }
-        obj.finish().unwrap();
-    }
-
-    builder.finish()
+fn generate_large_object() -> (Vec<u8>, Vec<u8>) {
+    // 256 elements (keys: 000-255) - each element is an object of 256 elements (240-495) - each
+    // element a list of numbers from 0-127
+    let keys: Vec<String> = (0..=255).map(|n| format!("{n:03}")).collect();
+    let innermost_list: String = format!(
+        "[{}]",
+        (0..=127)
+            .map(|n| format!("{n}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let inner_keys: Vec<String> = (240..=495).map(|n| format!("{n}")).collect();
+    let inner_object = format!(
+        "{{{}:{}}}",
+        inner_keys
+            .iter()
+            .map(|k| format!("\"{k}\""))
+            .collect::<Vec<String>>()
+            .join(format!(":{innermost_list},").as_str()),
+        innermost_list
+    );
+    let json = format!(
+        "{{{}:{}}}",
+        keys.iter()
+            .map(|k| format!("\"{k}\""))
+            .collect::<Vec<String>>()
+            .join(format!(":{inner_object},").as_str()),
+        inner_object
+    );
+    // Manually verify raw JSON value size
+    let mut variant_builder = VariantBuilder::new();
+    json_to_variant(&json, &mut variant_builder).unwrap();
+    variant_builder.finish()
 }
 
 // Generates a large object and performs full validation
 fn bench_validate_large_object(c: &mut Criterion) {
     c.bench_function("bench_validate_large_object", |b| {
-        let mut rng = StdRng::seed_from_u64(42);
-        let (m, v) = build_large_object(&mut rng);
+        let (m, v) = generate_large_object();
 
         b.iter(|| {
             std::hint::black_box(Variant::try_new(&m, &v).unwrap());
