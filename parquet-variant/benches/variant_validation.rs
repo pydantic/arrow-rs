@@ -20,16 +20,7 @@ extern crate parquet_variant;
 use criterion::*;
 
 use parquet_variant::{Variant, VariantBuilder};
-use rand::{
-    distr::{uniform::SampleUniform, Alphanumeric},
-    rngs::StdRng,
-    Rng, SeedableRng,
-};
-use std::{hint, ops::Range};
-
-fn random<T: SampleUniform + PartialEq + PartialOrd>(rng: &mut StdRng, range: Range<T>) -> T {
-    rng.random_range::<T, _>(range)
-}
+use rand::{distr::Alphanumeric, rngs::StdRng, Rng, SeedableRng};
 
 // generates a string with a 50/50 chance whether it's a short or a long string
 fn random_string(rng: &mut StdRng) -> String {
@@ -82,31 +73,6 @@ fn build_large_object(rng: &mut StdRng) -> (Vec<u8>, Vec<u8>) {
     builder.finish()
 }
 
-// generates a large nested object variant
-// contains 100 fields, each pointing to a nested object
-fn build_large_nested_object(rng: &mut StdRng) -> (Vec<u8>, Vec<u8>) {
-    let mut string_table = RandomStringGenerator::new(rng, 3333);
-
-    let mut builder = VariantBuilder::new();
-    {
-        let mut obj = builder.new_object();
-        for _ in 0..1_00 {
-            let k = string_table.next();
-            let mut inner_obj = obj.new_object(k);
-
-            for _ in 0..30 {
-                let inner_k = string_table.next();
-                inner_obj.insert(inner_k, inner_k);
-            }
-
-            inner_obj.finish().unwrap();
-        }
-        obj.finish().unwrap();
-    }
-
-    builder.finish()
-}
-
 // Generates a large object and performs full validation
 fn bench_validate_large_object(c: &mut Criterion) {
     c.bench_function("bench_validate_large_object", |b| {
@@ -119,22 +85,6 @@ fn bench_validate_large_object(c: &mut Criterion) {
     });
 }
 
-// Generates a large object and performs full validation
-fn bench_validate_large_nested_object(c: &mut Criterion) {
-    c.bench_function("bench_validate_large_nested_object", |b| {
-        let mut rng = StdRng::seed_from_u64(42);
-        let (m, v) = build_large_nested_object(&mut rng);
-
-        b.iter(|| {
-            std::hint::black_box(Variant::try_new(&m, &v).unwrap());
-        })
-    });
-}
-
-criterion_group!(
-    benches,
-    bench_validate_large_object,
-    bench_validate_large_nested_object
-);
+criterion_group!(benches, bench_validate_large_object);
 
 criterion_main!(benches);
