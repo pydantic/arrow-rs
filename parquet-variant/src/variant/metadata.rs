@@ -202,6 +202,7 @@ impl<'m> VariantMetadata<'m> {
             .get_offset(dictionary_size)?
             .checked_add(first_value_byte)
             .ok_or_else(|| overflow_error("variant metadata size"))?;
+
         new_self.bytes = slice_from_slice(bytes, ..last_offset)?;
         Ok(new_self)
     }
@@ -218,9 +219,65 @@ impl<'m> VariantMetadata<'m> {
     /// [validation]: Self#Validation
     pub fn with_full_validation(mut self) -> Result<Self, ArrowError> {
         if !self.validated {
-            // Iterate over all string keys in this dictionary in order to prove that the offset
-            // array is valid, all offsets are in bounds, and all string bytes are valid utf-8.
-            validate_fallible_iterator(self.iter_try())?;
+            /*
+                So as @scovich points out, in full validation we need to check the following things:
+                (1) all other offsets are in-bounds (*)
+                (2) all offsets are monotonically increasing (*)
+                (3) all values are valid utf-8 (*)
+
+
+                (1), (2)
+                If we know first and last offsets are in bounds, we just need to check if
+                the offsets inbetween are monotonically increasing.
+                Then we take advantage of this property and know all offsets are in bounds.
+
+
+                (3)
+                Why are we not taking advantage of the fact that values are lined up next to each other?
+                This seems like a great place to do vectorized utf8 validation.
+
+                This also means from now on when we try to get() fields, if it's been fully validated,
+                we can do a String::from_utf8_unchecked <https://doc.rust-lang.org/std/str/fn.from_utf8_unchecked.html>
+            */
+
+            // (1) (2)
+
+            let monotonic_offsets = {
+                // we do this ceremony _once_. See `try_impl` where we do this dictionary_size times
+                let offset_byte_range = self.header.first_offset_byte()..self.first_value_byte;
+                let bytes = slice_from_slice(self.bytes, offset_byte_range)?;
+
+                let offsets = bytes.chunks_exact(self.header.offset_size());
+
+                if !offsets.remainder().is_empty() {
+                    unreachable!("this should be unreachable. We already computed this in shallow validation");
+                };
+
+                offsets
+                    .map(|chunk| match self.header.offset_size {
+                        OffsetSizeBytes::One => u8::from_le_bytes([chunk[0]]).into(),
+                        OffsetSizeBytes::Two => u16::from_le_bytes([chunk[0], chunk[1]]).into(),
+                        OffsetSizeBytes::Three => {
+                            u32::from_le_bytes([0, chunk[0], chunk[1], chunk[2]])
+                        }
+                        OffsetSizeBytes::Four => {
+                            u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                        }
+                    })
+                    .is_sorted_by(|a, b| a < b)
+            };
+
+            if !monotonic_offsets {
+                return Err(ArrowError::InvalidArgumentError(
+                    "Offsets are not strictly monotonically increasing".to_string(),
+                ));
+            }
+
+            // (3)
+            let values = &self.bytes[self.first_value_byte..];
+            simdutf8::basic::from_utf8(values)
+                .map_err(|_| ArrowError::JsonError("Encountered non-UTF-8 data".to_string()))?;
+
             self.validated = true;
         }
         Ok(self)
@@ -362,6 +419,8 @@ mod tests {
 
     #[test]
     fn try_new_fails_non_monotonic() {
+        // this test case will fail when performing shallow validation.
+
         // 'cat', 'dog', 'lamb'
         let bytes = &[
             0b0000_0001, // header, offset_size_minus_one=0 and version=1
@@ -383,6 +442,42 @@ mod tests {
         ];
 
         let err = VariantMetadata::try_new(bytes).unwrap_err();
+        assert!(
+            matches!(err, ArrowError::InvalidArgumentError(_)),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn try_new_fails_non_monotonic2() {
+        // this test case checks whether offsets are monotonic in the full validation logic.
+
+        // 'cat', 'dog', 'lamb', "eel"
+        let bytes = &[
+            0b0000_0001, // header, offset_size_minus_one=0 and version=1
+            4,           // dictionary_size
+            0x00,
+            0x02,
+            0x01, // Doesn't increase monotonically
+            0x10,
+            13,
+            b'c',
+            b'a',
+            b't',
+            b'd',
+            b'o',
+            b'g',
+            b'l',
+            b'a',
+            b'm',
+            b'b',
+            b'e',
+            b'e',
+            b'l',
+        ];
+
+        let err = VariantMetadata::try_new(bytes).unwrap_err();
+
         assert!(
             matches!(err, ArrowError::InvalidArgumentError(_)),
             "unexpected error: {err:?}"
