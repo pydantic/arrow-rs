@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -210,9 +212,126 @@ impl<'m, 'v> VariantObject<'m, 'v> {
             // by value to all the children (who would otherwise re-validate it repeatedly).
             self.metadata = self.metadata.with_full_validation()?;
 
-            // Iterate over all string keys in this dictionary in order to prove that the offset
-            // array is valid, all offsets are in bounds, and all string bytes are valid utf-8.
-            validate_fallible_iterator(self.iter_try())?;
+            /*
+            - all field ids are valid metadata dictionary entries (*)
+
+            * i think we should also check if field ids are unique
+
+            - field ids are lexically ordered according by their corresponding string values (*)
+
+
+            - all field offsets are in bounds (*)
+            - all field values are (recursively) _valid_ variant values (*)
+            - the associated variant metadata is [valid] (*)
+
+            */
+
+            // field id work
+
+            // first we get all field ids
+            // note that we do this ceremony once now!
+            let byte_range = self.header.field_ids_start_byte()..self.first_field_offset_byte;
+            let field_id_bytes = slice_from_slice(self.value, byte_range)?;
+
+            let field_ids = {
+                let field_ids = field_id_bytes.chunks_exact(self.header.field_id_size());
+                assert!(field_ids.remainder().is_empty());
+
+                field_ids
+                    .map(|chunk| match self.header.field_id_size {
+                        OffsetSizeBytes::One => chunk[0].into(),
+                        OffsetSizeBytes::Two => u16::from_le_bytes([chunk[0], chunk[1]]).into(),
+                        OffsetSizeBytes::Three => {
+                            u32::from_le_bytes([0, chunk[0], chunk[1], chunk[2]])
+                        }
+                        OffsetSizeBytes::Four => {
+                            u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            // we should also check that every field id we parsed was unique.
+            let all_unique_field_ids = {
+                let mut seen = HashSet::new();
+                field_ids.iter().all(|id| seen.insert(id))
+            };
+
+            if !all_unique_field_ids {
+                return Err(ArrowError::InvalidArgumentError(
+                    "object contains duplicate field ids".to_string(),
+                ));
+            }
+
+            // now we need to make sure the field ids are lexicographically sorted
+            // we can take advantage of sorted dictionaries here
+
+            let sorted_field_names = if self.metadata.is_sorted() {
+                // if we have a sorted dictionary, we just need to check if field ids are increasing
+                field_ids.is_sorted()
+            } else {
+                // unfortunately, we need to parse out the string and check
+                field_ids
+                    .iter()
+                    .map(|&id| self.metadata.get(id as usize))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .is_sorted()
+            };
+
+            if !sorted_field_names {
+                return Err(ArrowError::InvalidArgumentError(
+                    "field names are not lexicographically sorted".to_string(),
+                ));
+            }
+
+            // now we check field offsets
+            // also note how we do this ceremony once!
+            // let byte_range = self.first_field_offset_byte..self.first_value_byte;
+            // let field_offsets = slice_from_slice(self.value, byte_range)?;
+
+            // let field_offsets = {
+            //     let field_offsets = field_offsets.chunks_exact(self.header.field_offset_size());
+            //     assert!(field_offsets.remainder().is_empty());
+
+            //     field_offsets
+            //         .map(|chunk| match self.header.field_offset_size {
+            //             OffsetSizeBytes::One => chunk[0].into(),
+            //             OffsetSizeBytes::Two => u16::from_le_bytes([chunk[0], chunk[1]]).into(),
+            //             OffsetSizeBytes::Three => {
+            //                 u32::from_le_bytes([0, chunk[0], chunk[1], chunk[2]])
+            //             }
+            //             OffsetSizeBytes::Four => {
+            //                 u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+            //             }
+            //         })
+            //         .collect::<Vec<_>>()
+            // };
+
+            // let field_offsets = &field_offsets[0..field_offsets.len() - 1];
+
+            // // just for sanity check
+            // let old_field_offsets = {
+            //     let mut offsets = Vec::new();
+
+            //     for i in 0..self.num_elements {
+            //         offsets.push(self.get_offset(i)? as u32);
+            //     }
+
+            //     offsets
+            // };
+
+            // assert_eq!(old_field_offsets, field_offsets);
+
+            // let value_bytes = slice_from_slice(self.value, self.first_value_byte..)?;
+
+            // for &offset in field_offsets {
+            //     Variant::try_new_with_metadata(self.metadata, &value_bytes[offset as usize..])?;
+            // }
+
+            for i in 0..self.num_elements {
+                self.try_field(i)?;
+            }
+
             self.validated = true;
         }
         Ok(self)

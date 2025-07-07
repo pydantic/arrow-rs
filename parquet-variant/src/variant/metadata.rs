@@ -17,8 +17,8 @@
 
 use crate::decoder::OffsetSizeBytes;
 use crate::utils::{
-    first_byte_from_slice, overflow_error, slice_from_slice, string_from_slice,
-    validate_fallible_iterator,
+    first_byte_from_slice, overflow_error, slice_from_slice, slice_from_slice_at_offset,
+    string_from_slice,
 };
 
 use arrow_schema::ArrowError;
@@ -225,6 +225,11 @@ impl<'m> VariantMetadata<'m> {
                 (2) all offsets are monotonically increasing (*)
                 (3) all values are valid utf-8 (*)
 
+                Here are some additional validations I think is very important
+                (4) validate sorted dictionaries
+                    if the header marks the variant as sorted, we need to go through all field names and check that they are sorted
+                    this will help us later on in object validation, since we'll just check if the field ids are increasing.
+
 
                 (1), (2)
                 If we know first and last offsets are in bounds, we just need to check if
@@ -242,30 +247,24 @@ impl<'m> VariantMetadata<'m> {
 
             // (1) (2)
 
-            let monotonic_offsets = {
-                // we do this ceremony _once_. See `try_impl` where we do this dictionary_size times
-                let offset_byte_range = self.header.first_offset_byte()..self.first_value_byte;
-                let bytes = slice_from_slice(self.bytes, offset_byte_range)?;
+            // we do this ceremony _once_. See `try_impl` where we do this dictionary_size times
+            let offset_byte_range = self.header.first_offset_byte()..self.first_value_byte;
+            let bytes = slice_from_slice(self.bytes, offset_byte_range)?;
 
-                let offsets = bytes.chunks_exact(self.header.offset_size());
+            let offsets = bytes.chunks_exact(self.header.offset_size());
 
-                if !offsets.remainder().is_empty() {
-                    unreachable!("this should be unreachable. We already computed this in shallow validation");
-                };
+            let offsets = offsets
+                .map(|chunk| match self.header.offset_size {
+                    OffsetSizeBytes::One => u8::from_le_bytes([chunk[0]]).into(),
+                    OffsetSizeBytes::Two => u16::from_le_bytes([chunk[0], chunk[1]]).into(),
+                    OffsetSizeBytes::Three => u32::from_le_bytes([0, chunk[0], chunk[1], chunk[2]]),
+                    OffsetSizeBytes::Four => {
+                        u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                    }
+                })
+                .collect::<Vec<_>>();
 
-                offsets
-                    .map(|chunk| match self.header.offset_size {
-                        OffsetSizeBytes::One => u8::from_le_bytes([chunk[0]]).into(),
-                        OffsetSizeBytes::Two => u16::from_le_bytes([chunk[0], chunk[1]]).into(),
-                        OffsetSizeBytes::Three => {
-                            u32::from_le_bytes([0, chunk[0], chunk[1], chunk[2]])
-                        }
-                        OffsetSizeBytes::Four => {
-                            u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                        }
-                    })
-                    .is_sorted_by(|a, b| a < b)
-            };
+            let monotonic_offsets = offsets.is_sorted_by(|a, b| a < b);
 
             if !monotonic_offsets {
                 return Err(ArrowError::InvalidArgumentError(
@@ -275,8 +274,40 @@ impl<'m> VariantMetadata<'m> {
 
             // (3)
             let values = &self.bytes[self.first_value_byte..];
-            simdutf8::basic::from_utf8(values)
-                .map_err(|_| ArrowError::JsonError("Encountered non-UTF-8 data".to_string()))?;
+            simdutf8::basic::from_utf8(values).map_err(|_| {
+                ArrowError::InvalidArgumentError("Encountered non-UTF-8 data".to_string())
+            })?;
+
+            // (4)
+            if self.header.is_sorted {
+                let mut prev_field_name = None;
+                let mut is_sorted = true;
+
+                for window in offsets.windows(2) {
+                    if !is_sorted {
+                        return Err(ArrowError::InvalidArgumentError(
+                            "Metadata marked as sorted dictionary but field names were not sorted"
+                                .to_string(),
+                        ));
+                    }
+
+                    let start_offset = window[0] as usize;
+                    let end_offset = window[1] as usize;
+
+                    let byte_range = start_offset..end_offset;
+                    let bytes =
+                        slice_from_slice_at_offset(self.bytes, self.first_value_byte, byte_range)?;
+
+                    // safety: we already validated the value buffer to contian valid utf8 bytes
+                    let current_field_name = unsafe { str::from_utf8_unchecked(bytes) };
+
+                    if let Some(prev_field_name) = prev_field_name {
+                        is_sorted = is_sorted && prev_field_name < current_field_name;
+                    }
+
+                    prev_field_name = Some(current_field_name);
+                }
+            }
 
             self.validated = true;
         }
@@ -314,7 +345,16 @@ impl<'m> VariantMetadata<'m> {
     /// [invalid]: Self#Validation
     pub fn get(&self, i: usize) -> Result<&'m str, ArrowError> {
         let byte_range = self.get_offset(i)?..self.get_offset(i + 1)?;
-        string_from_slice(self.bytes, self.first_value_byte, byte_range)
+
+        if self.validated {
+            let bytes = slice_from_slice_at_offset(self.bytes, self.first_value_byte, byte_range)?;
+
+            // safety: full validation checks if contents in the value buffer contain UTF8 bytes.
+            let entry = unsafe { str::from_utf8_unchecked(bytes) };
+            Ok(entry)
+        } else {
+            string_from_slice(self.bytes, self.first_value_byte, byte_range)
+        }
     }
 
     /// Returns an iterator that attempts to visit all dictionary entries, producing `Err` if the
