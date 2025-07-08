@@ -228,6 +228,8 @@ impl<'m> VariantMetadata<'m> {
     /// [validation]: Self#Validation
     pub fn with_full_validation(mut self) -> Result<Self, ArrowError> {
         if !self.validated {
+            dbg!("validating `VariantMetadata`");
+
             // Iterate over all string keys in this dictionary in order to prove that the offset
             // array is valid, all offsets are in bounds, and all string bytes are valid utf-8.
             validate_fallible_iterator(self.iter_try())?;
