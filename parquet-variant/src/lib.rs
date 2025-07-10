@@ -29,8 +29,10 @@
 
 mod builder;
 mod decoder;
+mod shredding;
 mod utils;
 mod variant;
 
 pub use builder::*;
+pub use shredding::*;
 pub use variant::*;

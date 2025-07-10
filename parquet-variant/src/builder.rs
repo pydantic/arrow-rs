@@ -62,7 +62,7 @@ fn write_offset(buf: &mut Vec<u8>, value: usize, nbytes: u8) {
 }
 
 #[derive(Default)]
-struct ValueBuffer(Vec<u8>);
+pub(crate) struct ValueBuffer(Vec<u8>);
 
 impl ValueBuffer {
     fn append_u8(&mut self, term: u8) {
@@ -81,7 +81,7 @@ impl ValueBuffer {
         &self.0
     }
 
-    fn into_inner(self) -> Vec<u8> {
+    pub(crate) fn into_inner(self) -> Vec<u8> {
         self.0
     }
 
@@ -192,7 +192,7 @@ impl ValueBuffer {
         self.0.len()
     }
 
-    fn append_non_nested_value<'m, 'd, T: Into<Variant<'m, 'd>>>(&mut self, value: T) {
+    pub(crate) fn append_non_nested_value<'m, 'd, T: Into<Variant<'m, 'd>>>(&mut self, value: T) {
         let variant = value.into();
         match variant {
             Variant::Null => self.append_null(),

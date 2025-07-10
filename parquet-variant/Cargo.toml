@@ -34,6 +34,7 @@ rust-version = "1.83"
 
 [dependencies]
 arrow-schema = { workspace = true }
+arrow-array = { path = "../arrow-array" }
 chrono = { workspace = true }
 indexmap = "2.10.0"
 
