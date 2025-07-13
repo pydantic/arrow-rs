@@ -17,12 +17,16 @@
 
 //! [`VariantArray`] implementation
 
-use arrow::array::{Array, ArrayData, ArrayRef, AsArray, StructArray};
+use arrow::array::{Array, ArrayData, ArrayRef, AsArray, Datum, StructArray};
 use arrow::buffer::NullBuffer;
-use arrow_schema::{ArrowError, DataType};
+use arrow::datatypes::Int32Type;
+use arrow_schema::{ArrowError, DataType, FieldRef};
 use parquet_variant::Variant;
 use std::any::Any;
+use std::ptr::metadata;
 use std::sync::Arc;
+
+use crate::variant_array_builder::{validate_shredded_schema, METADATA, TYPED_VALUE, VALUE};
 
 /// An array of Parquet [`Variant`] values
 ///
@@ -87,29 +91,8 @@ impl VariantArray {
                 "Invalid VariantArray: requires StructArray as input".to_string(),
             ));
         };
-        // Ensure the StructArray has a metadata field of BinaryView
-        let Some(metadata_field) = inner.fields().iter().find(|f| f.name() == "metadata") else {
-            return Err(ArrowError::InvalidArgumentError(
-                "Invalid VariantArray: StructArray must contain a 'metadata' field".to_string(),
-            ));
-        };
-        if metadata_field.data_type() != &DataType::BinaryView {
-            return Err(ArrowError::NotYetImplemented(format!(
-                "VariantArray 'metadata' field must be BinaryView, got {}",
-                metadata_field.data_type()
-            )));
-        }
-        let Some(value_field) = inner.fields().iter().find(|f| f.name() == "value") else {
-            return Err(ArrowError::InvalidArgumentError(
-                "Invalid VariantArray: StructArray must contain a 'value' field".to_string(),
-            ));
-        };
-        if value_field.data_type() != &DataType::BinaryView {
-            return Err(ArrowError::NotYetImplemented(format!(
-                "VariantArray 'value' field must be BinaryView, got {}",
-                value_field.data_type()
-            )));
-        }
+
+        validate_shredded_schema(inner.fields())?;
 
         Ok(Self {
             inner: inner.clone(),
@@ -132,22 +115,55 @@ impl VariantArray {
     ///
     /// Note: Does not do deep validation of the [`Variant`], so it is up to the
     /// caller to ensure that the metadata and value were constructed correctly.
-    pub fn value(&self, index: usize) -> Variant {
+    pub fn variant(&self, index: usize) -> Variant {
+        // let metadata = self.metadata_field().as_binary_view().value(index);
+        // let value = self.value_field().as_binary_view().value(index);
+
+        // Variant::new(metadata, value)
+
         let metadata = self.metadata_field().as_binary_view().value(index);
-        let value = self.value_field().as_binary_view().value(index);
-        Variant::new(metadata, value)
+
+        let value = self
+            .value_field()
+            .map(|value_field| value_field.as_binary_view().value(index));
+
+        let typed_value = self.typed_value_field().map(|typed_value_field| {
+            typed_value_field.get()
+        })
+
+        // let typed_value = self.typed_value_field().map(|typed_value_field| {
+        //     match typed_value_field.data_type() {
+        //         DataType::Boolean => typed_value_field.as_boolean().value(index),
+        //         DataType::Int32 => typed_value_field.as_primitive::<Int32Type>().value(index),
+        //         DataType::Int64 => todo!(),
+        //         DataType::Float32 => todo!(),
+        //         DataType::Float64 => todo!(),
+        //         DataType::BinaryView => todo!(),
+        //         DataType::Dictionary(data_type, data_type1) => todo!(),
+        //        DataType::Struct(_) => {
+        //             typed_value_field.as_struct()
+        //        }
+        //     }
+
+        // })
     }
 
     /// Return a reference to the metadata field of the [`StructArray`]
     pub fn metadata_field(&self) -> &ArrayRef {
         // spec says fields order is not guaranteed, so we search by name
-        self.inner.column_by_name("metadata").unwrap()
+        self.inner.column_by_name(METADATA).unwrap()
     }
 
     /// Return a reference to the value field of the `StructArray`
-    pub fn value_field(&self) -> &ArrayRef {
+    pub fn value_field(&self) -> Option<&ArrayRef> {
         // spec says fields order is not guaranteed, so we search by name
-        self.inner.column_by_name("value").unwrap()
+        self.inner.column_by_name(VALUE)
+    }
+
+    /// Return a reference to the typed_value field of the `StructArray`
+    pub fn typed_value_field(&self) -> Option<&ArrayRef> {
+        // spec says fields order is not guaranteed, so we search by name
+        self.inner.column_by_name(TYPED_VALUE)
     }
 }
 
@@ -196,6 +212,25 @@ impl Array for VariantArray {
 
     fn get_array_memory_size(&self) -> usize {
         self.inner.get_array_memory_size()
+    }
+}
+
+
+pub fn reconstruct_variant(
+    metadata: &[u8],
+    value: Option<&[u8]>,
+    typed_value: Option<(&[u8], DataType)>,
+) -> Result<(Vec<u8>, Vec<u8>), ArrowError> {
+    match typed_value {
+        Some((typed_value, data_type)) => {
+            todo!()
+        }
+        None => match value {
+            Some(value) => Ok((metadata.to_vec(), value.to_vec())),
+            None => Err(ArrowError::InvalidArgumentError(
+                "Value and typed_value is missing".to_string(),
+            )),
+        },
     }
 }
 
