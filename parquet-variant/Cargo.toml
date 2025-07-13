@@ -36,6 +36,7 @@ rust-version = "1.83"
 arrow-schema = { workspace = true }
 chrono = { workspace = true }
 indexmap = "2.10.0"
+ahash = { version = "0.8", default-features = false }
 
 
 [lib]
@@ -59,3 +60,7 @@ harness = false
 [[bench]]
 name = "variant_validation"
 harness = false
+
+[[bin]]
+name = "long"
+path = "long.rs"

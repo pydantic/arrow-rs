@@ -16,6 +16,7 @@
 // under the License.
 use crate::decoder::{VariantBasicType, VariantPrimitiveType};
 use crate::{ShortString, Variant, VariantDecimal16, VariantDecimal4, VariantDecimal8};
+use ahash::RandomState;
 use arrow_schema::ArrowError;
 use indexmap::{IndexMap, IndexSet};
 use std::collections::HashSet;
@@ -252,10 +253,9 @@ impl ValueBuffer {
     }
 }
 
-#[derive(Default)]
 struct MetadataBuilder {
     // Field names -- field_ids are assigned in insert order
-    field_names: IndexSet<String>,
+    field_names: IndexSet<String, RandomState>,
 
     // flag that checks if field names by insertion order are also lexicographically sorted
     is_sorted: bool,
@@ -341,6 +341,15 @@ impl MetadataBuilder {
     }
 }
 
+impl Default for MetadataBuilder {
+    fn default() -> Self {
+        Self {
+            field_names: IndexSet::with_hasher(RandomState::new()),
+            is_sorted: Default::default(),
+        }
+    }
+}
+
 impl<S: AsRef<str>> FromIterator<S> for MetadataBuilder {
     fn from_iter<T: IntoIterator<Item = S>>(iter: T) -> Self {
         let mut this = Self::default();
@@ -383,7 +392,7 @@ enum ParentState<'a> {
     Object {
         buffer: &'a mut ValueBuffer,
         metadata_builder: &'a mut MetadataBuilder,
-        fields: &'a mut IndexMap<u32, usize>,
+        fields: &'a mut IndexMap<u32, usize, RandomState>,
         field_name: &'a str,
     },
 }
@@ -813,7 +822,7 @@ impl Drop for ListBuilder<'_> {
 /// See the examples on [`VariantBuilder`] for usage.
 pub struct ObjectBuilder<'a> {
     parent_state: ParentState<'a>,
-    fields: IndexMap<u32, usize>, // (field_id, offset)
+    fields: IndexMap<u32, usize, RandomState>, // (field_id, offset)
     buffer: ValueBuffer,
     validate_unique_fields: bool,
     /// Set of duplicate fields to report for errors
@@ -824,7 +833,7 @@ impl<'a> ObjectBuilder<'a> {
     fn new(parent_state: ParentState<'a>, validate_unique_fields: bool) -> Self {
         Self {
             parent_state,
-            fields: IndexMap::new(),
+            fields: IndexMap::with_hasher(RandomState::new()),
             buffer: ValueBuffer::default(),
             validate_unique_fields,
             duplicate_fields: HashSet::new(),
@@ -931,7 +940,9 @@ impl<'a> ObjectBuilder<'a> {
         parent_buffer.append_offset_array(ids, None, id_size);
 
         // Write the field offset array, followed by the value bytes
-        let offsets = std::mem::take(&mut self.fields).into_values();
+        let offsets =
+            std::mem::replace(&mut self.fields, IndexMap::with_hasher(RandomState::new()))
+                .into_values();
         parent_buffer.append_offset_array(offsets, Some(data_size), offset_size);
         parent_buffer.append_slice(self.buffer.inner());
         self.parent_state.finish(starting_offset);
