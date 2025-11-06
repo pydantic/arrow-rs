@@ -634,6 +634,10 @@ enum Encoding {
   /// afterwards. Note that the use of this encoding with FIXED_LEN_BYTE_ARRAY(N) data may
   /// perform poorly for large values of N.
   BYTE_STREAM_SPLIT = 9;
+
+
+  /// FSST (Fast static symbol table) encoding
+  FSST = 10;
 }
 );
 
@@ -654,6 +658,7 @@ impl FromStr for Encoding {
             "DELTA_BYTE_ARRAY" | "delta_byte_array" => Ok(Encoding::DELTA_BYTE_ARRAY),
             "RLE_DICTIONARY" | "rle_dictionary" => Ok(Encoding::RLE_DICTIONARY),
             "BYTE_STREAM_SPLIT" | "byte_stream_split" => Ok(Encoding::BYTE_STREAM_SPLIT),
+            "FSST" | "fsst" => Ok(Encoding::FSST),
             _ => Err(general_err!("unknown encoding: {}", s)),
         }
     }
@@ -786,6 +791,7 @@ fn i32_to_encoding(val: i32) -> Encoding {
         7 => Encoding::DELTA_BYTE_ARRAY,
         8 => Encoding::RLE_DICTIONARY,
         9 => Encoding::BYTE_STREAM_SPLIT,
+        10 => Encoding::FSST,
         _ => panic!("Impossible encoding {val}"),
     }
 }
@@ -2067,6 +2073,8 @@ mod tests {
         );
         assert_eq!(Encoding::DELTA_BYTE_ARRAY.to_string(), "DELTA_BYTE_ARRAY");
         assert_eq!(Encoding::RLE_DICTIONARY.to_string(), "RLE_DICTIONARY");
+        assert_eq!(Encoding::BYTE_STREAM_SPLIT.to_string(), "BYTE_STREAM_SPLIT");
+        assert_eq!(Encoding::FSST.to_string(), "FSST");
     }
 
     #[test]

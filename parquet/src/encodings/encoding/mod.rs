@@ -30,9 +30,11 @@ use crate::util::bit_util::{BitWriter, num_required_bits};
 use byte_stream_split_encoder::{ByteStreamSplitEncoder, VariableWidthByteStreamSplitEncoder};
 use bytes::Bytes;
 pub use dict_encoder::DictEncoder;
+pub use fsst_encoder::*;
 
 mod byte_stream_split_encoder;
 mod dict_encoder;
+mod fsst_encoder;
 
 // ----------------------------------------------------------------------
 // Encoders

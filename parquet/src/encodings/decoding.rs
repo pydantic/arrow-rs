@@ -29,11 +29,14 @@ use crate::data_type::*;
 use crate::encodings::decoding::byte_stream_split_decoder::{
     ByteStreamSplitDecoder, VariableWidthByteStreamSplitDecoder,
 };
+use crate::encodings::decoding::fsst_decoder::FSSTDecoder;
+
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::{self, BitReader};
 
 mod byte_stream_split_decoder;
+mod fsst_decoder;
 
 pub(crate) mod private {
     use super::*;
@@ -142,6 +145,7 @@ pub(crate) mod private {
                 Encoding::DELTA_LENGTH_BYTE_ARRAY => {
                     Ok(Box::new(DeltaLengthByteArrayDecoder::new()))
                 }
+                Encoding::FSST => Ok(Box::new(FSSTDecoder::new())),
                 _ => get_decoder_default(descr, encoding),
             }
         }
