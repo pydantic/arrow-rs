@@ -680,6 +680,9 @@ impl<'a, L: ListLikeArray> ListUnshredVariantBuilder<'a, L> {
     }
 }
 
+// TODO: This code is covered by tests in `parquet/tests/variant_integration.rs`. Does that suffice?
+// Or do we also need targeted stand-alone unit tests for full coverage?
+
 #[cfg(test)]
 mod tests {
     use crate::VariantArray;
