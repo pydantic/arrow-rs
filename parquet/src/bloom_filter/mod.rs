@@ -170,7 +170,7 @@ pub struct BloomFilterHeader {
 /// When a value is inserted, [`Block::mask`] picks one bit in each word
 /// (8 bits total), and those bits are OR'd in. When checking, we verify
 /// all 8 bits are set.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 #[repr(transparent)]
 struct Block([u32; 8]);
 impl Block {
@@ -317,7 +317,7 @@ impl Block {
 ///
 /// The creation of this structure is based on the [`crate::file::properties::BloomFilterProperties`]
 /// struct set via [`crate::file::properties::WriterProperties`] and is thus hidden by default.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Sbbf(Vec<Block>);
 
 pub(crate) const SBBF_HEADER_SIZE_ESTIMATE: usize = 20;
@@ -764,6 +764,8 @@ fn hash_as_bytes<A: AsBytes + ?Sized>(value: &A) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
 
     #[test]
     fn test_hash_bytes() {
@@ -910,6 +912,43 @@ mod tests {
                 "Value '{}' missing after folding (false negative!)",
                 v
             );
+        }
+    }
+
+    #[test]
+    fn test_folding_fuzz() {
+        const SEED: u64 = 0x42;
+        const ITERATIONS: usize = 256;
+        const TARGET_FPPS: [f64; 7] = [0.0001, 0.001, 0.1, 0.2, 0.9, 0.99, 0.999];
+
+        let mut rng = StdRng::seed_from_u64(SEED);
+
+        for iteration in 0..ITERATIONS {
+            let ndv = rng.random_range(1..20000);
+            let values = random_distinct_strings(&mut rng, ndv);
+
+            // Create the largest Sbbf possible
+            let mut large_sbbf = Sbbf::new_with_num_of_bytes(BITSET_MAX_LENGTH); // maximum size
+            for value in &values {
+                large_sbbf.insert(value.as_str());
+            }
+
+            for &target_fpp in &TARGET_FPPS {
+                let mut folded = large_sbbf.clone();
+                folded.fold_to_target_fpp(target_fpp);
+
+                // Recreate the SBBF with the same block size
+                let folded_bytes = folded.0.len() * size_of::<Block>();
+                let mut recreated = Sbbf::new_with_num_of_bytes(folded_bytes);
+                for value in &values {
+                    recreated.insert(value.as_str());
+                }
+
+                assert_eq!(
+                    folded, recreated,
+                    "Folded and recreated SBBFs should be identical for iteration {iteration} and target FPP {target_fpp}"
+                );
+            }
         }
     }
 
@@ -1236,5 +1275,29 @@ mod tests {
             // bit-identity means these must be exactly equal
             assert_eq!(folded_fp, fresh_fp);
         }
+    }
+
+    fn random_string(rng: &mut StdRng) -> String {
+        // Build varied inputs with both a random numeric prefix and a random alphabetic suffix.
+        let len = rng.random_range(0..32);
+        let mut value = String::with_capacity(len + 20);
+        value.push_str("value-");
+        value.push_str(&rng.random::<u64>().to_string());
+        for _ in 0..len {
+            let ch = rng.random_range(b'a'..=b'z') as char;
+            value.push(ch);
+        }
+        value
+    }
+
+    fn random_distinct_strings(rng: &mut StdRng, ndv: usize) -> Vec<String> {
+        use std::collections::BTreeSet;
+
+        // Keep sampling until we have exactly `ndv` unique values for a deterministic test case.
+        let mut values = BTreeSet::new();
+        while values.len() < ndv {
+            values.insert(random_string(rng));
+        }
+        values.into_iter().collect()
     }
 }
