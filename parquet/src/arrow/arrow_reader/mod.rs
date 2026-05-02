@@ -791,6 +791,24 @@ impl ArrowReaderOptions {
         })
     }
 
+    /// Returns the configured virtual columns, if any.
+    pub fn virtual_columns(&self) -> &[FieldRef] {
+        &self.virtual_columns
+    }
+
+    /// Returns the supplied arrow [`Schema`], if one was provided via
+    /// [`Self::with_schema`].
+    pub fn supplied_schema(&self) -> Option<&SchemaRef> {
+        self.supplied_schema.as_ref()
+    }
+
+    /// Returns whether the reader will skip the embedded arrow schema
+    /// metadata stored in the parquet file (set via
+    /// [`Self::with_skip_arrow_metadata`]).
+    pub fn skip_arrow_metadata(&self) -> bool {
+        self.skip_arrow_metadata
+    }
+
     #[deprecated(
         since = "57.2.0",
         note = "Use `column_index_policy` or `offset_index_policy` instead"
@@ -883,6 +901,35 @@ impl ArrowReaderMetadata {
         );
         let metadata = metadata.parse_and_finish(reader)?;
         Self::try_new(Arc::new(metadata), options)
+    }
+
+    /// Construct an [`ArrowReaderMetadata`] from precomputed
+    /// [`FieldLevels`].
+    ///
+    /// Use this when the caller has already computed the arrow [`Schema`]
+    /// and [`FieldLevels`] for `metadata` (e.g. by calling
+    /// [`parquet_to_arrow_field_levels`]) and wants to avoid recomputing
+    /// them. For wide schemas the field-levels conversion walks every leaf
+    /// in the parquet schema, so reusing it across reader builds for the
+    /// same metadata is significantly cheaper than calling [`Self::try_new`]
+    /// repeatedly.
+    ///
+    /// `arrow_schema_metadata` is used for the [`Schema`]'s key/value
+    /// metadata and is otherwise opaque; pass an empty map when you do not
+    /// have one.
+    ///
+    /// [`parquet_to_arrow_field_levels`]: crate::arrow::schema::parquet_to_arrow_field_levels
+    pub fn from_field_levels(
+        metadata: Arc<ParquetMetaData>,
+        arrow_schema: SchemaRef,
+        field_levels: FieldLevels,
+    ) -> Self {
+        let FieldLevels { fields: _, levels } = field_levels;
+        Self {
+            metadata,
+            schema: arrow_schema,
+            fields: levels.map(Arc::new),
+        }
     }
 
     /// Create a new [`ArrowReaderMetadata`] from a pre-existing

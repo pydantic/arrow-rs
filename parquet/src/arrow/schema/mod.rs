@@ -67,6 +67,39 @@ pub fn parquet_to_arrow_schema_by_columns(
     Ok(parquet_to_arrow_schema_and_fields(parquet_schema, mask, key_value_metadata, &[])?.0)
 }
 
+/// Convert a parquet [`SchemaDescriptor`] into both the arrow [`Schema`]
+/// and matching [`FieldLevels`] in a single walk.
+///
+/// This is a convenience around [`parquet_to_arrow_field_levels`] that
+/// also produces a [`Schema`] (with the parquet file's key/value metadata
+/// attached). Useful for callers that want to pre-compute and reuse both
+/// for [`ArrowReaderMetadata::from_field_levels`].
+///
+/// [`ArrowReaderMetadata::from_field_levels`]: crate::arrow::arrow_reader::ArrowReaderMetadata::from_field_levels
+pub fn parquet_to_arrow_schema_and_field_levels(
+    parquet_schema: &SchemaDescriptor,
+    mask: ProjectionMask,
+    key_value_metadata: Option<&Vec<KeyValue>>,
+) -> Result<(Schema, FieldLevels)> {
+    let mut metadata = parse_key_value_metadata(key_value_metadata).unwrap_or_default();
+    let maybe_schema = metadata
+        .remove(super::ARROW_SCHEMA_META_KEY)
+        .map(|value| get_arrow_schema_from_metadata(&value))
+        .transpose()?;
+
+    if let Some(arrow_schema) = &maybe_schema {
+        arrow_schema.metadata().iter().for_each(|(k, v)| {
+            metadata.entry(k.clone()).or_insert_with(|| v.clone());
+        });
+    }
+
+    let hint = maybe_schema.as_ref().map(|s| s.fields());
+    let field_levels =
+        parquet_to_arrow_field_levels_with_virtual(parquet_schema, mask, hint, &[])?;
+    let schema = Schema::new_with_metadata(field_levels.fields.clone(), metadata);
+    Ok((schema, field_levels))
+}
+
 /// Determines the Arrow Schema from a Parquet schema
 ///
 /// Looks for an Arrow schema metadata "hint" (see
