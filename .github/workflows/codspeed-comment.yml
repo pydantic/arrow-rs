@@ -1,0 +1,145 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# On-demand CodSpeed runs triggered from PR comments.
+#
+# A comment of the form:
+#
+#     run codspeed                       # build & run all workspace benches
+#     run codspeed <bench>               # run a single bench target
+#     run codspeed <bench> <bench> ...   # run several bench targets
+#
+# kicks off a CodSpeed instrumentation run against the PR's head commit.
+# Each whitespace-separated token after `run codspeed` is passed to
+# cargo-codspeed via `--bench <token>` (repeatable). Tokens are validated
+# against a strict allowlist before being forwarded to the shell.
+#
+# Authorization: the commenter must have the OWNER, MEMBER, or COLLABORATOR
+# author_association on the PR — i.e. they have at least write access to
+# the repo. External contributors cannot trigger billed runs.
+
+name: codspeed-comment
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  trigger:
+    if: >
+      github.event.issue.pull_request != null &&
+      startsWith(github.event.comment.body, 'run codspeed') &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: React to comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X POST \
+            "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content=rocket
+
+      - name: Resolve PR head
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pr_json=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}")
+          echo "sha=$(jq -r .head.sha <<<"$pr_json")" >> "$GITHUB_OUTPUT"
+          echo "ref=$(jq -r .head.ref <<<"$pr_json")" >> "$GITHUB_OUTPUT"
+
+      - name: Parse bench filter from comment
+        id: parse
+        env:
+          BODY: ${{ github.event.comment.body }}
+        run: |
+          # Strip the "run codspeed" prefix; remaining tokens are bench
+          # target names. Validate each token against a strict allowlist
+          # so nothing user-controlled reaches the shell unescaped.
+          rest="${BODY#run codspeed}"
+          rest="$(echo "$rest" | tr -d '\r' | head -n1 | xargs || true)"
+
+          bench_args=""
+          for tok in $rest; do
+            if ! [[ "$tok" =~ ^[A-Za-z0-9_-]+$ ]]; then
+              echo "::error::Invalid bench name '$tok' — only [A-Za-z0-9_-] allowed"
+              exit 1
+            fi
+            bench_args="$bench_args --bench $tok"
+          done
+
+          echo "args=$bench_args" >> "$GITHUB_OUTPUT"
+          if [ -z "$bench_args" ]; then
+            echo "scope=workspace (all benches)" >> "$GITHUB_OUTPUT"
+          else
+            echo "scope=$rest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.pr.outputs.sha }}
+          submodules: true
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Setup Rust toolchain, cache and cargo-codspeed
+        uses: moonrepo/setup-rust@v1
+        with:
+          channel: stable
+          cache-target: release
+          bins: cargo-codspeed
+
+      - name: Build benchmarks
+        env:
+          BENCH_ARGS: ${{ steps.parse.outputs.args }}
+        run: |
+          if [ -z "$BENCH_ARGS" ]; then
+            cargo codspeed build --workspace
+          else
+            cargo codspeed build --workspace $BENCH_ARGS
+          fi
+
+      - name: Run benchmarks
+        uses: CodSpeedHQ/action@v4
+        with:
+          mode: instrumentation
+          run: |
+            if [ -z "${BENCH_ARGS}" ]; then
+              cargo codspeed run --workspace
+            else
+              cargo codspeed run --workspace ${BENCH_ARGS}
+            fi
+        env:
+          BENCH_ARGS: ${{ steps.parse.outputs.args }}
+
+      - name: Comment failure on PR
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X POST \
+            "repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" \
+            -f body="CodSpeed run requested by @${{ github.event.comment.user.login }} failed. See [the workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details."
