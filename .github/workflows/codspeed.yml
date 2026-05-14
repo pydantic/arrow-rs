@@ -65,10 +65,15 @@ jobs:
           bins: cargo-codspeed
 
       - name: Build benchmarks
-        run: cargo codspeed build --workspace
+        # The --features list enables every feature that any workspace
+        # bench target gates behind `required-features`. Without these,
+        # those bench targets silently aren't built.
+        run: |
+          cargo codspeed build --workspace \
+            --features arrow/test_utils,arrow-schema/ffi,parquet/test_common,parquet/experimental,parquet/async,parquet/object_store
 
       - name: Run benchmarks
         uses: CodSpeedHQ/action@v4
         with:
-          mode: instrumentation
+          mode: simulation
           run: cargo codspeed run --workspace

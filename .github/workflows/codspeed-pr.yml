@@ -111,16 +111,19 @@ jobs:
           bins: cargo-codspeed
 
       - name: Build benchmarks
-        env:
-          ARGS: ${{ steps.scope.outputs.args }}
+        # Always build the full workspace: cross-crate features like
+        # `parquet/object_store` can't be passed when -p limits the
+        # build set to a single crate, and the build is cached. Bench
+        # selection happens at run time via `cargo codspeed run`.
         run: |
-          echo "::notice::Building benches for:${{ steps.scope.outputs.scope }}"
-          cargo codspeed build $ARGS
+          echo "::notice::Run scope:${{ steps.scope.outputs.scope }}"
+          cargo codspeed build --workspace \
+            --features arrow/test_utils,arrow-schema/ffi,parquet/test_common,parquet/experimental,parquet/async,parquet/object_store
 
       - name: Run benchmarks
         uses: CodSpeedHQ/action@v4
         with:
-          mode: instrumentation
+          mode: simulation
           run: cargo codspeed run $ARGS
         env:
           ARGS: ${{ steps.scope.outputs.args }}
