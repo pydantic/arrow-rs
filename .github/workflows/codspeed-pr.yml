@@ -28,13 +28,10 @@
 # `bench:parquet`, `bench:arrow-cast`. `bench:all` short-circuits and
 # supersedes any per-crate labels.
 #
-# The matrix is computed dynamically by the `setup` job: it parses
-# every Cargo.toml of the selected crates for `[[bench]]` entries and
-# emits one shard per bench target. Per-bench-target sharding is
-# required because crate-level shards (e.g. parquet) can still exceed
-# CodSpeed's 1000-benchmark per-upload limit. Jobs in the same
-# workflow are auto-aggregated by CodSpeed into one report.
-# https://codspeed.io/docs/features/sharded-benchmarks
+# Topology mirrors codspeed.yml (setup + build run in parallel; bench
+# is a matrix that downloads the build artifact and runs one bench
+# target per shard). The `setup` job additionally filters the matrix
+# by labels.
 #
 # Authorization: only users with write access to the repo can add
 # labels, so the label is itself the authorization gate.
@@ -61,13 +58,17 @@ permissions:
   id-token: write
   pull-requests: write
 
+env:
+  CODSPEED_FEATURES: arrow/test_utils,arrow/csv,arrow/json,arrow/chrono-tz,arrow/prettyprint,arrow-schema/ffi,parquet/arrow,parquet/async,parquet/test_common,parquet/experimental,parquet/object_store
+
 jobs:
   setup:
-    # Compute the matrix only if at least one `bench:*` label is
-    # currently attached. The toJSON serialization wraps each label
-    # name in double quotes, so searching for `"bench:` matches only
-    # at the start of a label name.
+    # Run only if at least one `bench:*` label is currently attached.
+    # The toJSON serialization wraps each label name in double quotes,
+    # so searching for `"bench:` matches only at the start of a label
+    # name.
     if: contains(toJSON(github.event.pull_request.labels.*.name), '"bench:')
+    name: Generate bench matrix
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
@@ -88,7 +89,6 @@ jobs:
             selected_crates="$all_crates"
             scope="full workspace (bench:all)"
           else
-            # Validate each suffix is a plausible workspace member name.
             for pkg in $suffixes; do
               if ! [[ "$pkg" =~ ^[a-z][a-z0-9_-]*$ ]]; then
                 echo "::error::Invalid bench label suffix 'bench:$pkg'"
@@ -120,15 +120,13 @@ jobs:
           echo "scope=$scope" >> "$GITHUB_OUTPUT"
           echo "::notice::Scope: $scope ($(jq length matrix.json) bench shards)"
 
-  bench:
-    needs: setup
-    name: ${{ matrix.config.crate }} / ${{ matrix.config.bench }}
+  build:
+    # Gate on the same label condition as setup so we don't build when
+    # there are no benches to run.
+    if: contains(toJSON(github.event.pull_request.labels.*.name), '"bench:')
+    name: Build workspace benchmarks
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        config: ${{ fromJson(needs.setup.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -144,13 +142,42 @@ jobs:
           cache-target: release
           bins: cargo-codspeed
 
-      - name: Build workspace benchmarks
-        # Identical command across shards so rust-cache keys match and
-        # the cache is shared. See codspeed.yml for rationale.
-        run: |
-          echo "::notice::Bench scope: ${{ needs.setup.outputs.scope }}"
-          cargo codspeed build --workspace \
-            --features arrow/test_utils,arrow/csv,arrow/json,arrow/chrono-tz,arrow/prettyprint,arrow-schema/ffi,parquet/arrow,parquet/async,parquet/test_common,parquet/experimental,parquet/object_store
+      - name: Build benchmarks
+        run: cargo codspeed build --workspace --features "$CODSPEED_FEATURES"
+
+      - name: Upload built bench binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: codspeed-binaries
+          path: target/codspeed/
+          retention-days: 1
+          if-no-files-found: error
+
+  bench:
+    needs: [setup, build]
+    name: ${{ matrix.config.crate }} / ${{ matrix.config.bench }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        config: ${{ fromJson(needs.setup.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install cargo-codspeed
+        uses: moonrepo/setup-rust@v1
+        with:
+          channel: stable
+          bins: cargo-codspeed
+
+      - name: Download built bench binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: codspeed-binaries
+          path: target/codspeed/
 
       - name: Run single bench target
         uses: CodSpeedHQ/action@v4
