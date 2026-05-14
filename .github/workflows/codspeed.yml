@@ -29,10 +29,55 @@ jobs:
           bins: cargo-codspeed
 
       - name: Build the benchmark target(s)
-        run: cargo codspeed build --features arrow/test_utils,arrow-schema/ffi,parquet/test_common,parquet/experimental,parquet/async,parquet/object_store
+        run: |
+          cargo codspeed build \
+            --features arrow/test_utils,arrow-schema/ffi,parquet/test_common,parquet/experimental,parquet/async,parquet/object_store
 
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@v4
         with:
           mode: simulation
-          run: cargo codspeed run
+          run: |
+            cargo codspeed run --exclude arrow
+            cargo codspeed run -p arrow \
+              --bench aggregate_kernels \
+              --bench array_from \
+              --bench array_iter \
+              --bench builder \
+              --bench buffer_bit_ops \
+              --bench boolean_kernels \
+              --bench boolean_append_packed \
+              --bench arithmetic_kernels \
+              --bench cast_kernels \
+              --bench comparison_kernels \
+              --bench filter_kernels \
+              --bench coalesce_kernels \
+              --bench take_kernels \
+              --bench interleave_kernels \
+              --bench zip_kernels \
+              --bench length_kernel \
+              --bench bit_length_kernel \
+              --bench sort_kernel \
+              --bench partition_kernels \
+              --bench csv_writer \
+              --bench csv_reader \
+              --bench json_reader \
+              --bench json_writer \
+              --bench equal \
+              --bench array_slice \
+              --bench concatenate_kernel \
+              --bench mutable_array \
+              --bench buffer_create \
+              --bench string_dictionary_builder \
+              --bench string_run_builder \
+              --bench string_run_iterator \
+              --bench primitive_run_accessor \
+              --bench primitive_run_take \
+              --bench substring_kernels \
+              --bench regexp_kernels \
+              --bench array_data_validate \
+              --bench decimal_validate \
+              --bench row_format \
+              --bench bitwise_kernel \
+              --bench lexsort \
+              --bench nullif_kernel
