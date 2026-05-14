@@ -18,11 +18,23 @@
 # Continuous benchmarking on CodSpeed.
 #
 # Runs the full workspace bench suite on every push to main, sharded
-# one job per bench-bearing crate. Sharding is required because the
-# full workspace produces >1000 benchmarks, which is CodSpeed's
-# per-upload limit; jobs in the same workflow are auto-aggregated into
-# a single report.
+# one job per `[[bench]]` target in the workspace (~88 jobs). Sharding
+# at this granularity is required because both crate-level shards
+# (e.g. parquet alone has 16 bench targets producing >1000 benchmarks)
+# and the workspace as a whole exceed CodSpeed's 1000-benchmark
+# per-upload limit. Jobs in the same workflow are auto-aggregated by
+# CodSpeed into one report.
 # https://codspeed.io/docs/features/sharded-benchmarks
+#
+# The matrix is computed dynamically in the `setup` job by parsing
+# every workspace member's Cargo.toml for `[[bench]]` entries; new
+# bench targets are picked up automatically without touching this
+# workflow.
+#
+# Each shard does an identical full-workspace `cargo codspeed build`
+# so that rust-cache keys match across all 88 shards (one cache,
+# shared restores). The build is then run-scoped to a single bench
+# target via `cargo codspeed run -p <crate> --bench <bench>`.
 #
 # Auth is via GitHub OIDC; the workflow's `id-token` claim is what
 # CodSpeed verifies, so no secret token is required.
@@ -49,25 +61,41 @@ permissions:
   id-token: write
 
 jobs:
-  bench:
-    name: Bench ${{ matrix.crate }}
+  setup:
+    name: Generate bench matrix
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Generate matrix of {crate, bench} from workspace Cargo.tomls
+        id: gen
+        run: |
+          {
+            for crate in arrow arrow-array arrow-avro arrow-buffer arrow-cast arrow-ipc arrow-json arrow-schema parquet parquet-variant parquet-variant-compute; do
+              awk -v crate="$crate" '
+                /^\[\[bench\]\]/ { in_bench=1; next }
+                /^\[/             { in_bench=0 }
+                in_bench && /^name = / {
+                  sub(/^name = "/, ""); sub(/"$/, "");
+                  printf "%s %s\n", crate, $0
+                }
+              ' "$crate/Cargo.toml"
+            done
+          } | jq -Rcs 'split("\n") | map(select(length>0) | split(" ") | {crate: .[0], bench: .[1]})' > matrix.json
+          echo "matrix=$(cat matrix.json)" >> "$GITHUB_OUTPUT"
+          echo "::notice::Generated $(jq length matrix.json) bench shards"
+
+  bench:
+    needs: setup
+    name: ${{ matrix.config.crate }} / ${{ matrix.config.bench }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        crate:
-          - arrow
-          - arrow-array
-          - arrow-avro
-          - arrow-buffer
-          - arrow-cast
-          - arrow-ipc
-          - arrow-json
-          - arrow-schema
-          - parquet
-          - parquet-variant
-          - parquet-variant-compute
+        config: ${{ fromJson(needs.setup.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -83,21 +111,18 @@ jobs:
           cache-target: release
           bins: cargo-codspeed
 
-      - name: Build benchmarks
-        # Every shard builds the same full workspace with the same
-        # feature set. Keeping the build command identical across
-        # shards (rather than per-crate -p + per-crate features) keeps
-        # rust-cache keys stable and dodges the cross-crate-feature
-        # restriction cargo enforces when -p limits the build set.
-        # The --features list enables every feature that any workspace
-        # bench target gates behind `required-features`; without these
-        # those bench targets silently aren't built.
+      - name: Build workspace benchmarks
+        # Identical build command across all shards so rust-cache keys
+        # match and the cache is shared. The --features list enables
+        # every feature any workspace bench target gates behind
+        # `required-features`; without these those benches silently
+        # aren't built.
         run: |
           cargo codspeed build --workspace \
-            --features arrow/test_utils,arrow-schema/ffi,parquet/test_common,parquet/experimental,parquet/async,parquet/object_store
+            --features arrow/test_utils,arrow/csv,arrow/json,arrow/chrono-tz,arrow/prettyprint,arrow-schema/ffi,parquet/arrow,parquet/async,parquet/test_common,parquet/experimental,parquet/object_store
 
-      - name: Run benchmarks
+      - name: Run single bench target
         uses: CodSpeedHQ/action@v4
         with:
           mode: simulation
-          run: cargo codspeed run -p ${{ matrix.crate }}
+          run: cargo codspeed run -p ${{ matrix.config.crate }} --bench ${{ matrix.config.bench }}

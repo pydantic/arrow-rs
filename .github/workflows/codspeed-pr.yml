@@ -16,23 +16,24 @@
 # under the License.
 
 # Opt-in CodSpeed benchmarking for pull requests, gated by labels and
-# sharded one job per selected crate.
+# sharded one job per `[[bench]]` target in each selected crate.
 #
 # Label convention (managed manually on each PR):
 #
-#   bench:all                        # all 11 bench-bearing crates
-#   bench:<crate>                    # just that crate
+#   bench:all                        # every [[bench]] in the workspace
+#   bench:<crate>                    # every [[bench]] in that crate
 #   bench:<crate> bench:<crate>      # union
 #
 # Where <crate> is a workspace member name, e.g. `bench:arrow`,
 # `bench:parquet`, `bench:arrow-cast`. `bench:all` short-circuits and
 # supersedes any per-crate labels.
 #
-# The matrix is computed dynamically by the `setup` job from the
-# current label set, so each labeled crate fans out into its own
-# parallel job. Sharding is required because the full workspace
-# produces >1000 benchmarks (CodSpeed's per-upload limit); jobs in the
-# same workflow are auto-aggregated into a single report.
+# The matrix is computed dynamically by the `setup` job: it parses
+# every Cargo.toml of the selected crates for `[[bench]]` entries and
+# emits one shard per bench target. Per-bench-target sharding is
+# required because crate-level shards (e.g. parquet) can still exceed
+# CodSpeed's 1000-benchmark per-upload limit. Jobs in the same
+# workflow are auto-aggregated by CodSpeed into one report.
 # https://codspeed.io/docs/features/sharded-benchmarks
 #
 # Authorization: only users with write access to the repo can add
@@ -69,47 +70,65 @@ jobs:
     if: contains(toJSON(github.event.pull_request.labels.*.name), '"bench:')
     runs-on: ubuntu-latest
     outputs:
-      crates: ${{ steps.scope.outputs.crates }}
-      scope: ${{ steps.scope.outputs.scope }}
+      matrix: ${{ steps.gen.outputs.matrix }}
+      scope: ${{ steps.gen.outputs.scope }}
     steps:
-      - name: Resolve bench scope from labels
-        id: scope
+      - uses: actions/checkout@v6
+
+      - name: Resolve crates from labels and emit per-bench-target matrix
+        id: gen
         env:
           LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: |
-          all_crates='["arrow","arrow-array","arrow-avro","arrow-buffer","arrow-cast","arrow-ipc","arrow-json","arrow-schema","parquet","parquet-variant","parquet-variant-compute"]'
+          all_crates="arrow arrow-array arrow-avro arrow-buffer arrow-cast arrow-ipc arrow-json arrow-schema parquet parquet-variant parquet-variant-compute"
 
-          # Pull out the suffix of every `bench:*` label.
           suffixes=$(jq -r '.[] | select(startswith("bench:")) | sub("^bench:"; "")' <<<"$LABELS")
 
           if echo "$suffixes" | grep -qx "all"; then
-            echo "crates=$all_crates" >> "$GITHUB_OUTPUT"
-            echo "scope=full workspace (bench:all)" >> "$GITHUB_OUTPUT"
-            exit 0
+            selected_crates="$all_crates"
+            scope="full workspace (bench:all)"
+          else
+            # Validate each suffix is a plausible workspace member name.
+            for pkg in $suffixes; do
+              if ! [[ "$pkg" =~ ^[a-z][a-z0-9_-]*$ ]]; then
+                echo "::error::Invalid bench label suffix 'bench:$pkg'"
+                exit 1
+              fi
+            done
+            selected_crates="$(echo $suffixes | tr '\n' ' ')"
+            scope="$selected_crates"
           fi
 
-          # Validate each suffix against a strict allowlist and build a
-          # JSON array for the dynamic matrix consumer.
-          for pkg in $suffixes; do
-            if ! [[ "$pkg" =~ ^[a-z][a-z0-9_-]*$ ]]; then
-              echo "::error::Invalid bench label suffix 'bench:$pkg' — expected a workspace member name"
-              exit 1
-            fi
-          done
+          {
+            for crate in $selected_crates; do
+              if [ ! -f "$crate/Cargo.toml" ]; then
+                echo "::warning::No Cargo.toml found for '$crate' (bench:$crate); skipping"
+                continue
+              fi
+              awk -v crate="$crate" '
+                /^\[\[bench\]\]/ { in_bench=1; next }
+                /^\[/             { in_bench=0 }
+                in_bench && /^name = / {
+                  sub(/^name = "/, ""); sub(/"$/, "");
+                  printf "%s %s\n", crate, $0
+                }
+              ' "$crate/Cargo.toml"
+            done
+          } | jq -Rcs 'split("\n") | map(select(length>0) | split(" ") | {crate: .[0], bench: .[1]})' > matrix.json
 
-          crates_json=$(jq -Rcn '[inputs]' <<<"$suffixes")
-          echo "crates=$crates_json" >> "$GITHUB_OUTPUT"
-          echo "scope=$(echo $suffixes | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+          echo "matrix=$(cat matrix.json)" >> "$GITHUB_OUTPUT"
+          echo "scope=$scope" >> "$GITHUB_OUTPUT"
+          echo "::notice::Scope: $scope ($(jq length matrix.json) bench shards)"
 
   bench:
     needs: setup
-    name: Bench ${{ matrix.crate }}
+    name: ${{ matrix.config.crate }} / ${{ matrix.config.bench }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        crate: ${{ fromJson(needs.setup.outputs.crates) }}
+        config: ${{ fromJson(needs.setup.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -125,18 +144,16 @@ jobs:
           cache-target: release
           bins: cargo-codspeed
 
-      - name: Build benchmarks
-        # Every shard builds the same full workspace with the same
-        # feature set. Keeping the build identical across shards keeps
-        # rust-cache keys stable and dodges the cross-crate-feature
-        # restriction cargo enforces under a single-crate -p.
+      - name: Build workspace benchmarks
+        # Identical command across shards so rust-cache keys match and
+        # the cache is shared. See codspeed.yml for rationale.
         run: |
           echo "::notice::Bench scope: ${{ needs.setup.outputs.scope }}"
           cargo codspeed build --workspace \
-            --features arrow/test_utils,arrow-schema/ffi,parquet/test_common,parquet/experimental,parquet/async,parquet/object_store
+            --features arrow/test_utils,arrow/csv,arrow/json,arrow/chrono-tz,arrow/prettyprint,arrow-schema/ffi,parquet/arrow,parquet/async,parquet/test_common,parquet/experimental,parquet/object_store
 
-      - name: Run benchmarks
+      - name: Run single bench target
         uses: CodSpeedHQ/action@v4
         with:
           mode: simulation
-          run: cargo codspeed run -p ${{ matrix.crate }}
+          run: cargo codspeed run -p ${{ matrix.config.crate }} --bench ${{ matrix.config.bench }}
