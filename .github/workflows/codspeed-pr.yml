@@ -15,29 +15,35 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Opt-in CodSpeed benchmarking for pull requests, gated by labels.
+# Opt-in CodSpeed benchmarking for pull requests, gated by labels and
+# sharded one job per selected crate.
 #
 # Label convention (managed manually on each PR):
 #
-#   bench:all                        # build & run every workspace bench
-#   bench:<crate>                    # run benches for one crate
-#   bench:<crate> bench:<crate>      # union; runs benches in both crates
+#   bench:all                        # all 11 bench-bearing crates
+#   bench:<crate>                    # just that crate
+#   bench:<crate> bench:<crate>      # union
 #
-# Where <crate> is the workspace member name, e.g. `bench:arrow`,
-# `bench:parquet`, `bench:arrow-cast`, etc. `bench:all` collapses to
-# `--workspace` and supersedes any per-crate labels.
+# Where <crate> is a workspace member name, e.g. `bench:arrow`,
+# `bench:parquet`, `bench:arrow-cast`. `bench:all` short-circuits and
+# supersedes any per-crate labels.
 #
-# Authorization: only users with write access to the repo can add labels
-# to a PR, so the label is itself the authorization gate. No extra
-# author_association check is needed.
+# The matrix is computed dynamically by the `setup` job from the
+# current label set, so each labeled crate fans out into its own
+# parallel job. Sharding is required because the full workspace
+# produces >1000 benchmarks (CodSpeed's per-upload limit); jobs in the
+# same workflow are auto-aggregated into a single report.
+# https://codspeed.io/docs/features/sharded-benchmarks
 #
-# Baseline: native `pull_request` event → CodSpeed compares against the
-# base branch's latest CodSpeed report automatically; no env spoofing
-# required (contrast with the comment-trigger variant).
+# Authorization: only users with write access to the repo can add
+# labels, so the label is itself the authorization gate.
 #
-# Fork PR caveat: workflows triggered by `pull_request` from fork PRs do
-# not get an OIDC token. For benches on fork PRs, push the branch to this
-# repo and add labels there.
+# Baseline: native `pull_request` event → CodSpeed compares against
+# the base branch's latest CodSpeed report automatically.
+#
+# Fork PR caveat: workflows triggered by `pull_request` from fork PRs
+# do not get an OIDC token. For benches on fork PRs, push the branch
+# to this repo and label it there.
 
 name: codspeed-pr
 
@@ -55,50 +61,59 @@ permissions:
   pull-requests: write
 
 jobs:
-  bench:
-    # Run only if at least one label whose name starts with `bench:` is
-    # currently attached to the PR. The toJSON serialization wraps each
-    # label name in double quotes, so searching for `"bench:` matches
-    # only at the start of a label name (not a label that happens to
-    # contain `bench:` mid-string).
+  setup:
+    # Compute the matrix only if at least one `bench:*` label is
+    # currently attached. The toJSON serialization wraps each label
+    # name in double quotes, so searching for `"bench:` matches only
+    # at the start of a label name.
     if: contains(toJSON(github.event.pull_request.labels.*.name), '"bench:')
-    name: Run CodSpeed benchmarks
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    outputs:
+      crates: ${{ steps.scope.outputs.crates }}
+      scope: ${{ steps.scope.outputs.scope }}
     steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-
       - name: Resolve bench scope from labels
         id: scope
         env:
           LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: |
+          all_crates='["arrow","arrow-array","arrow-avro","arrow-buffer","arrow-cast","arrow-ipc","arrow-json","arrow-schema","parquet","parquet-variant","parquet-variant-compute"]'
+
           # Pull out the suffix of every `bench:*` label.
           suffixes=$(jq -r '.[] | select(startswith("bench:")) | sub("^bench:"; "")' <<<"$LABELS")
 
           if echo "$suffixes" | grep -qx "all"; then
-            echo "args=--workspace" >> "$GITHUB_OUTPUT"
+            echo "crates=$all_crates" >> "$GITHUB_OUTPUT"
             echo "scope=full workspace (bench:all)" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          pkg_args=""
-          scope_pretty=""
+          # Validate each suffix against a strict allowlist and build a
+          # JSON array for the dynamic matrix consumer.
           for pkg in $suffixes; do
-            # Strict allowlist so nothing user-controlled reaches the shell
-            # unescaped. Workspace member names in arrow-rs all match this.
             if ! [[ "$pkg" =~ ^[a-z][a-z0-9_-]*$ ]]; then
               echo "::error::Invalid bench label suffix 'bench:$pkg' — expected a workspace member name"
               exit 1
             fi
-            pkg_args="$pkg_args -p $pkg"
-            scope_pretty="$scope_pretty $pkg"
           done
 
-          echo "args=$pkg_args" >> "$GITHUB_OUTPUT"
-          echo "scope=$scope_pretty" >> "$GITHUB_OUTPUT"
+          crates_json=$(jq -Rcn '[inputs]' <<<"$suffixes")
+          echo "crates=$crates_json" >> "$GITHUB_OUTPUT"
+          echo "scope=$(echo $suffixes | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+
+  bench:
+    needs: setup
+    name: Bench ${{ matrix.crate }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: ${{ fromJson(needs.setup.outputs.crates) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
 
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -111,12 +126,12 @@ jobs:
           bins: cargo-codspeed
 
       - name: Build benchmarks
-        # Always build the full workspace: cross-crate features like
-        # `parquet/object_store` can't be passed when -p limits the
-        # build set to a single crate, and the build is cached. Bench
-        # selection happens at run time via `cargo codspeed run`.
+        # Every shard builds the same full workspace with the same
+        # feature set. Keeping the build identical across shards keeps
+        # rust-cache keys stable and dodges the cross-crate-feature
+        # restriction cargo enforces under a single-crate -p.
         run: |
-          echo "::notice::Run scope:${{ steps.scope.outputs.scope }}"
+          echo "::notice::Bench scope: ${{ needs.setup.outputs.scope }}"
           cargo codspeed build --workspace \
             --features arrow/test_utils,arrow-schema/ffi,parquet/test_common,parquet/experimental,parquet/async,parquet/object_store
 
@@ -124,6 +139,4 @@ jobs:
         uses: CodSpeedHQ/action@v4
         with:
           mode: simulation
-          run: cargo codspeed run $ARGS
-        env:
-          ARGS: ${{ steps.scope.outputs.args }}
+          run: cargo codspeed run -p ${{ matrix.crate }}
