@@ -31,6 +31,14 @@
 # Authorization: the commenter must have the OWNER, MEMBER, or COLLABORATOR
 # author_association on the PR — i.e. they have at least write access to
 # the repo. External contributors cannot trigger billed runs.
+#
+# Baseline selection: CodSpeed only compares against the base branch when
+# it sees a `pull_request` event. `issue_comment` events have
+# GITHUB_REF=refs/heads/<default-branch>, which would make CodSpeed compare
+# the run against the previous commit on the default branch instead of the
+# PR's base. We therefore synthesize a pull_request event payload and
+# override GITHUB_EVENT_NAME/GITHUB_REF/GITHUB_EVENT_PATH/GITHUB_BASE_REF
+# on the CodSpeed step.
 
 name: codspeed-comment
 
@@ -61,14 +69,58 @@ jobs:
             "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
             -f content=rocket
 
-      - name: Resolve PR head
+      - name: Resolve PR & synthesize pull_request event context
         id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          pr_json=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}")
-          echo "sha=$(jq -r .head.sha <<<"$pr_json")" >> "$GITHUB_OUTPUT"
-          echo "ref=$(jq -r .head.ref <<<"$pr_json")" >> "$GITHUB_OUTPUT"
+          # CodSpeed's runner only treats a run as a PR (and therefore picks
+          # the base-branch report as the baseline) when GITHUB_EVENT_NAME is
+          # `pull_request`, GITHUB_REF matches refs/pull/<N>/merge, and
+          # GITHUB_EVENT_PATH points at a payload with `pull_request.{head,base}`
+          # objects. Under `issue_comment` none of that is true, so we
+          # synthesize a minimal event file with exactly the fields the runner
+          # reads (see CodSpeedHQ/codspeed src/run_environment/github_actions/provider.rs).
+          pr_json=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}")
+
+          head_sha=$(jq -r .head.sha <<<"$pr_json")
+          head_ref=$(jq -r .head.ref <<<"$pr_json")
+          base_ref=$(jq -r .base.ref <<<"$pr_json")
+          head_repo_id=$(jq -r .head.repo.id <<<"$pr_json")
+          base_repo_id=$(jq -r .base.repo.id <<<"$pr_json")
+          head_repo_owner=$(jq -r .head.repo.owner.login <<<"$pr_json")
+          repo_private=$(jq -r .head.repo.private <<<"$pr_json")
+
+          synth_path="${RUNNER_TEMP}/codspeed-pr-event.json"
+          jq -n \
+            --argjson head_repo_id "$head_repo_id" \
+            --argjson base_repo_id "$base_repo_id" \
+            --arg head_ref "$head_ref" \
+            --arg base_ref "$base_ref" \
+            --arg head_repo_owner "$head_repo_owner" \
+            --argjson private "$repo_private" \
+            '{
+              repository: { private: $private },
+              pull_request: {
+                head: {
+                  ref: $head_ref,
+                  repo: { id: $head_repo_id, owner: { login: $head_repo_owner } }
+                },
+                base: {
+                  ref: $base_ref,
+                  repo: { id: $base_repo_id }
+                }
+              }
+            }' > "$synth_path"
+
+          {
+            echo "sha=$head_sha"
+            echo "ref=$head_ref"
+            echo "base_ref=$base_ref"
+            echo "event_path=$synth_path"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Parse bench filter from comment
         id: parse
@@ -134,6 +186,15 @@ jobs:
             fi
         env:
           BENCH_ARGS: ${{ steps.parse.outputs.args }}
+          # Override the issue_comment event context so CodSpeed treats this
+          # as a pull_request run and compares against the base branch's
+          # latest CodSpeed report instead of the previous commit on main.
+          GITHUB_EVENT_NAME: pull_request
+          GITHUB_REF: refs/pull/${{ github.event.issue.number }}/merge
+          GITHUB_BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          GITHUB_HEAD_REF: ${{ steps.pr.outputs.ref }}
+          GITHUB_EVENT_PATH: ${{ steps.pr.outputs.event_path }}
+          GITHUB_SHA: ${{ steps.pr.outputs.sha }}
 
       - name: Comment failure on PR
         if: failure()
