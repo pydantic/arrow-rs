@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Smoke-test trigger for the codspeed-pr workflow.
 use arrow::array::{Array, ArrayRef, BinaryViewArray, StringArray, StructArray};
 use arrow::util::test_util::seedable_rng;
 use arrow_schema::{DataType, Field, FieldRef, Fields};
