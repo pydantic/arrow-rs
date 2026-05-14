@@ -117,11 +117,18 @@ jobs:
         # benches silently aren't built.
         run: cargo codspeed build --workspace --features "$CODSPEED_FEATURES"
 
+      - name: Pack bench binaries into a tarball
+        # actions/upload-artifact does not preserve Unix executable
+        # bits, so downloaded bench binaries land as 644 and
+        # `cargo codspeed run` then fails with EACCES. Tar preserves
+        # mode bits, so we wrap the directory before upload.
+        run: tar -cf codspeed-binaries.tar -C target codspeed
+
       - name: Upload built bench binaries
         uses: actions/upload-artifact@v4
         with:
           name: codspeed-binaries
-          path: target/codspeed/
+          path: codspeed-binaries.tar
           retention-days: 1
           if-no-files-found: error
 
@@ -149,7 +156,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: codspeed-binaries
-          path: target/codspeed/
+          path: .
+
+      - name: Unpack bench binaries (preserves executable bits)
+        run: |
+          mkdir -p target
+          tar -xf codspeed-binaries.tar -C target
 
       - name: Run single bench target
         uses: CodSpeedHQ/action@v4
