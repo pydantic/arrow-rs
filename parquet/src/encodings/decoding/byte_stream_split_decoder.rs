@@ -56,9 +56,19 @@ fn join_streams_const<const TYPE_SIZE: usize>(
     values_decoded: usize,
 ) {
     let sub_src = &src[values_decoded..];
-    for i in 0..dst.len() / TYPE_SIZE {
+    let num_values = dst.len() / TYPE_SIZE;
+
+    // Pre-slice each byte stream to exactly `num_values` length.
+    // This gives the compiler proof that indexing with `i < num_values`
+    // is always in-bounds, eliminating per-element bounds checks.
+    let streams: [&[u8]; TYPE_SIZE] =
+        std::array::from_fn(|j| &sub_src[j * stride..][..num_values]);
+
+    // `chunks_exact_mut(TYPE_SIZE)` yields slices of exactly TYPE_SIZE bytes,
+    // so `chunk[j]` for `j < TYPE_SIZE` needs no bounds check either.
+    for (i, chunk) in dst.chunks_exact_mut(TYPE_SIZE).enumerate() {
         for j in 0..TYPE_SIZE {
-            dst[i * TYPE_SIZE + j] = sub_src[i + j * stride];
+            chunk[j] = streams[j][i];
         }
     }
 }
