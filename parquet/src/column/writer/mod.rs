@@ -2677,6 +2677,500 @@ mod tests {
     }
 
     #[test]
+    fn test_column_writer_caps_page_size_for_large_byte_array_values() {
+        // Regression: the post-write data page byte limit check only fires
+        // at mini-batch boundaries, so a 1024-row mini-batch of multi-MiB
+        // BYTE_ARRAY values used to buffer multiple GiB into a single page
+        // before the limit was even consulted. With the threshold-based
+        // granular mode this batch should split into ~one page per value.
+        let value_size = 64 * 1024; // 64 KiB per value
+        let page_byte_limit = 16 * 1024; // 16 KiB page limit
+        let num_rows = 64;
+
+        let mut file = tempfile::tempfile().unwrap();
+        let mut write = TrackedWrite::new(&mut file);
+        let page_writer = Box::new(SerializedPageWriter::new(&mut write));
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_writer_version(WriterVersion::PARQUET_1_0)
+                .set_dictionary_enabled(false)
+                .set_encoding(Encoding::PLAIN)
+                .set_data_page_size_limit(page_byte_limit)
+                // Default write_batch_size (1024) — without the fix this
+                // buffers the entire input into a single ~4 MiB page.
+                .build(),
+        );
+
+        let mut data = Vec::with_capacity(num_rows);
+        for i in 0..num_rows {
+            data.push(ByteArray::from(vec![i as u8; value_size]));
+        }
+
+        let mut writer = get_test_column_writer::<ByteArrayType>(page_writer, 0, 0, props);
+        writer.write_batch(&data, None, None).unwrap();
+        let r = writer.close().unwrap();
+        drop(write);
+
+        let props = ReaderProperties::builder()
+            .set_backward_compatible_lz4(false)
+            .build();
+        let mut page_reader = Box::new(
+            SerializedPageReader::new_with_properties(
+                Arc::new(file),
+                &r.metadata,
+                r.rows_written as usize,
+                None,
+                Arc::new(props),
+            )
+            .unwrap(),
+        );
+
+        let mut data_page_sizes = Vec::new();
+        let mut data_page_value_counts = Vec::new();
+        while let Some(page) = page_reader.get_next_page().unwrap() {
+            if matches!(
+                page.page_type(),
+                PageType::DATA_PAGE | PageType::DATA_PAGE_V2
+            ) {
+                data_page_sizes.push(page.buffer().len());
+                data_page_value_counts.push(page.num_values());
+            }
+        }
+
+        // Every value must end up somewhere.
+        assert_eq!(
+            data_page_value_counts.iter().sum::<u32>() as usize,
+            num_rows
+        );
+        // Without the fix this assertion fired with one ~4 MiB page; the
+        // threshold splits the input so that no page holds more than a
+        // single oversized value's worth of bytes.
+        assert!(
+            data_page_sizes.len() >= num_rows / 2,
+            "expected pages to be cut close to one per value, got {} pages for sizes {:?}",
+            data_page_sizes.len(),
+            data_page_sizes,
+        );
+        // Each page must be bounded by roughly one value's worth of bytes;
+        // parquet allows a single oversized value to occupy a page by
+        // itself but never lets us pile many of them together.
+        for size in &data_page_sizes {
+            assert!(
+                *size <= value_size + 64,
+                "page size {size} exceeds one-value bound ({}B) — pages {:?}",
+                value_size + 64,
+                data_page_sizes,
+            );
+        }
+    }
+
+    #[test]
+    fn test_column_writer_caps_page_size_for_large_values_in_list() {
+        // Coverage for the Materialized-rep branch of
+        // `write_granular_chunk`. The flat-column regression test
+        // exercises the per-level step; this exercises the
+        // record-by-record step used when rep levels are present.
+        //
+        // Column is `list<required binary>` (max_def = 1, max_rep = 1)
+        // with 3 records of 3 large blobs each. The page byte limit is
+        // smaller than a single blob, so granular mode kicks in, and the
+        // Materialized-rep arm of `write_granular_chunk` steps from one
+        // `rep == 0` boundary to the next so a record never spans pages.
+        let value_size = 32 * 1024;
+        let page_byte_limit = 16 * 1024;
+        let values_per_record = 3;
+        let num_records = 3;
+        let num_values = values_per_record * num_records;
+
+        // rep levels: 0, 1, 1, 0, 1, 1, 0, 1, 1
+        let mut rep_levels = Vec::with_capacity(num_values);
+        for _ in 0..num_records {
+            rep_levels.push(0i16);
+            rep_levels.extend(std::iter::repeat_n(1i16, values_per_record - 1));
+        }
+        let def_levels = vec![1i16; num_values];
+
+        let mut file = tempfile::tempfile().unwrap();
+        let mut write = TrackedWrite::new(&mut file);
+        let page_writer = Box::new(SerializedPageWriter::new(&mut write));
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_writer_version(WriterVersion::PARQUET_1_0)
+                .set_dictionary_enabled(false)
+                .set_encoding(Encoding::PLAIN)
+                .set_data_page_size_limit(page_byte_limit)
+                .build(),
+        );
+
+        let mut data = Vec::with_capacity(num_values);
+        for i in 0..num_values {
+            data.push(ByteArray::from(vec![i as u8; value_size]));
+        }
+
+        let mut writer = get_test_column_writer::<ByteArrayType>(page_writer, 1, 1, props);
+        writer
+            .write_batch(&data, Some(&def_levels), Some(&rep_levels))
+            .unwrap();
+        let r = writer.close().unwrap();
+        drop(write);
+
+        let props = ReaderProperties::builder()
+            .set_backward_compatible_lz4(false)
+            .build();
+        let mut page_reader = Box::new(
+            SerializedPageReader::new_with_properties(
+                Arc::new(file),
+                &r.metadata,
+                r.rows_written as usize,
+                None,
+                Arc::new(props),
+            )
+            .unwrap(),
+        );
+
+        let mut data_pages = Vec::new();
+        while let Some(page) = page_reader.get_next_page().unwrap() {
+            if matches!(
+                page.page_type(),
+                PageType::DATA_PAGE | PageType::DATA_PAGE_V2
+            ) {
+                data_pages.push((page.buffer().len(), page.num_values()));
+            }
+        }
+
+        // The Materialized-rep arm groups levels by record, and each
+        // record's bytes blow the page byte limit on its own, so we get
+        // exactly one page per record.
+        assert_eq!(
+            data_pages.len(),
+            num_records,
+            "expected one data page per record, got {data_pages:?}"
+        );
+        for (bytes, n_values) in &data_pages {
+            assert_eq!(
+                *n_values as usize, values_per_record,
+                "each page must hold a whole record's leaves, got {data_pages:?}"
+            );
+            // Each page is one full record (its leaves cannot be split),
+            // so allow up to `values_per_record` blobs of payload plus a
+            // small fudge for level encoding overhead.
+            let upper_bound = values_per_record * (value_size + 16);
+            assert!(
+                *bytes <= upper_bound,
+                "page size {bytes} exceeds whole-record bound ({upper_bound}); pages {data_pages:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_column_writer_caps_page_size_with_nullable_large_values() {
+        // Coverage for `LevelDataRef::value_count` on Materialized def
+        // levels: a nullable column with mixed nulls and large values.
+        // `value_count` must return the actual non-null count so the
+        // byte estimate reflects bytes that will actually be written,
+        // not the level count.
+        let value_size = 32 * 1024;
+        let page_byte_limit = 16 * 1024;
+        let num_levels = 32;
+
+        // Alternating null / non-null: 16 nulls and 16 values.
+        let def_levels: Vec<i16> = (0..num_levels as i16).map(|i| i % 2).collect();
+        let num_values = def_levels.iter().filter(|&&d| d == 1).count();
+
+        let mut file = tempfile::tempfile().unwrap();
+        let mut write = TrackedWrite::new(&mut file);
+        let page_writer = Box::new(SerializedPageWriter::new(&mut write));
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_writer_version(WriterVersion::PARQUET_1_0)
+                .set_dictionary_enabled(false)
+                .set_encoding(Encoding::PLAIN)
+                .set_data_page_size_limit(page_byte_limit)
+                .build(),
+        );
+
+        let mut data = Vec::with_capacity(num_values);
+        for i in 0..num_values {
+            data.push(ByteArray::from(vec![i as u8; value_size]));
+        }
+
+        let mut writer = get_test_column_writer::<ByteArrayType>(page_writer, 1, 0, props);
+        writer.write_batch(&data, Some(&def_levels), None).unwrap();
+        let r = writer.close().unwrap();
+        drop(write);
+
+        let props = ReaderProperties::builder()
+            .set_backward_compatible_lz4(false)
+            .build();
+        let mut page_reader = Box::new(
+            SerializedPageReader::new_with_properties(
+                Arc::new(file),
+                &r.metadata,
+                r.rows_written as usize,
+                None,
+                Arc::new(props),
+            )
+            .unwrap(),
+        );
+
+        let mut data_pages = Vec::new();
+        while let Some(page) = page_reader.get_next_page().unwrap() {
+            if matches!(
+                page.page_type(),
+                PageType::DATA_PAGE | PageType::DATA_PAGE_V2
+            ) {
+                data_pages.push(page.buffer().len());
+            }
+        }
+
+        // With 16 actual values of 32 KiB each and a 16 KiB page limit,
+        // every non-null value should get its own page (plus possibly
+        // adjacent nulls). At minimum, the number of pages must be
+        // roughly the value count, not 1 (which is what `main` produced).
+        assert!(
+            data_pages.len() >= num_values / 2,
+            "expected at least {} pages for {num_values} large values, got {} pages: {data_pages:?}",
+            num_values / 2,
+            data_pages.len(),
+        );
+        // No page contains more than ~one value's worth of payload bytes.
+        for size in &data_pages {
+            assert!(
+                *size <= value_size + 64,
+                "page size {size} exceeds one-value bound; pages {data_pages:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_column_writer_dict_enabled_large_values_post_spill() {
+        // While dictionary encoding is active, `has_dictionary()` short-
+        // circuits `estimated_value_bytes` — the byte estimate is plain-
+        // encoded size but dict-encoded pages only store small RLE
+        // indices, so we'd otherwise shrink pages spuriously. Once the
+        // dictionary spills (each value is large + unique), plain
+        // encoding takes over and the byte-budget sub-batch kicks in.
+        //
+        // This test makes sure the writer survives that transition and
+        // produces bounded pages thereafter.
+        let value_size = 64 * 1024;
+        let page_byte_limit = 16 * 1024;
+        let num_rows = 32;
+
+        let mut file = tempfile::tempfile().unwrap();
+        let mut write = TrackedWrite::new(&mut file);
+        let page_writer = Box::new(SerializedPageWriter::new(&mut write));
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_writer_version(WriterVersion::PARQUET_1_0)
+                .set_dictionary_enabled(true)
+                // Force a small dict so it spills quickly even though
+                // each value here is unique.
+                .set_dictionary_page_size_limit(1024)
+                .set_data_page_size_limit(page_byte_limit)
+                // Small mini-batches so dict fallback happens part-way
+                // through the input, leaving subsequent mini-batches to
+                // exercise the post-spill plain-encoding path that the
+                // page-size fix actually targets.
+                .set_write_batch_size(4)
+                .build(),
+        );
+
+        let mut data = Vec::with_capacity(num_rows);
+        for i in 0..num_rows {
+            data.push(ByteArray::from(vec![i as u8; value_size]));
+        }
+
+        let mut writer = get_test_column_writer::<ByteArrayType>(page_writer, 0, 0, props);
+        writer.write_batch(&data, None, None).unwrap();
+        let r = writer.close().unwrap();
+        drop(write);
+
+        let props = ReaderProperties::builder()
+            .set_backward_compatible_lz4(false)
+            .build();
+        let mut page_reader = Box::new(
+            SerializedPageReader::new_with_properties(
+                Arc::new(file),
+                &r.metadata,
+                r.rows_written as usize,
+                None,
+                Arc::new(props),
+            )
+            .unwrap(),
+        );
+
+        let mut data_pages = Vec::new();
+        while let Some(page) = page_reader.get_next_page().unwrap() {
+            if matches!(
+                page.page_type(),
+                PageType::DATA_PAGE | PageType::DATA_PAGE_V2
+            ) {
+                data_pages.push(page.buffer().len());
+            }
+        }
+
+        // After spill, plain encoding writes one ~64 KiB value per page.
+        // Without the fix, post-spill writes still buffered all 32
+        // values into a single ~2 MiB page.
+        assert!(
+            data_pages.len() >= num_rows / 2,
+            "expected >= {} data pages after dict spill, got {} ({data_pages:?})",
+            num_rows / 2,
+            data_pages.len(),
+        );
+        for size in &data_pages {
+            assert!(
+                *size <= value_size + 64,
+                "page size {size} exceeds one-value bound; pages {data_pages:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_column_writer_caps_dictionary_page_size() {
+        // A column of large *distinct* values with dictionary encoding on:
+        // the dictionary page accumulates the values themselves, and its
+        // spill check runs only once per mini-batch. Without bounding the
+        // dictionary-encoding mini-batch, one `write_batch_size` mini-batch
+        // would intern `write_batch_size * value_size` bytes into the
+        // dictionary page before the check fires (~16 MiB here). The chunker
+        // must sub-batch the dictionary-encoding phase too.
+        let value_size = 8 * 1024;
+        let dict_page_limit = 64 * 1024;
+        let num_rows = 2048;
+
+        let mut file = tempfile::tempfile().unwrap();
+        let mut write = TrackedWrite::new(&mut file);
+        let page_writer = Box::new(SerializedPageWriter::new(&mut write));
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_writer_version(WriterVersion::PARQUET_1_0)
+                .set_dictionary_enabled(true)
+                .set_dictionary_page_size_limit(dict_page_limit)
+                .build(),
+        );
+
+        let mut data = Vec::with_capacity(num_rows);
+        for i in 0..num_rows {
+            // each value distinct, so the dictionary cannot dedup them
+            let mut v = vec![0u8; value_size];
+            v[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            data.push(ByteArray::from(v));
+        }
+
+        let mut writer = get_test_column_writer::<ByteArrayType>(page_writer, 0, 0, props);
+        writer.write_batch(&data, None, None).unwrap();
+        let r = writer.close().unwrap();
+        drop(write);
+
+        let props = ReaderProperties::builder()
+            .set_backward_compatible_lz4(false)
+            .build();
+        let mut page_reader = Box::new(
+            SerializedPageReader::new_with_properties(
+                Arc::new(file),
+                &r.metadata,
+                r.rows_written as usize,
+                None,
+                Arc::new(props),
+            )
+            .unwrap(),
+        );
+
+        let mut dict_page_size = 0;
+        while let Some(page) = page_reader.get_next_page().unwrap() {
+            if page.page_type() == PageType::DICTIONARY_PAGE {
+                dict_page_size = dict_page_size.max(page.buffer().len());
+            }
+        }
+
+        assert!(
+            dict_page_size > 0,
+            "expected the column to dictionary-encode"
+        );
+        // Bounded near the limit (~2x from the post-mini-batch check). Before
+        // the fix the dictionary page reached num_rows * value_size (~16 MiB,
+        // 256x the limit).
+        assert!(
+            dict_page_size <= 3 * dict_page_limit,
+            "dictionary page {dict_page_size} exceeds 3x the {dict_page_limit} limit",
+        );
+    }
+
+    #[test]
+    fn test_column_writer_caps_page_size_for_fixed_len_byte_array() {
+        // Coverage for `ParquetValueType::byte_size` override on
+        // `FixedLenByteArray`. With `type_length = 1`, each plain-encoded
+        // value is one byte, so a 4-byte page byte limit forces the
+        // sub-batch sizer to write ~4 values per page rather than one
+        // page for the whole batch.
+        let page_byte_limit = 4;
+        let num_values = 128;
+
+        let mut file = tempfile::tempfile().unwrap();
+        let mut write = TrackedWrite::new(&mut file);
+        let page_writer = Box::new(SerializedPageWriter::new(&mut write));
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_writer_version(WriterVersion::PARQUET_1_0)
+                .set_dictionary_enabled(false)
+                .set_encoding(Encoding::PLAIN)
+                .set_data_page_size_limit(page_byte_limit)
+                .build(),
+        );
+
+        let mut data = Vec::with_capacity(num_values);
+        for i in 0..num_values {
+            let mut fla = FixedLenByteArray::default();
+            fla.set_data(Bytes::from(vec![i as u8]));
+            data.push(fla);
+        }
+
+        let mut writer = get_test_column_writer::<FixedLenByteArrayType>(page_writer, 0, 0, props);
+        writer.write_batch(&data, None, None).unwrap();
+        let r = writer.close().unwrap();
+        drop(write);
+
+        let props = ReaderProperties::builder()
+            .set_backward_compatible_lz4(false)
+            .build();
+        let mut page_reader = Box::new(
+            SerializedPageReader::new_with_properties(
+                Arc::new(file),
+                &r.metadata,
+                r.rows_written as usize,
+                None,
+                Arc::new(props),
+            )
+            .unwrap(),
+        );
+
+        let mut data_pages = Vec::new();
+        while let Some(page) = page_reader.get_next_page().unwrap() {
+            if matches!(
+                page.page_type(),
+                PageType::DATA_PAGE | PageType::DATA_PAGE_V2
+            ) {
+                data_pages.push(page.buffer().len());
+            }
+        }
+
+        // Without the fix this is a single 128-byte page; with the fix
+        // the byte budget caps each page at ~`page_byte_limit` bytes.
+        assert!(
+            data_pages.len() >= num_values / 8,
+            "expected pages capped by byte budget, got {data_pages:?}"
+        );
+        for size in &data_pages {
+            assert!(
+                *size <= page_byte_limit * 4,
+                "page size {size} larger than expected; pages {data_pages:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_bool_statistics() {
         let stats = statistics_roundtrip::<BoolType>(&[true, false, false, true]);
         // Booleans have an unsigned sort order and so are not compatible
