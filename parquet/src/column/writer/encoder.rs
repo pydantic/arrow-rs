@@ -90,6 +90,42 @@ pub trait ColumnValueEncoder {
     /// Write the values at the indexes in `indices` to this [`ColumnValueEncoder`]
     fn write_gather(&mut self, values: &Self::Values, indices: &[usize]) -> Result<()>;
 
+    /// Returns the largest `k` such that the first `k` values in
+    /// `values[offset..offset + len]` encode to at most `byte_budget`
+    /// bytes — i.e. how many values fit in a single page byte budget.
+    ///
+    /// Returns `len` if every value fits. Returns at least 1 if a single
+    /// value alone exceeds the budget, matching parquet's "at least one
+    /// value per data page" rule.
+    ///
+    /// `None` means "no cheap estimate available"; the caller stays on
+    /// the batched fast path and lets the post-write
+    /// `should_add_data_page` check handle bounding.
+    ///
+    /// Implementations should short-circuit aggressively: the typical
+    /// case is "everything fits, return `len`", and the next-most-common
+    /// case is "one wide value, return 1." The variable-width walk only
+    /// needs to be precise when the chunk is genuinely near the budget.
+    fn count_values_within_byte_budget(
+        _values: &Self::Values,
+        _offset: usize,
+        _len: usize,
+        _byte_budget: usize,
+    ) -> Option<usize> {
+        None
+    }
+
+    /// As [`Self::count_values_within_byte_budget`] but using gather
+    /// `indices` rather than a contiguous range. Returns the number of
+    /// `indices` that fit, not the maximum index value.
+    fn count_values_within_byte_budget_gather(
+        _values: &Self::Values,
+        _indices: &[usize],
+        _byte_budget: usize,
+    ) -> Option<usize> {
+        None
+    }
+
     /// Returns the number of buffered values
     fn num_values(&self) -> usize;
 
@@ -245,6 +281,63 @@ impl<T: DataType> ColumnValueEncoder for ColumnValueEncoderImpl<T> {
         self.num_values += indices.len();
         let slice: Vec<_> = indices.iter().map(|idx| values[*idx].clone()).collect();
         self.write_slice(&slice)
+    }
+
+    fn count_values_within_byte_budget(
+        values: &[T::T],
+        offset: usize,
+        len: usize,
+        byte_budget: usize,
+    ) -> Option<usize> {
+        // Clamp so that a caller-supplied `len` that overruns the input
+        // (e.g. a level/value mismatch the encoder will reject later)
+        // returns an estimate instead of panicking here.
+        let end = (offset + len).min(values.len());
+        let start = offset.min(end);
+        let n = end - start;
+        // Fixed-size physical types have a constant per-value byte cost,
+        // so the answer is one division — no need to walk the slice.
+        let phys = <T::T as ParquetValueType>::PHYSICAL_TYPE;
+        if phys != Type::BYTE_ARRAY && phys != Type::FIXED_LEN_BYTE_ARRAY {
+            let per = std::mem::size_of::<T::T>().max(1);
+            let fits = (byte_budget / per).max(1);
+            return Some(fits.min(n));
+        }
+        // Variable-width: scan, accumulate, exit at the first value that
+        // pushes us past the budget. This both bounds skewed
+        // distributions (one outlier among small values is caught when
+        // it lands, regardless of position) and short-circuits when an
+        // early value alone exceeds the budget.
+        let mut cum: usize = 0;
+        for (i, v) in values[start..end].iter().enumerate() {
+            cum = cum.saturating_add(plain_encoded_byte_size::<T>(v));
+            if cum > byte_budget {
+                return Some(i.max(1));
+            }
+        }
+        Some(n)
+    }
+
+    fn count_values_within_byte_budget_gather(
+        values: &[T::T],
+        indices: &[usize],
+        byte_budget: usize,
+    ) -> Option<usize> {
+        let phys = <T::T as ParquetValueType>::PHYSICAL_TYPE;
+        if phys != Type::BYTE_ARRAY && phys != Type::FIXED_LEN_BYTE_ARRAY {
+            let per = std::mem::size_of::<T::T>().max(1);
+            let fits = (byte_budget / per).max(1);
+            return Some(fits.min(indices.len()));
+        }
+        let mut cum: usize = 0;
+        for (i, idx) in indices.iter().enumerate() {
+            let Some(v) = values.get(*idx) else { continue };
+            cum = cum.saturating_add(plain_encoded_byte_size::<T>(v));
+            if cum > byte_budget {
+                return Some(i.max(1));
+            }
+        }
+        Some(indices.len())
     }
 
     fn num_values(&self) -> usize {
@@ -409,5 +502,40 @@ where
         for val in iter {
             bounder.update_wkb(val.as_bytes());
         }
+    }
+}
+
+/// Plain-encoded byte cost of a single value of type `T::T`.
+///
+/// Derived from [`ParquetValueType::dict_encoding_size`] so we don't add a
+/// parallel per-value-size hook to the trait. The components returned by
+/// `dict_encoding_size` are `(per-value overhead, value-bytes)`. For
+/// plain encoding the on-disk layout is:
+///
+/// - `BYTE_ARRAY`: 4-byte length prefix + payload bytes = `overhead + bytes`.
+/// - `FIXED_LEN_BYTE_ARRAY`: raw bytes only, taken from the type descriptor's
+///   `type_length`. The value's own `dict_encoding_size` reports the length
+///   prefix, which is irrelevant for plain FLBA encoding; the encoder passes
+///   `type_length` directly.
+/// - Everything else (numeric / bool): a constant per-value size; the caller
+///   already short-circuits these via `mem::size_of::<T::T>()` before
+///   touching this function, so this branch is unreachable in practice and
+///   we fall back to `overhead` defensively.
+///
+/// See `dict_encoder.rs::push` (line ~52) for the matching dispatch.
+///
+/// Placed at the end of the module deliberately. Inserting it above the
+/// `ColumnValueEncoder` trait shifts the trait and `ColumnValueEncoderImpl`
+/// within the compiled module enough to perturb downstream code placement,
+/// which measurably regresses unrelated arrow-writer string benchmarks
+/// (~5-9% on `string` / `string_and_binary_view`). Defining it last keeps
+/// the hot encoder code at the offsets it has on `main`.
+#[inline]
+fn plain_encoded_byte_size<T: DataType>(value: &T::T) -> usize {
+    let (overhead, bytes) = value.dict_encoding_size();
+    match <T::T as ParquetValueType>::PHYSICAL_TYPE {
+        Type::BYTE_ARRAY => overhead + bytes,
+        Type::FIXED_LEN_BYTE_ARRAY => bytes,
+        _ => overhead,
     }
 }

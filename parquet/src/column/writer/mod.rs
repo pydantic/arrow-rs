@@ -49,7 +49,10 @@ use crate::file::properties::{
 use crate::file::statistics::{Statistics, ValueStatistics};
 use crate::schema::types::{ColumnDescPtr, ColumnDescriptor};
 
+mod byte_budget_chunker;
 pub(crate) mod encoder;
+
+use byte_budget_chunker::ByteBudgetChunker;
 
 macro_rules! downcast_writer {
     ($e:expr, $i:ident, $b:expr) => {
@@ -374,6 +377,24 @@ impl<'a> LevelDataRef<'a> {
             Self::Uniform { value, .. } => Self::Uniform { value, count: len },
         }
     }
+
+    /// Count of positions in this slice that represent an actual value
+    /// (definition level equal to `max_def`). `Absent` means the column has
+    /// `max_def == 0` and every position is a value, so the implicit count
+    /// is the caller-supplied `total`.
+    pub(crate) fn value_count(self, total: usize, max_def: i16) -> usize {
+        match self {
+            Self::Absent => total,
+            Self::Materialized(values) => values.iter().filter(|&&d| d == max_def).count(),
+            Self::Uniform { value, count } => {
+                if value == max_def {
+                    count
+                } else {
+                    0
+                }
+            }
+        }
+    }
 }
 
 /// Typed column writer for a primitive column.
@@ -545,6 +566,7 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         } else {
             self.props.write_batch_size()
         };
+        let chunker = ByteBudgetChunker::new(&self.descr, &self.props, base_batch_size);
         while levels_offset < num_levels {
             let mut end_offset = num_levels.min(levels_offset + base_batch_size);
 
@@ -555,14 +577,39 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
                 }
             }
 
-            values_offset += self.write_mini_batch(
+            let chunk_size = end_offset - levels_offset;
+            let chunk_def = def_levels.slice(levels_offset, chunk_size);
+            let chunk_rep = rep_levels.slice(levels_offset, chunk_size);
+
+            let sub_batch_size = chunker.pick_sub_batch_size(
+                &self.encoder,
                 values,
-                values_offset,
                 value_indices,
-                end_offset - levels_offset,
-                def_levels.slice(levels_offset, end_offset - levels_offset),
-                rep_levels.slice(levels_offset, end_offset - levels_offset),
-            )?;
+                chunk_def,
+                values_offset,
+                chunk_size,
+            );
+
+            if sub_batch_size >= chunk_size {
+                values_offset += self.write_mini_batch(
+                    values,
+                    values_offset,
+                    value_indices,
+                    chunk_size,
+                    chunk_def,
+                    chunk_rep,
+                )?;
+            } else {
+                values_offset += self.write_granular_chunk(
+                    values,
+                    values_offset,
+                    value_indices,
+                    chunk_size,
+                    chunk_def,
+                    chunk_rep,
+                    sub_batch_size,
+                )?;
+            }
             levels_offset = end_offset;
         }
 
@@ -711,6 +758,78 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             column_index,
             offset_index,
         })
+    }
+
+    /// Writes a chunk in sub-batches sized by the caller-supplied
+    /// `sub_batch_size` so the post-write data page byte limit check
+    /// fires before the chunk can grossly overshoot
+    /// `data_page_size_limit`.
+    ///
+    /// For flat (unrepeated) columns sub-batches contain up to
+    /// `sub_batch_size` levels each. For repeated/nested columns
+    /// sub-batches step from one `rep == 0` boundary to the next so a
+    /// record never spans data pages, matching the parquet format rule.
+    ///
+    /// Returns the total number of values consumed across all sub-batches.
+    ///
+    /// `#[inline(never)]` keeps this slow path — only reached for
+    /// variable-width columns whose values need page splitting — out of
+    /// the hot `write_batch_internal` loop.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn write_granular_chunk(
+        &mut self,
+        values: &E::Values,
+        values_offset: usize,
+        value_indices: Option<&[usize]>,
+        chunk_size: usize,
+        chunk_def: LevelDataRef<'_>,
+        chunk_rep: LevelDataRef<'_>,
+        sub_batch_size: usize,
+    ) -> Result<usize> {
+        let mut values_consumed = 0;
+        let mut sub_start = 0;
+        while sub_start < chunk_size {
+            let sub_end = match chunk_rep {
+                LevelDataRef::Materialized(levels) => {
+                    // Pack up to `sub_batch_size` levels per mini-batch, then
+                    // extend to the next record boundary (rep == 0) so a
+                    // record never spans data pages. Packing whole records
+                    // rather than stepping one record at a time avoids
+                    // emitting a `write_mini_batch` per record: records
+                    // average only a handful of levels, so the
+                    // record-at-a-time loop issued roughly `sub_batch_size`×
+                    // more mini-batches than necessary.
+                    let mut e = (sub_start + sub_batch_size).min(chunk_size);
+                    while e < chunk_size && levels[e] != 0 {
+                        e += 1;
+                    }
+                    // `sub_batch_size` can be 0 when the chunker sizes a
+                    // sub-batch below one record; always make progress by
+                    // consuming at least the first whole record.
+                    if e == sub_start {
+                        e = sub_start + 1;
+                        while e < chunk_size && levels[e] != 0 {
+                            e += 1;
+                        }
+                    }
+                    e
+                }
+                _ => (sub_start + sub_batch_size).min(chunk_size),
+            };
+            let sub_len = sub_end - sub_start;
+            let written = self.write_mini_batch(
+                values,
+                values_offset + values_consumed,
+                value_indices,
+                sub_len,
+                chunk_def.slice(sub_start, sub_len),
+                chunk_rep.slice(sub_start, sub_len),
+            )?;
+            values_consumed += written;
+            sub_start = sub_end;
+        }
+        Ok(values_consumed)
     }
 
     /// Creates a new streaming level encoder appropriate for the writer version.
@@ -5209,6 +5328,42 @@ mod tests {
                 assert_eq!(&v[..levels_read], self.expected_rep_levels.unwrap());
             }
         }
+    }
+
+    #[test]
+    fn test_level_data_ref_value_count() {
+        // `value_count` is what the byte-budget chunker uses to convert a
+        // chunk's level span into a leaf-value count. It must work for any
+        // column shape — flat, nullable, or nested — because the leaf
+        // values array is decoupled from the rep/def level stream.
+        let max_def = 2;
+        // Non-nullable / unrepeated: no def levels materialized — every
+        // level is a value.
+        assert_eq!(LevelDataRef::Absent.value_count(64, max_def), 64);
+        // Uniform run of present values, and of nulls.
+        assert_eq!(
+            LevelDataRef::Uniform {
+                value: max_def,
+                count: 40
+            }
+            .value_count(40, max_def),
+            40
+        );
+        assert_eq!(
+            LevelDataRef::Uniform {
+                value: max_def - 1,
+                count: 40
+            }
+            .value_count(40, max_def),
+            0
+        );
+        // Materialized def levels (nullable / nested): only levels equal to
+        // `max_def` are values; empty-list / null levels are not.
+        let levels = [2i16, 0, 2, 1, 2, 2, 0];
+        assert_eq!(
+            LevelDataRef::Materialized(&levels).value_count(levels.len(), max_def),
+            4
+        );
     }
 
     #[test]
