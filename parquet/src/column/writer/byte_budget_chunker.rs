@@ -51,6 +51,12 @@ pub(crate) struct ByteBudgetChunker {
     /// decision short-circuit with no work for every numeric, bool, or
     /// narrow `FIXED_LEN_BYTE_ARRAY` column.
     static_always_fits: bool,
+    /// Configured dictionary page byte limit for the column.
+    dict_page_byte_limit: usize,
+    /// As [`Self::static_always_fits`] but for the dictionary page: `true`
+    /// when one `base_batch_size` mini-batch of this fixed-width type cannot
+    /// overshoot `dict_page_byte_limit` by more than one mini-batch's worth.
+    static_dict_always_fits: bool,
 }
 
 impl ByteBudgetChunker {
@@ -61,6 +67,7 @@ impl ByteBudgetChunker {
         base_batch_size: usize,
     ) -> Self {
         let page_byte_limit = props.column_data_page_size_limit(descr.path());
+        let dict_page_byte_limit = props.column_dictionary_page_size_limit(descr.path());
         let static_bytes_per_value = match descr.physical_type() {
             Type::BOOLEAN => Some(1),
             Type::INT32 | Type::FLOAT => Some(std::mem::size_of::<i32>()),
@@ -69,27 +76,36 @@ impl ByteBudgetChunker {
             Type::FIXED_LEN_BYTE_ARRAY => Some(descr.type_length().max(0) as usize),
             Type::BYTE_ARRAY => None,
         };
-        let static_always_fits = static_bytes_per_value
-            .map(|b| b.saturating_mul(base_batch_size) <= page_byte_limit)
-            .unwrap_or(false);
+        let static_fits = |limit: usize| {
+            static_bytes_per_value
+                .map(|b| b.saturating_mul(base_batch_size) <= limit)
+                .unwrap_or(false)
+        };
         Self {
             page_byte_limit,
             max_def_level: descr.max_def_level(),
-            static_always_fits,
+            static_always_fits: static_fits(page_byte_limit),
+            dict_page_byte_limit,
+            static_dict_always_fits: static_fits(dict_page_byte_limit),
         }
     }
 
     /// Decide how many levels at the start of a chunk belong in one
-    /// mini-batch, so the mini-batch cannot overflow the data page that is
-    /// currently accumulating value bytes. A returned value smaller than
-    /// `chunk_size` triggers granular sub-batching in
+    /// mini-batch, so the mini-batch cannot overflow whichever page is
+    /// currently accumulating value bytes: the data page when plain-encoding,
+    /// or the *dictionary* page while dictionary-encoding. A returned value
+    /// smaller than `chunk_size` triggers granular sub-batching in
     /// `write_batch_internal`.
     ///
+    /// While dictionary-encoding, the data page holds only small RLE indices,
+    /// but the dictionary page accumulates the distinct values themselves —
+    /// so it is the dictionary page's remaining budget that must bound the
+    /// mini-batch. The per-mini-batch dictionary spill check would otherwise
+    /// let one mini-batch of large values balloon the dictionary page.
+    ///
     /// Returns `chunk_size` immediately (no value inspection) when the chunk
-    /// is empty, when the column is dictionary-encoding (the data page then
-    /// holds only small RLE indices, so the plain-encoded byte estimate does
-    /// not apply), or when the column is a fixed-width type whose
-    /// mini-batches statically cannot overshoot the data page.
+    /// is empty, or when the column is a fixed-width type whose mini-batches
+    /// statically cannot overshoot the relevant page.
     ///
     /// `#[inline]`: this is a tiny per-chunk dispatcher; the actual byte
     /// inspection lives in the out-of-line `byte_budget_sub_batch_size`.
@@ -106,27 +122,34 @@ impl ByteBudgetChunker {
         if chunk_size == 0 {
             return chunk_size;
         }
-        // While dictionary-encoding, the data page holds only small RLE
-        // indices — the plain-encoded byte estimate would spuriously shrink
-        // pages — so stay on the batched fast path.
-        if encoder.has_dictionary() {
-            return chunk_size;
-        }
-        if self.static_always_fits {
-            return chunk_size;
-        }
+        let budget = if encoder.has_dictionary() {
+            if self.static_dict_always_fits {
+                return chunk_size;
+            }
+            // Bound the mini-batch by the dictionary page's *remaining*
+            // budget (it accumulates across mini-batches until it spills).
+            match encoder.estimated_dict_page_size() {
+                Some(used) => self.dict_page_byte_limit.saturating_sub(used),
+                None => return chunk_size,
+            }
+        } else {
+            if self.static_always_fits {
+                return chunk_size;
+            }
+            self.page_byte_limit
+        };
         self.byte_budget_sub_batch_size::<E>(
             values,
             value_indices,
             chunk_def,
             values_offset,
             chunk_size,
-            self.page_byte_limit,
+            budget,
         )
     }
 
     /// Inspect value sizes to decide how many of the chunk's values fit in
-    /// `budget` bytes (the data page remaining budget).
+    /// `budget` bytes (the data page or dictionary page remaining budget).
     ///
     /// `#[inline(never)]` keeps this slow path out of the hot
     /// `write_batch_internal` loop; numeric and bool columns never reach it.

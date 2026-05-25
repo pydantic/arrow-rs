@@ -408,16 +408,16 @@ fn test_string() {
                 columns: vec![ColumnChunk {
                     pages: vec![
                         Page {
-                            rows: 130,
+                            rows: 125,
                             page_header_size: 38,
-                            compressed_size: 138,
+                            compressed_size: 114,
                             encoding: Encoding::RLE_DICTIONARY,
                             page_type: PageType::DATA_PAGE,
                         },
                         Page {
-                            rows: 1250,
+                            rows: 1255,
                             page_header_size: 40,
-                            compressed_size: 10000,
+                            compressed_size: 10040,
                             encoding: Encoding::PLAIN,
                             page_type: PageType::DATA_PAGE,
                         },
@@ -429,10 +429,15 @@ fn test_string() {
                             page_type: PageType::DATA_PAGE,
                         },
                     ],
+                    // The byte-budget chunker now sub-batches the
+                    // dictionary-encoding phase, so the dictionary page is
+                    // bounded at the 1000-byte limit instead of overshooting
+                    // to 1040 — the dictionary spills one mini-batch earlier
+                    // (125 rows rather than 130).
                     dictionary_page: Some(Page {
-                        rows: 130,
+                        rows: 125,
                         page_header_size: 38,
-                        compressed_size: 1040,
+                        compressed_size: 1000,
                         encoding: Encoding::PLAIN,
                         page_type: PageType::DICTIONARY_PAGE,
                     }),
