@@ -408,16 +408,16 @@ fn test_string() {
                 columns: vec![ColumnChunk {
                     pages: vec![
                         Page {
-                            rows: 125,
+                            rows: 126,
                             page_header_size: 38,
                             compressed_size: 114,
                             encoding: Encoding::RLE_DICTIONARY,
                             page_type: PageType::DATA_PAGE,
                         },
                         Page {
-                            rows: 1255,
+                            rows: 1254,
                             page_header_size: 40,
-                            compressed_size: 10040,
+                            compressed_size: 10032,
                             encoding: Encoding::PLAIN,
                             page_type: PageType::DATA_PAGE,
                         },
@@ -429,15 +429,16 @@ fn test_string() {
                             page_type: PageType::DATA_PAGE,
                         },
                     ],
-                    // The byte-budget chunker now sub-batches the
-                    // dictionary-encoding phase, so the dictionary page is
-                    // bounded at the 1000-byte limit instead of overshooting
-                    // to 1040 — the dictionary spills one mini-batch earlier
-                    // (125 rows rather than 130).
+                    // The byte-budget chunker sub-batches the dictionary
+                    // phase. The mini-batch deliberately includes the value
+                    // that crosses the 1000-byte limit so the spill triggers
+                    // on this chunk rather than carrying a sliver into the
+                    // next page (see #9972 discussion), giving a 126-row
+                    // dictionary page at 1008 bytes.
                     dictionary_page: Some(Page {
-                        rows: 125,
+                        rows: 126,
                         page_header_size: 38,
-                        compressed_size: 1000,
+                        compressed_size: 1008,
                         encoding: Encoding::PLAIN,
                         page_type: PageType::DICTIONARY_PAGE,
                     }),
