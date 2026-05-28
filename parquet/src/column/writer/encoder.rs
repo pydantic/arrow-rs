@@ -307,12 +307,15 @@ impl<T: DataType> ColumnValueEncoder for ColumnValueEncoderImpl<T> {
         // pushes us past the budget. This both bounds skewed
         // distributions (one outlier among small values is caught when
         // it lands, regardless of position) and short-circuits when an
-        // early value alone exceeds the budget.
+        // early value alone exceeds the budget. The boundary value is
+        // included in the returned count so the caller's page-flush check
+        // trips on this mini-batch rather than leaving a sliver to glue
+        // onto the next page (see #9972 discussion).
         let mut cum: usize = 0;
         for (i, v) in values[start..end].iter().enumerate() {
             cum = cum.saturating_add(plain_encoded_byte_size::<T>(v));
             if cum > byte_budget {
-                return Some(i.max(1));
+                return Some(i + 1);
             }
         }
         Some(n)
@@ -334,7 +337,7 @@ impl<T: DataType> ColumnValueEncoder for ColumnValueEncoderImpl<T> {
             let Some(v) = values.get(*idx) else { continue };
             cum = cum.saturating_add(plain_encoded_byte_size::<T>(v));
             if cum > byte_budget {
-                return Some(i.max(1));
+                return Some(i + 1);
             }
         }
         Some(indices.len())

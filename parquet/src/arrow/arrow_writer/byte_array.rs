@@ -681,10 +681,11 @@ where
 
 /// Cumulative-scan fallback used for byte array types that don't expose
 /// a single contiguous offsets buffer — view arrays, dictionary arrays,
-/// fixed-size binary. Returns the largest `k` such that the first `k`
-/// values picked out by `indices` encode to at most `byte_budget` bytes
-/// (or `indices.len()` if they all fit, or `1` if a single value alone
-/// exceeds the budget).
+/// fixed-size binary. Returns `indices.len()` if every value fits the
+/// budget, otherwise the smallest `k ≥ 1` whose first `k` values' encoded
+/// size first exceeds `byte_budget` — i.e. the boundary value is included
+/// so the caller's page-flush check trips immediately on this mini-batch,
+/// without leaving a sliver to glue onto the next page.
 ///
 /// Free function so it can be used with `downcast_op!`.
 fn count_within_budget_accessor<T>(values: T, indices: &[usize], byte_budget: usize) -> usize
@@ -697,7 +698,7 @@ where
         let value_len = values.value(*idx).as_ref().len() + std::mem::size_of::<u32>();
         cum = cum.saturating_add(value_len);
         if cum > byte_budget {
-            return i.max(1);
+            return i + 1;
         }
     }
     indices.len()
@@ -750,7 +751,7 @@ fn count_within_budget_views(
         let len = (views[*idx] as u32) as usize;
         cum = cum.saturating_add(len + std::mem::size_of::<u32>());
         if cum > byte_budget {
-            return i.max(1);
+            return i + 1;
         }
     }
     indices.len()
@@ -808,7 +809,7 @@ fn count_within_budget_offsets<T: ByteArrayType>(
         let len = (offsets[idx + 1] - offsets[*idx]).as_usize() + prefix_overhead;
         cum = cum.saturating_add(len);
         if cum > byte_budget {
-            return i.max(1);
+            return i + 1;
         }
     }
     n
