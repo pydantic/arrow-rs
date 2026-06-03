@@ -611,16 +611,6 @@ fn test_per_column_data_page_size_limit() {
 #[test]
 fn test_fixed_size_binary() {
     // FixedSizeBinary values larger than the data page byte limit.
-    //
-    // The arrow writer routes a (non-dictionary) FixedSizeBinary column
-    // through the *generic* column writer
-    // (`ColumnValueEncoderImpl<FixedLenByteArrayType>`), not the byte-array
-    // encoder. Its byte-budget chunker uses the plain-encoded value size —
-    // `type_length` bytes, with no length prefix for FIXED_LEN_BYTE_ARRAY —
-    // to cap each data page. With 1 KiB values and a 4 KiB page limit, a
-    // mini-batch grows until its cumulative bytes first cross the limit
-    // (the boundary value is included), so 5 values land per page (5120 B)
-    // instead of buffering all 64 values into one ~64 KiB page.
     let value_size = 1024usize;
     let num_rows = 64usize;
     let values: Vec<u8> = (0..num_rows)
@@ -672,16 +662,6 @@ fn test_fixed_size_binary() {
 #[test]
 fn test_dictionary() {
     // Arrow `DictionaryArray<Int32, Utf8>` input.
-    //
-    // The byte-budget chunker's gather path has a dedicated arm for
-    // dictionary-typed arrow input that reports "everything fits"
-    // (`indices.len()`), keeping the column on the batched fast path: an
-    // arrow array that is *already* dictionary-encoded implies its values
-    // are small enough that dedup is worthwhile — the opposite of the large
-    // blob case the page-size fix targets — so there is nothing to bound and
-    // walking dict keys per chunk would only cost time. This test drives that
-    // arm and confirms the column still lays out as a normal dictionary
-    // column (one small dictionary page + one RLE_DICTIONARY data page).
     let num_rows = 2000;
     let dict_values = StringArray::from_iter_values(["alpha", "beta", "gamma", "delta"]);
     let keys = Int32Array::from_iter_values((0..num_rows).map(|i| i % 4));
