@@ -627,7 +627,8 @@ fn test_fixed_size_binary() {
         .flat_map(|i| vec![i as u8; value_size])
         .collect();
     let array =
-        Arc::new(FixedSizeBinaryArray::try_new(value_size as i32, values.into(), None).unwrap()) as _;
+        Arc::new(FixedSizeBinaryArray::try_new(value_size as i32, values.into(), None).unwrap())
+            as _;
     let batch = RecordBatch::try_from_iter([("col", array)]).unwrap();
 
     let props = WriterProperties::builder()
@@ -683,9 +684,9 @@ fn test_dictionary() {
     // column (one small dictionary page + one RLE_DICTIONARY data page).
     let num_rows = 2000;
     let dict_values = StringArray::from_iter_values(["alpha", "beta", "gamma", "delta"]);
-    let keys = Int32Array::from_iter_values((0..num_rows as i32).map(|i| i % 4));
-    let array = Arc::new(DictionaryArray::<Int32Type>::try_new(keys, Arc::new(dict_values)).unwrap())
-        as _;
+    let keys = Int32Array::from_iter_values((0..num_rows).map(|i| i % 4));
+    let array =
+        Arc::new(DictionaryArray::<Int32Type>::try_new(keys, Arc::new(dict_values)).unwrap()) as _;
     let batch = RecordBatch::try_from_iter([("col", array)]).unwrap();
 
     let props = WriterProperties::builder()
@@ -721,4 +722,3 @@ fn test_dictionary() {
         },
     });
 }
-

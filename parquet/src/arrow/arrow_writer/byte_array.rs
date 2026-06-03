@@ -554,15 +554,13 @@ impl ColumnValueEncoder for ByteArrayEncoder {
             // chunk costs ~+30-80% vs `main` after writer-dict spill,
             // and there is essentially nothing to bound.
             DataType::Dictionary(_, _) => indices.len(),
-            // FixedSizeBinary falls through to the per-value walk via
-            // `ArrayAccessor::value`.
-            _ => downcast_op!(
-                values.data_type(),
-                values,
-                count_within_budget_accessor,
-                indices,
-                byte_budget
-            ),
+            // Every byte-array type `ByteArrayEncoder` is constructed for
+            // has an explicit arm above. A `Dictionary(value = FixedSizeBinary)`
+            // column hits the `Dictionary(_, _)` arm (its `values.data_type()`
+            // is `Dictionary`), and a bare `FixedSizeBinary` column is routed
+            // to the generic column writer, never this encoder — so no other
+            // type can reach here.
+            data_type => unreachable!("ByteArrayEncoder cannot be constructed for {data_type:?}"),
         };
         Some(count)
     }
@@ -677,31 +675,6 @@ where
         Some(dict_encoder) => dict_encoder.encode(values, indices),
         None => encoder.fallback.encode(values, indices),
     }
-}
-
-/// Cumulative-scan fallback used for byte array types that don't expose
-/// a single contiguous offsets buffer — view arrays, dictionary arrays,
-/// fixed-size binary. Returns `indices.len()` if every value fits the
-/// budget, otherwise the smallest `k ≥ 1` whose first `k` values' encoded
-/// size first exceeds `byte_budget` — i.e. the boundary value is included
-/// so the caller's page-flush check trips immediately on this mini-batch,
-/// without leaving a sliver to glue onto the next page.
-///
-/// Free function so it can be used with `downcast_op!`.
-fn count_within_budget_accessor<T>(values: T, indices: &[usize], byte_budget: usize) -> usize
-where
-    T: ArrayAccessor + Copy,
-    T::Item: AsRef<[u8]>,
-{
-    let mut cum: usize = 0;
-    for (i, idx) in indices.iter().enumerate() {
-        let value_len = values.value(*idx).as_ref().len() + std::mem::size_of::<u32>();
-        cum = cum.saturating_add(value_len);
-        if cum > byte_budget {
-            return i + 1;
-        }
-    }
-    indices.len()
 }
 
 /// Upper bound on any single value's byte length in a view array.
