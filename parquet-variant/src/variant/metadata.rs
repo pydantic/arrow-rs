@@ -17,8 +17,8 @@
 
 use crate::decoder::{OffsetSizeBytes, map_bytes_to_offsets};
 use crate::utils::{
-    first_byte_from_slice, overflow_error, slice_from_slice, string_from_slice,
-    try_binary_search_range_by,
+    first_byte_from_slice, overflow_error, slice_from_slice, slice_from_slice_at_offset,
+    string_from_slice, try_binary_search_range_by,
 };
 
 use arrow_schema::ArrowError;
@@ -342,6 +342,18 @@ impl<'m> VariantMetadata<'m> {
         self.header.offset_size.unpack_u32(bytes, i)
     }
 
+    pub(crate) fn get_bytes(&self, i: usize) -> Result<&'m [u8], ArrowError> {
+        let start = usize::try_from(self.get_offset(i)?)
+            .map_err(|_| overflow_error("variant metadata dictionary entry start"))?;
+        let end = usize::try_from(self.get_offset(i + 1)?)
+            .map_err(|_| overflow_error("variant metadata dictionary entry end"))?;
+        let dictionary_start = usize::try_from(self.first_value_byte)
+            .map_err(|_| overflow_error("variant metadata dictionary start"))?;
+
+        let byte_range = start..end;
+        slice_from_slice_at_offset(self.bytes, dictionary_start, byte_range)
+    }
+
     /// Returns the total size, in bytes, of the metadata.
     ///
     /// Note this value may be smaller than what was passed to [`Self::new`] or
@@ -375,13 +387,17 @@ impl<'m> VariantMetadata<'m> {
     ///
     /// [invalid]: Self#Validation
     pub fn get_entry(&self, field_name: &str) -> Option<(u32, &'m str)> {
+        let field_name_bytes = field_name.as_bytes();
         let field_id = if self.is_sorted() && self.len() > 10 {
             // Binary search is faster for a not-tiny sorted metadata dictionary
-            let cmp = |i| Some(self.get_impl(i).cmp(field_name));
+            let cmp = |i| Some(self.get_bytes(i).ok()?.cmp(field_name_bytes));
             try_binary_search_range_by(0..self.len(), cmp)?.ok()?
         } else {
             // Fall back to Linear search for tiny or unsorted dictionary
-            (0..self.len()).find(|i| self.get_impl(*i) == field_name)?
+            (0..self.len()).find(|i| {
+                self.get_bytes(*i)
+                    .is_ok_and(|value| value == field_name_bytes)
+            })?
         };
         Some((field_id as u32, self.get_impl(field_id)))
     }
