@@ -415,7 +415,14 @@ impl<'m, 'v> VariantObject<'m, 'v> {
         // NOTE: This does not require a sorted metadata dictionary, because the variant spec
         // requires object field ids to be lexically sorted by their corresponding string values,
         // and probing the dictionary for a field id is always O(1) work.
-        let cmp = |i| Some(self.field_name(i)?.cmp(name));
+        let cmp = |i| {
+            let field_id = self.field_id(i)?;
+            let field_name = self
+                .metadata
+                .get_bytes(usize::try_from(field_id).ok()?)
+                .ok()?;
+            Some(field_name.cmp(name.as_bytes()))
+        };
         let i = try_binary_search_range_by(0..self.len(), cmp)?.ok()?;
         self.field(i)
     }
