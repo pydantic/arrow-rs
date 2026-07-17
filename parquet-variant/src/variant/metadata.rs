@@ -17,8 +17,8 @@
 
 use crate::decoder::{OffsetSizeBytes, map_bytes_to_offsets};
 use crate::utils::{
-    first_byte_from_slice, overflow_error, slice_from_slice, string_from_slice,
-    try_binary_search_range_by,
+    first_byte_from_slice, overflow_error, slice_from_slice, slice_from_slice_at_offset,
+    string_from_slice, try_binary_search_range_by,
 };
 
 use arrow_schema::ArrowError;
@@ -361,6 +361,15 @@ impl<'m> VariantMetadata<'m> {
     /// [invalid]: Self#Validation
     pub fn get(&self, i: usize) -> Result<&'m str, ArrowError> {
         let byte_range = self.get_offset(i)? as _..self.get_offset(i + 1)? as _;
+
+        if self.validated {
+            let bytes =
+                slice_from_slice_at_offset(self.bytes, self.first_value_byte as _, byte_range)?;
+
+            // safety: full validation checked the entire dictionary value buffer as utf-8
+            return Ok(unsafe { std::str::from_utf8_unchecked(bytes) });
+        }
+
         string_from_slice(self.bytes, self.first_value_byte as _, byte_range)
     }
 
