@@ -310,7 +310,7 @@ impl<'m> VariantMetadata<'m> {
                 // Since shallow validation ensures the first and last offsets are in bounds,
                 // we can also verify all offsets are in-bounds by checking if
                 // offsets are monotonically increasing
-                if !offsets.is_sorted_by(|a, b| a < b) {
+                if !offsets.is_sorted_by(|a, b| a <= b) {
                     return Err(ArrowError::InvalidArgumentError(
                         "offsets not monotonically increasing".to_string(),
                     ));
