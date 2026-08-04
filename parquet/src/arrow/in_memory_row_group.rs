@@ -18,6 +18,7 @@
 use crate::arrow::ProjectionMask;
 use crate::arrow::array_reader::RowGroups;
 use crate::arrow::arrow_reader::RowSelection;
+use crate::arrow::push_decoder::page_store::PageStore;
 use crate::column::page::{PageIterator, PageReader};
 use crate::errors::ParquetError;
 use crate::file::metadata::{ParquetMetaData, RowGroupMetaData};
@@ -255,6 +256,21 @@ pub(crate) enum ColumnChunkData {
     },
     /// Full column chunk and the offset within the original file
     Dense { offset: usize, data: Bytes },
+    /// Pages served from a [`PageStore`] shared with the decoder, which may
+    /// gain and lose pages *while* a reader built over this chunk is alive.
+    ///
+    /// This is what lets one reader (and its decoded dictionaries) span a
+    /// whole row group whose bytes arrive a window at a time. Like
+    /// [`ColumnChunkData::Sparse`] it resolves only exact page starts, which
+    /// is the access pattern of
+    /// [`SerializedPageReader`](crate::file::serialized_reader::SerializedPageReader)
+    /// when an offset index is present.
+    Shared {
+        /// Length of the full column chunk
+        length: usize,
+        /// Shared page store, keyed by file offset
+        store: Arc<PageStore>,
+    },
 }
 
 impl ColumnChunkData {
@@ -275,6 +291,12 @@ impl ColumnChunkData {
                 let start = start as usize - *offset;
                 Ok(data.slice(start..))
             }
+            ColumnChunkData::Shared { store, .. } => store.get(start).ok_or_else(|| {
+                ParquetError::General(format!(
+                    "Missing page at offset {start} in shared column chunk data. \
+                     The page was not pushed into the decoder before it was needed."
+                ))
+            }),
         }
     }
 }
@@ -285,6 +307,7 @@ impl Length for ColumnChunkData {
         match &self {
             ColumnChunkData::Sparse { length, .. } => *length as u64,
             ColumnChunkData::Dense { data, .. } => data.len() as u64,
+            ColumnChunkData::Shared { length, .. } => *length as u64,
         }
     }
 }

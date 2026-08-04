@@ -18,9 +18,12 @@
 //! [`ParquetPushDecoder`]: decodes Parquet data with data provided by the
 //! caller (rather than from an underlying reader).
 
+pub(crate) mod page_store;
 mod reader_builder;
 mod remaining;
 mod scan_plan;
+#[cfg(test)]
+mod windowed_tests;
 
 use crate::DecodeResult;
 use crate::arrow::arrow_reader::{
@@ -32,7 +35,7 @@ pub use crate::util::push_buffers::PushBuffers;
 use arrow_array::RecordBatch;
 use bytes::Bytes;
 use reader_builder::{RowBudget, RowGroupReaderBuilder, RowGroupReaderBuilderParts};
-use remaining::{RemainingRowGroups, RemainingRowGroupsParts};
+use remaining::{RemainingRowGroups, RemainingRowGroupsParts, WindowedStep};
 pub use scan_plan::{PlannedRange, ScanPlan, plan_scan_ranges};
 use std::ops::Range;
 use std::sync::Arc;
@@ -204,6 +207,9 @@ pub type ParquetPushDecoderBuilder = ArrowReaderBuilder<PushDecoderInput>;
 pub struct PushDecoderInput {
     /// Bytes pushed into the decoder, awaiting decode.
     buffers: PushBuffers,
+    /// Rows of demand lookahead when decoding in windows. `None` (the
+    /// default) keeps the row-group-granular behaviour.
+    row_window: Option<usize>,
 }
 
 /// Methods for building a ParquetDecoder. See the base [`ArrowReaderBuilder`] for
@@ -246,7 +252,49 @@ impl ParquetPushDecoderBuilder {
     /// from, so bytes already fetched are not requested again.
     pub fn with_buffers(self, buffers: PushBuffers) -> Self {
         Self {
-            input: PushDecoderInput { buffers },
+            input: PushDecoderInput {
+                buffers,
+                ..self.input
+            },
+            ..self
+        }
+    }
+
+    /// Decode in *windows* of roughly `rows` rows instead of a row group at a
+    /// time.
+    ///
+    /// By default [`ParquetPushDecoder`] expresses demand one row group at a
+    /// time: [`DecodeResult::NeedsData`](crate::DecodeResult) does not resolve
+    /// until every projected byte of the row group is buffered. That bounds
+    /// resident bytes by row-group size and puts a whole row group of latency
+    /// in front of the first batch.
+    ///
+    /// With a row window set, [`ParquetPushDecoder::try_decode`] instead
+    /// reports the pages the *next batch* needs, and the decoder keeps the row
+    /// group's decode state — column readers, decoded dictionaries, predicate
+    /// cache — alive across windows, so windowing costs no extra decode work.
+    ///
+    /// `rows` is a *lookahead* target, not a batch size: it is how far ahead of
+    /// the decode cursor demand is expressed, so a caller can keep I/O for the
+    /// next window in flight while the current one decodes. Values below the
+    /// batch size are raised to it.
+    ///
+    /// # Requirements
+    ///
+    /// * The metadata must carry an offset index (load it with
+    ///   [`ArrowReaderOptions::with_page_index_policy`]); page locations are
+    ///   what make per-page demand expressible. Row groups without one fall
+    ///   back to whole-row-group fetching.
+    /// * Batches must be pulled with [`ParquetPushDecoder::try_decode`].
+    ///   [`ParquetPushDecoder::try_next_reader`] hands out a reader for a whole
+    ///   row group, which is incompatible with only having a window of it
+    ///   resident, and returns an error when a row window is set.
+    pub fn with_row_window(self, rows: usize) -> Self {
+        Self {
+            input: PushDecoderInput {
+                row_window: Some(rows),
+                ..self.input
+            },
             ..self
         }
     }
@@ -254,7 +302,11 @@ impl ParquetPushDecoderBuilder {
     /// Create a [`ParquetPushDecoder`] with the configured options
     pub fn build(self) -> Result<ParquetPushDecoder, ParquetError> {
         let Self {
-            input: PushDecoderInput { buffers },
+            input:
+                PushDecoderInput {
+                    buffers,
+                    row_window,
+                },
             metadata: parquet_metadata,
             schema,
             fields,
@@ -290,6 +342,7 @@ impl ParquetPushDecoderBuilder {
             max_predicate_cache_size,
             buffers,
             row_selection_policy,
+            row_window.map(|rows| rows.max(batch_size)),
         );
 
         // Initialize the decoder with the configured options
@@ -334,10 +387,14 @@ fn builder_from_remaining(parts: RemainingRowGroupsParts) -> ParquetPushDecoderB
         metrics,
         row_selection_policy,
         buffers,
+        row_window,
     } = reader_builder;
 
     ArrowReaderBuilder {
-        input: PushDecoderInput::default(),
+        input: PushDecoderInput {
+            buffers: PushBuffers::default(),
+            row_window,
+        },
         metadata,
         schema,
         fields,
@@ -419,7 +476,11 @@ impl ParquetPushDecoder {
     ///```
     pub fn try_decode(&mut self) -> Result<DecodeResult<RecordBatch>, ParquetError> {
         let current_state = std::mem::replace(&mut self.state, ParquetDecoderState::Finished);
-        let (new_state, decode_result) = current_state.try_next_batch()?;
+        let (new_state, decode_result) = if current_state.is_windowed() {
+            current_state.try_next_batch_windowed()?
+        } else {
+            current_state.try_next_batch()?
+        };
         self.state = new_state;
         Ok(decode_result)
     }
@@ -465,6 +526,15 @@ impl ParquetPushDecoder {
     pub fn try_next_reader(
         &mut self,
     ) -> Result<DecodeResult<ParquetRecordBatchReader>, ParquetError> {
+        if self.state.is_windowed() {
+            // A reader covers a whole row group. Windowed decoding
+            // deliberately keeps only a window of it resident, so handing one
+            // out would fail on the first page that has not arrived.
+            return Err(ParquetError::General(String::from(
+                "try_next_reader is not supported while decoding in windows: \
+                 use try_decode, or build the decoder without a row window",
+            )));
+        }
         let current_state = std::mem::replace(&mut self.state, ParquetDecoderState::Finished);
         let (new_state, decode_result) = current_state.try_next_reader()?;
         self.state = new_state;
@@ -670,6 +740,83 @@ impl ParquetDecoderState {
                 Self::Finished => {
                     return Ok((Self::Finished, DecodeResult::Finished));
                 }
+            }
+        }
+    }
+
+    /// True when the decoder was configured with a row window.
+    fn is_windowed(&self) -> bool {
+        match self {
+            Self::ReadingRowGroup {
+                remaining_row_groups,
+            } => remaining_row_groups.is_windowed(),
+            Self::DecodingRowGroup {
+                remaining_row_groups,
+                ..
+            } => remaining_row_groups.is_windowed(),
+            Self::Finished => false,
+        }
+    }
+
+    /// [`Self::try_next_batch`], but expressing demand page by page.
+    ///
+    /// Batches come straight out of the active row group's retained decode
+    /// state; the `DecodingRowGroup` arm only runs for row groups that had to
+    /// fall back to whole-row-group reading.
+    fn try_next_batch_windowed(self) -> Result<(Self, DecodeResult<RecordBatch>), ParquetError> {
+        let mut current_state = self;
+        loop {
+            match current_state {
+                Self::ReadingRowGroup {
+                    mut remaining_row_groups,
+                } => match remaining_row_groups.try_next_windowed()? {
+                    WindowedStep::NeedsData(ranges) => {
+                        return Ok((
+                            Self::ReadingRowGroup {
+                                remaining_row_groups,
+                            },
+                            DecodeResult::NeedsData(ranges),
+                        ));
+                    }
+                    WindowedStep::Batch(batch) => {
+                        return Ok((
+                            Self::ReadingRowGroup {
+                                remaining_row_groups,
+                            },
+                            DecodeResult::Data(batch),
+                        ));
+                    }
+                    WindowedStep::Reader(record_batch_reader) => {
+                        current_state = Self::DecodingRowGroup {
+                            record_batch_reader: Box::new(record_batch_reader),
+                            remaining_row_groups,
+                        };
+                    }
+                    WindowedStep::Finished => {
+                        return Ok((Self::Finished, DecodeResult::Finished));
+                    }
+                },
+                Self::DecodingRowGroup {
+                    mut record_batch_reader,
+                    remaining_row_groups,
+                } => match record_batch_reader.next() {
+                    Some(Ok(batch)) => {
+                        return Ok((
+                            Self::DecodingRowGroup {
+                                record_batch_reader,
+                                remaining_row_groups,
+                            },
+                            DecodeResult::Data(batch),
+                        ));
+                    }
+                    None => {
+                        current_state = Self::ReadingRowGroup {
+                            remaining_row_groups,
+                        };
+                    }
+                    Some(Err(e)) => return Err(ParquetError::ArrowError(e.to_string())),
+                },
+                Self::Finished => return Ok((Self::Finished, DecodeResult::Finished)),
             }
         }
     }

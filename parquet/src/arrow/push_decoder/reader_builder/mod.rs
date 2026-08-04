@@ -17,6 +17,7 @@
 
 mod data;
 mod filter;
+mod windowed;
 
 use crate::arrow::ProjectionMask;
 use crate::arrow::array_reader::{ArrayReaderBuilder, CacheOptions, RowGroupCache};
@@ -34,12 +35,15 @@ use crate::errors::ParquetError;
 use crate::file::metadata::ParquetMetaData;
 use crate::file::page_index::offset_index::OffsetIndexMetaData;
 use crate::util::push_buffers::PushBuffers;
+use arrow_array::RecordBatch;
 use bytes::Bytes;
 use data::DataRequest;
 use filter::AdvanceResult;
 use filter::FilterInfo;
 use std::ops::Range;
 use std::sync::{Arc, RwLock};
+pub(crate) use windowed::WindowedResult;
+use windowed::{WindowedConfig, WindowedRowGroup};
 
 /// The current row group being read, its read plan, and its offset/limit budget.
 #[derive(Debug)]
@@ -84,6 +88,11 @@ enum RowGroupDecoderState {
         /// Any cached filter results
         cache_info: Option<CacheInfo>,
     },
+    /// Decoding this row group a window of rows at a time.
+    ///
+    /// See [`WindowedRowGroup`]. Only entered when a row window is configured
+    /// and the row group has an offset index.
+    Windowed(Box<WindowedRowGroup>),
     /// Finished (or not yet started) reading this group
     Finished,
 }
@@ -182,6 +191,23 @@ struct BudgetedReadPlan {
     remaining_budget: RowBudget,
 }
 
+/// Result of driving a row group in windowed mode.
+#[derive(Debug)]
+pub(crate) enum WindowedBuildResult {
+    /// The active row group is complete.
+    Finished { remaining_budget: RowBudget },
+    /// Bytes needed before the next batch can be decoded.
+    NeedsData(Vec<Range<u64>>),
+    /// The next output batch.
+    Batch(RecordBatch),
+    /// This row group could not be windowed (no offset index); drain this
+    /// whole-row-group reader instead.
+    Reader {
+        batch_reader: ParquetRecordBatchReader,
+        remaining_budget: RowBudget,
+    },
+}
+
 #[derive(Debug)]
 pub(crate) enum RowGroupBuildResult {
     /// The active row group is complete without producing a reader.
@@ -271,6 +297,12 @@ pub(crate) struct RowGroupReaderBuilder {
 
     /// The underlying data store
     buffers: PushBuffers,
+
+    /// When set, decode in windows of this many rows rather than a row group
+    /// at a time. See [`ParquetPushDecoderBuilder::with_row_window`].
+    ///
+    /// [`ParquetPushDecoderBuilder::with_row_window`]: crate::arrow::push_decoder::ParquetPushDecoderBuilder::with_row_window
+    row_window: Option<usize>,
 }
 
 /// The parts of a [`RowGroupReaderBuilder`] needed to rebuild it, recovered by
@@ -290,6 +322,8 @@ pub(crate) struct RowGroupReaderBuilderParts {
     /// Bytes already pushed into the decoder, carried across a rebuild so they
     /// are not re-requested.
     pub buffers: PushBuffers,
+    /// Row window, if windowed decoding was configured.
+    pub row_window: Option<usize>,
 }
 
 impl RowGroupReaderBuilder {
@@ -305,6 +339,7 @@ impl RowGroupReaderBuilder {
         max_predicate_cache_size: usize,
         buffers: PushBuffers,
         row_selection_policy: RowSelectionPolicy,
+        row_window: Option<usize>,
     ) -> Self {
         Self {
             batch_size,
@@ -317,6 +352,7 @@ impl RowGroupReaderBuilder {
             row_selection_policy,
             state: Some(RowGroupDecoderState::Finished),
             buffers,
+            row_window,
         }
     }
 
@@ -337,6 +373,7 @@ impl RowGroupReaderBuilder {
             row_selection_policy,
             state: _,
             buffers,
+            row_window,
         } = self;
         RowGroupReaderBuilderParts {
             batch_size,
@@ -347,6 +384,7 @@ impl RowGroupReaderBuilder {
             metrics,
             row_selection_policy,
             buffers,
+            row_window,
         }
     }
 
@@ -364,8 +402,128 @@ impl RowGroupReaderBuilder {
     }
 
     /// Returns the total number of buffered bytes available
+    ///
+    /// In windowed mode this includes the pages held by the active row group's
+    /// [`PageStore`](crate::arrow::push_decoder::page_store::PageStore), which
+    /// have been moved out of [`PushBuffers`] but are still resident.
     pub fn buffered_bytes(&self) -> u64 {
-        self.buffers.buffered_bytes()
+        let windowed = match &self.state {
+            Some(RowGroupDecoderState::Windowed(windowed)) => windowed.buffered_bytes(),
+            _ => 0,
+        };
+        self.buffers.buffered_bytes() + windowed
+    }
+
+    /// True when this builder decodes in windows.
+    pub(crate) fn is_windowed(&self) -> bool {
+        self.row_window.is_some()
+    }
+
+    /// Drive the active row group one *batch* at a time, expressing demand
+    /// page by page rather than row group by row group.
+    ///
+    /// Falls back to [`Self::try_build`] for row groups that cannot be
+    /// windowed (no offset index), in which case a whole-row-group reader is
+    /// returned for the caller to drain.
+    pub(crate) fn try_build_windowed(&mut self) -> Result<WindowedBuildResult, ParquetError> {
+        loop {
+            let state = self.take_state()?;
+            match state {
+                RowGroupDecoderState::Start { row_group_info } => {
+                    let RowGroupInfo {
+                        row_group_idx,
+                        row_count,
+                        plan_builder,
+                        budget,
+                    } = row_group_info;
+                    let config = WindowedConfig {
+                        batch_size: self.batch_size,
+                        window_rows: self.row_window.unwrap_or(self.batch_size),
+                        projection: self.projection.clone(),
+                        metadata: Arc::clone(&self.metadata),
+                        fields: self.fields.clone(),
+                        metrics: self.metrics.clone(),
+                        max_predicate_cache_size: self.max_predicate_cache_size,
+                        row_selection_policy: self.row_selection_policy,
+                    };
+                    let selection = plan_builder.selection().cloned();
+                    let filter = self.filter.take();
+                    match WindowedRowGroup::try_new(
+                        config,
+                        row_group_idx,
+                        row_count,
+                        selection,
+                        budget,
+                        filter,
+                    )? {
+                        Some((windowed, filter)) => {
+                            // A row group without predicates hands the filter
+                            // straight back; one with predicates keeps it
+                            // until it finishes.
+                            self.filter = filter;
+                            self.state = Some(RowGroupDecoderState::Windowed(Box::new(windowed)));
+                        }
+                        None => {
+                            // No offset index: fall back to whole-row-group.
+                            self.state = Some(RowGroupDecoderState::Start {
+                                row_group_info: RowGroupInfo {
+                                    row_group_idx,
+                                    row_count,
+                                    plan_builder,
+                                    budget,
+                                },
+                            });
+                            return self.fall_back_to_row_group();
+                        }
+                    }
+                }
+                RowGroupDecoderState::Windowed(mut windowed) => {
+                    let result = windowed.try_next(&mut self.buffers)?;
+                    match result {
+                        WindowedResult::NeedsData(ranges) => {
+                            self.state = Some(RowGroupDecoderState::Windowed(windowed));
+                            return Ok(WindowedBuildResult::NeedsData(ranges));
+                        }
+                        WindowedResult::Batch(batch) => {
+                            self.state = Some(RowGroupDecoderState::Windowed(windowed));
+                            return Ok(WindowedBuildResult::Batch(batch));
+                        }
+                        WindowedResult::Finished { remaining_budget } => {
+                            if let Some(filter) = windowed.take_filter() {
+                                debug_assert!(self.filter.is_none());
+                                self.filter = Some(filter);
+                            }
+                            self.state = Some(RowGroupDecoderState::Finished);
+                            return Ok(WindowedBuildResult::Finished { remaining_budget });
+                        }
+                    }
+                }
+                other => {
+                    // A row group that could not be windowed is mid-flight in
+                    // the whole-row-group state machine; keep driving it.
+                    self.state = Some(other);
+                    return self.fall_back_to_row_group();
+                }
+            }
+        }
+    }
+
+    /// Drive the whole-row-group state machine and re-tag its result for the
+    /// windowed caller. Used for row groups that cannot be windowed.
+    fn fall_back_to_row_group(&mut self) -> Result<WindowedBuildResult, ParquetError> {
+        Ok(match self.try_build()? {
+            RowGroupBuildResult::Finished { remaining_budget } => {
+                WindowedBuildResult::Finished { remaining_budget }
+            }
+            RowGroupBuildResult::NeedsData(ranges) => WindowedBuildResult::NeedsData(ranges),
+            RowGroupBuildResult::Data {
+                batch_reader,
+                remaining_budget,
+            } => WindowedBuildResult::Reader {
+                batch_reader,
+                remaining_budget,
+            },
+        })
     }
 
     /// Clear any staged ranges currently buffered for future decode work.
@@ -807,6 +965,13 @@ impl RowGroupReaderBuilder {
                         remaining_budget: budget,
                     },
                 )
+            }
+            RowGroupDecoderState::Windowed(_) => {
+                return Err(ParquetError::General(String::from(
+                    "try_next_reader is not supported while decoding in windows: \
+                     a reader covers a whole row group, but only a window of it is resident. \
+                     Use try_decode instead, or drop the row window.",
+                )));
             }
             RowGroupDecoderState::Finished => {
                 return Err(ParquetError::General(String::from(

@@ -19,14 +19,29 @@ use crate::DecodeResult;
 use crate::arrow::arrow_reader::{ParquetRecordBatchReader, RowSelection};
 use crate::arrow::push_decoder::reader_builder::{
     RowBudget, RowGroupBuildResult, RowGroupReaderBuilder, RowGroupReaderBuilderParts,
+    WindowedBuildResult,
 };
 use crate::errors::ParquetError;
 use crate::file::metadata::ParquetMetaData;
+use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
+
+/// One step of windowed decoding. See [`RemainingRowGroups::try_next_windowed`].
+#[derive(Debug)]
+pub(crate) enum WindowedStep {
+    /// Bytes needed before the next batch can be decoded.
+    NeedsData(Vec<Range<u64>>),
+    /// The next output batch.
+    Batch(RecordBatch),
+    /// A whole-row-group reader for a row group that could not be windowed.
+    Reader(ParquetRecordBatchReader),
+    /// No more data.
+    Finished,
+}
 
 /// Plan for the next queued row group after row-selection slicing.
 #[derive(Debug)]
@@ -336,6 +351,61 @@ impl RemainingRowGroups {
             return Ok(None);
         }
         self.frontier.peek_next_row_group()
+    }
+
+    /// True when this decoder was configured to decode in windows.
+    pub fn is_windowed(&self) -> bool {
+        self.row_group_reader_builder.is_windowed()
+    }
+
+    /// Produce the next batch, expressing demand page by page rather than row
+    /// group by row group. See
+    /// [`ParquetPushDecoderBuilder::with_row_window`](super::ParquetPushDecoderBuilder::with_row_window).
+    ///
+    /// The `Reader` variant is returned for row groups that could not be
+    /// windowed (no offset index); the caller drains it as usual.
+    pub fn try_next_windowed(&mut self) -> Result<WindowedStep, ParquetError> {
+        loop {
+            if !self.row_group_reader_builder.has_active_row_group() {
+                match self.frontier.next_readable_row_group()? {
+                    Some(NextRowGroup {
+                        row_group_idx,
+                        row_count,
+                        selection,
+                        budget,
+                    }) => {
+                        self.row_group_reader_builder.next_row_group(
+                            row_group_idx,
+                            row_count,
+                            selection,
+                            budget,
+                        )?;
+                    }
+                    None => return Ok(WindowedStep::Finished),
+                }
+            }
+
+            match self.row_group_reader_builder.try_build_windowed()? {
+                WindowedBuildResult::Finished { remaining_budget } => {
+                    self.frontier
+                        .update_budget_after_row_group(remaining_budget);
+                }
+                WindowedBuildResult::NeedsData(ranges) => {
+                    return Ok(WindowedStep::NeedsData(ranges));
+                }
+                WindowedBuildResult::Batch(batch) => {
+                    return Ok(WindowedStep::Batch(batch));
+                }
+                WindowedBuildResult::Reader {
+                    batch_reader,
+                    remaining_budget,
+                } => {
+                    self.frontier
+                        .update_budget_after_row_group(remaining_budget);
+                    return Ok(WindowedStep::Reader(batch_reader));
+                }
+            }
+        }
     }
 
     /// returns [`ParquetRecordBatchReader`] suitable for reading the next
