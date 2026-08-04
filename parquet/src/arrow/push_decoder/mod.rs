@@ -24,6 +24,7 @@ mod page_spans;
 pub(crate) mod page_store;
 mod reader_builder;
 mod remaining;
+mod scan_plan;
 
 use crate::DecodeResult;
 pub use crate::arrow::arrow_reader::RowGroupSelection;
@@ -37,6 +38,7 @@ use arrow_array::RecordBatch;
 use bytes::Bytes;
 use reader_builder::{RowBudget, RowGroupReaderBuilder, RowGroupReaderBuilderParts};
 use remaining::{IncrementalStep, RemainingRowGroups, RemainingRowGroupsParts};
+pub use scan_plan::{PlannedRange, ScanPlan, plan_scan_ranges};
 use std::ops::Range;
 use std::sync::Arc;
 
