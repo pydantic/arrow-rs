@@ -158,6 +158,11 @@ name = "read_with_rowgroup"
 required-features = ["arrow", "async"]
 path = "./examples/read_with_rowgroup.rs"
 
+[[example]]
+name = "windowed_decode"
+required-features = ["arrow"]
+path = "./examples/windowed_decode.rs"
+
 [[test]]
 name = "arrow_writer_layout"
 required-features = ["arrow"]
