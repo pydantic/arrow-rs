@@ -686,6 +686,119 @@ fn filtered_output_matches_default_policy_end_to_end() {
 }
 
 // ---------------------------------------------------------------------------
+// randomized equivalence
+// ---------------------------------------------------------------------------
+
+/// Randomly combine every knob that feeds the windowed state machine and
+/// assert the batches are unchanged. Hand-written cases cover the shapes we
+/// thought of; this covers the ones we did not.
+#[test]
+fn randomized_equivalence() {
+    use rand::Rng;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    let (file, metadata) = test_file();
+    let schema = metadata.metadata().file_metadata().schema_descr();
+
+    for seed in 0..200u64 {
+        let mut rng = StdRng::seed_from_u64(seed);
+
+        let batch_size = [7usize, 25, 64, 100, 512][rng.random_range(0..5)];
+        let window = batch_size * rng.random_range(1..6);
+
+        let projection = match rng.random_range(0..4) {
+            0 => None,
+            1 => Some(ProjectionMask::columns(schema, ["a"])),
+            2 => Some(ProjectionMask::columns(schema, ["a", "c"])),
+            _ => Some(ProjectionMask::columns(schema, ["b", "c"])),
+        };
+
+        let selection = if rng.random_bool(0.5) {
+            let mut selectors = Vec::new();
+            let mut rows_left = NUM_ROWS;
+            let mut skip = rng.random_bool(0.5);
+            while rows_left > 0 {
+                let run = rng.random_range(1..=rows_left.min(200));
+                selectors.push(if skip {
+                    RowSelector::skip(run)
+                } else {
+                    RowSelector::select(run)
+                });
+                rows_left -= run;
+                skip = !skip;
+            }
+            Some(RowSelection::from(selectors))
+        } else {
+            None
+        };
+
+        let num_predicates = rng.random_range(0..3);
+        let predicates: Vec<PredicateSpec> = (0..num_predicates)
+            .map(|_| match rng.random_range(0..5) {
+                0 => PredicateSpec::Filter {
+                    column: "a",
+                    kind: Cmp::Lt,
+                    value: rng.random_range(0..NUM_ROWS as i64),
+                },
+                1 => PredicateSpec::Filter {
+                    column: "a",
+                    kind: Cmp::Ge,
+                    value: rng.random_range(0..NUM_ROWS as i64),
+                },
+                2 => PredicateSpec::Filter {
+                    column: "b",
+                    kind: Cmp::ModNotZero,
+                    value: rng.random_range(2..7),
+                },
+                3 => PredicateSpec::Filter {
+                    column: "b",
+                    kind: Cmp::All,
+                    value: 0,
+                },
+                _ => PredicateSpec::Filter {
+                    column: "b",
+                    kind: Cmp::None,
+                    value: 0,
+                },
+            })
+            .collect();
+
+        let scan = Scan {
+            batch_size: Some(batch_size),
+            projection,
+            selection,
+            limit: rng.random_bool(0.4).then(|| rng.random_range(1..NUM_ROWS)),
+            offset: rng.random_bool(0.4).then(|| rng.random_range(0..NUM_ROWS)),
+            // Windowed output is selector-driven; pin the reference to match
+            // so batch *boundaries* are comparable, not just the rows.
+            policy: (!predicates.is_empty()).then_some(RowSelectionPolicy::Selectors),
+            predicates,
+            ..Default::default()
+        };
+
+        let (expected, _) = drive(scan.build(&metadata, &file), &file);
+        let windowed = scan
+            .build(&metadata, &file)
+            .into_builder()
+            .unwrap()
+            .with_row_window(window)
+            .build()
+            .unwrap();
+        let (actual, _) = drive(windowed, &file);
+
+        assert_eq!(
+            actual.iter().map(|b| b.num_rows()).collect::<Vec<_>>(),
+            expected.iter().map(|b| b.num_rows()).collect::<Vec<_>>(),
+            "seed {seed}: batch shapes differ (batch_size {batch_size}, window {window})"
+        );
+        for (i, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(actual, expected, "seed {seed}: batch {i} differs");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // demand shape
 // ---------------------------------------------------------------------------
 
