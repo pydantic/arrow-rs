@@ -251,10 +251,8 @@ fn shredded_get_path(
                 target.len(),
             )?;
 
-            if has_path
-                && target.typed_value_column().is_none()
-                && let Some(value_column) = target.value_column()
-            {
+            if has_path && target.typed_value_column().is_none() {
+                let value_column = target.value_column();
                 let metadata_column = target.metadata_column();
                 let mut cached_metadata = None::<((*const u8, usize), VariantMetadata<'_>)>;
 
