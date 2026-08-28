@@ -76,7 +76,7 @@ pub struct DataPageValues<T> {
 /// producing an indices page and handed back afterwards. Erasing the type is
 /// what lets the arrow byte-array dictionary and the generic
 /// [`DictEncoder`] live behind the same public handle.
-pub(crate) trait DynDictionary: std::any::Any {
+pub trait DynDictionary: std::any::Any {
     /// Number of distinct entries interned so far.
     fn num_entries(&self) -> usize;
 
@@ -137,7 +137,7 @@ impl<T: DataType> DynDictionary for DictEncoder<T> {
 /// ([`ColumnValueEncoder::try_new_page_candidate`]), so K candidates still
 /// produce exactly one insert per value. See `PAGE_API_DESIGN.md`.
 #[derive(Default)]
-pub(crate) struct ValueAccumulators {
+pub struct ValueAccumulators {
     pub bloom_filter: Option<Sbbf>,
     pub bloom_filter_target_fpp: f64,
     pub geo_stats_accumulator: Option<Box<dyn GeoStatsAccumulator>>,
@@ -252,6 +252,18 @@ pub trait ColumnValueEncoder {
         Self: Sized,
     {
         Self::try_new(descr, props)
+    }
+
+    /// Replace this encoder's value encoding with `encoding`, dropping any
+    /// dictionary.
+    ///
+    /// The page-grain API uses this to build a *pinned* candidate: one that
+    /// encodes a span with a caller-chosen encoding regardless of what the
+    /// column's [`WriterProperties`] say. Pinning by rebuilding the encoder,
+    /// rather than by cloning and editing the properties, keeps candidate
+    /// construction cheap enough to do per page.
+    fn pin_encoding(&mut self, _encoding: Encoding, _descr: &ColumnDescPtr) -> Result<()> {
+        Err(nyi_err!("this column value encoder cannot pin an encoding"))
     }
 
     /// Take this encoder's dictionary, if it has one, for the caller to own.
@@ -517,6 +529,12 @@ impl<T: DataType> ColumnValueEncoder for ColumnValueEncoderImpl<T> {
         encoder.bloom_filter = None;
         encoder.geo_stats_accumulator = None;
         Ok(encoder)
+    }
+
+    fn pin_encoding(&mut self, encoding: Encoding, descr: &ColumnDescPtr) -> Result<()> {
+        self.encoder = get_encoder(encoding, descr)?;
+        self.dict_encoder = None;
+        Ok(())
     }
 
     fn take_dictionary(&mut self) -> Option<Box<dyn DynDictionary>> {

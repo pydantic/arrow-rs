@@ -141,6 +141,11 @@ impl FallbackEncoder {
                     WriterVersion::PARQUET_2_0 => Encoding::DELTA_BYTE_ARRAY,
                 });
 
+        Self::with_encoding(encoding)
+    }
+
+    /// Create the fallback encoder for an explicitly chosen `encoding`.
+    fn with_encoding(encoding: Encoding) -> Result<Self> {
         let encoder = match encoding {
             Encoding::PLAIN => FallbackEncoderImpl::Plain { buffer: vec![] },
             Encoding::DELTA_LENGTH_BYTE_ARRAY => FallbackEncoderImpl::DeltaLength {
@@ -640,6 +645,12 @@ impl ColumnValueEncoder for ByteArrayEncoder {
         encoder.bloom_filter = None;
         encoder.geo_stats_accumulator = None;
         Ok(encoder)
+    }
+
+    fn pin_encoding(&mut self, encoding: Encoding, _descr: &ColumnDescPtr) -> Result<()> {
+        self.fallback = FallbackEncoder::with_encoding(encoding)?;
+        self.dict_encoder = None;
+        Ok(())
     }
 
     fn take_dictionary(&mut self) -> Option<Box<dyn DynDictionary>> {

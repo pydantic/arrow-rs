@@ -504,6 +504,16 @@ pub struct GenericColumnWriter<'a, E: ColumnValueEncoder> {
     /// ([`crate::arrow::arrow_writer::page_grain`]) sets this; the default path
     /// leaves it `false` and behaves exactly as before.
     defer_page_flush: bool,
+
+    /// When set (only meaningful with [`Self::defer_page_flush`]), the write
+    /// loop *stops* at the first page boundary instead of merely declining to
+    /// act on it.
+    ///
+    /// This is the difference between the candidate that paces a page and the
+    /// candidates that are handed the span it chose: the pacer stops where its
+    /// budget says, the others must encode the whole span so the resulting
+    /// pages describe the same rows.
+    stop_at_page_boundary: bool,
 }
 
 /// A data page that has been fully assembled (levels encoded, values encoded,
@@ -544,6 +554,21 @@ impl<T: ParquetValueType> PreparedDataPage<T> {
     /// Uncompressed size of the page's body, excluding the page header.
     pub(crate) fn uncompressed_len(&self) -> usize {
         self.compressed.uncompressed_size()
+    }
+
+    /// Number of levels (values plus nulls) in the page.
+    pub(crate) fn metrics_num_values(&self) -> u32 {
+        self.metrics.num_buffered_values
+    }
+
+    /// Number of records in the page.
+    pub(crate) fn metrics_num_rows(&self) -> u32 {
+        self.metrics.num_buffered_rows
+    }
+
+    /// Number of nulls in the page.
+    pub(crate) fn metrics_null_count(&self) -> u64 {
+        self.metrics.num_page_nulls
     }
 }
 
@@ -625,23 +650,31 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             data_page_boundary_descending: true,
             last_non_null_data_page_min_max: None,
             defer_page_flush: false,
+            stop_at_page_boundary: false,
         }
     }
 
-    /// Put this writer into deferred-flush mode; see [`Self::defer_page_flush`].
-    pub(crate) fn set_defer_page_flush(&mut self, defer: bool) {
+    /// Put this writer into deferred-flush mode; see [`Self::defer_page_flush`]
+    /// and [`Self::stop_at_page_boundary`].
+    pub(crate) fn set_defer_page_flush(&mut self, defer: bool, stop_at_boundary: bool) {
         self.defer_page_flush = defer;
+        self.stop_at_page_boundary = defer && stop_at_boundary;
+    }
+
+    /// Whether the buffered values have reached the page budget.
+    ///
+    /// This is the same predicate the default write path acts on; the
+    /// page-grain API reads it to decide whether the page it is pacing is
+    /// finished, rather than inferring that from how much was consumed (which
+    /// is ambiguous when the budget trips exactly at the end of an input).
+    pub(crate) fn page_boundary_reached(&self) -> bool {
+        self.should_add_data_page()
     }
 
     /// Mutable access to the value encoder, for lending the chunk's shared
     /// dictionary and value-fed accumulators in and out.
     pub(crate) fn encoder_mut(&mut self) -> &mut E {
         &mut self.encoder
-    }
-
-    /// Whether any values are buffered for the in-progress page.
-    pub(crate) fn has_buffered_values(&self) -> bool {
-        self.page_metrics.num_buffered_values > 0
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -796,7 +829,7 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
 
             // Deferred-flush mode: the page budget the normal path would have
             // acted on is instead reported back to the caller as a split point.
-            if self.defer_page_flush && self.should_add_data_page() {
+            if self.stop_at_page_boundary && self.should_add_data_page() {
                 break;
             }
         }
@@ -1020,7 +1053,7 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             )?;
             values_consumed += written;
             sub_start = sub_end;
-            if self.defer_page_flush && self.should_add_data_page() {
+            if self.stop_at_page_boundary && self.should_add_data_page() {
                 break;
             }
         }
@@ -1506,8 +1539,8 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
 
         // Untruncated page statistics, kept for the column index.
         let index_statistics = match (&values_data.min_value, &values_data.max_value) {
-            (Some(min), Some(max)) => (self.statistics_enabled == EnabledStatistics::Page)
-                .then(|| {
+            (Some(min), Some(max)) => {
+                (self.statistics_enabled == EnabledStatistics::Page).then(|| {
                     ValueStatistics::new(
                         Some(min.clone()),
                         Some(max.clone()),
@@ -1516,7 +1549,8 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
                         false,
                     )
                     .with_nan_count(values_data.nan_count)
-                }),
+                })
+            }
             _ => None,
         };
 
@@ -1665,11 +1699,7 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         }
 
         // update column and offset index
-        self.update_column_offset_index(
-            &metrics,
-            index_statistics.as_ref(),
-            variable_length_bytes,
-        );
+        self.update_column_offset_index(&metrics, index_statistics.as_ref(), variable_length_bytes);
 
         // Update histograms and variable_length_bytes in column_metrics
         self.column_metrics.update_from_page_metrics(&metrics);
