@@ -320,23 +320,36 @@ fn records() -> Dataset {
 // boundaries themselves and use this exact split.
 // ---------------------------------------------------------------------------
 
-/// Splits `batches` into groups of exactly `rows_per_group` rows, slicing a
-/// batch that straddles a boundary. The final group may be short.
-fn split_into_row_groups(batches: &[RecordBatch], rows_per_group: usize) -> Vec<Vec<RecordBatch>> {
+/// Splits `batches` into groups with exactly the row counts in `sizes`.
+///
+/// This is what makes the four writers comparable: they all cut row groups in
+/// the same places. For a supplied file the sizes are the input's own row group
+/// row counts, which are often uneven, so a single "rows per row group" number
+/// cannot reproduce them.
+fn split_into_row_groups(batches: &[RecordBatch], sizes: &[usize]) -> Vec<Vec<RecordBatch>> {
     let mut groups: Vec<Vec<RecordBatch>> = Vec::new();
     let mut current: Vec<RecordBatch> = Vec::new();
     let mut filled = 0usize;
+    let mut target = sizes.first().copied().unwrap_or(usize::MAX).max(1);
+    let mut next_size = 1usize;
 
     for batch in batches {
         let mut offset = 0usize;
         while offset < batch.num_rows() {
-            let take = (rows_per_group - filled).min(batch.num_rows() - offset);
+            let take = (target - filled).min(batch.num_rows() - offset);
             current.push(batch.slice(offset, take));
             offset += take;
             filled += take;
-            if filled == rows_per_group {
+            if filled == target {
                 groups.push(std::mem::take(&mut current));
                 filled = 0;
+                // Any rows beyond the sizes given continue at the last size.
+                target = sizes
+                    .get(next_size)
+                    .copied()
+                    .unwrap_or(*sizes.last().unwrap_or(&target))
+                    .max(1);
+                next_size += 1;
             }
         }
     }
@@ -1244,6 +1257,12 @@ fn write_option_c(
 // ---------------------------------------------------------------------------
 
 /// A stock [`ArrowWriter`] at the shared properties.
+///
+/// The row group boundaries are driven explicitly with `flush`, rather than
+/// left to `max_row_group_row_count`, so the baseline cuts row groups in
+/// exactly the same places as the other three arms even when the sizes are
+/// uneven. The properties still carry a row count limit large enough never to
+/// pre-empt these boundaries.
 fn write_baseline(
     schema: &SchemaRef,
     groups: &[Vec<RecordBatch>],
@@ -1257,6 +1276,8 @@ fn write_baseline(
         for batch in group {
             writer.write(batch)?;
         }
+        // Ends the row group. A no-op if the group contributed no rows.
+        writer.flush()?;
     }
     writer.close()?;
     Ok(start.elapsed())
@@ -1343,53 +1364,68 @@ fn final_encodings(path: &Path) -> Result<(Vec<(String, String)>, usize)> {
     Ok((out, metadata.num_row_groups()))
 }
 
-/// Reads `path` back and requires exact column-wise equality against `expected`.
-fn verify(path: &Path, expected: &[ArrayRef]) -> Result<usize> {
+/// Reads `path` back and requires exact equality against the source batches.
+///
+/// The comparison streams: it walks the read batches against a cursor over the
+/// source batches and compares equal-length slices, rather than concatenating
+/// either side. At ClickBench width (about 100 columns, long string values) a
+/// concatenating check would hold two extra full copies of the data.
+fn verify(path: &Path, source: &[RecordBatch]) -> Result<usize> {
     let file = File::open(path)?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
         .with_batch_size(8192)
         .build()?;
 
-    let mut columns: Vec<Vec<ArrayRef>> = vec![Vec::new(); expected.len()];
+    let mut src_idx = 0usize;
+    let mut src_off = 0usize;
+    let mut rows = 0usize;
+
     for batch in reader {
         let batch = batch?;
-        for (idx, column) in batch.columns().iter().enumerate() {
-            columns[idx].push(column.clone());
+        let mut taken = 0usize;
+        while taken < batch.num_rows() {
+            // Advance past any exhausted (or empty) source batch.
+            while src_idx < source.len() && src_off == source[src_idx].num_rows() {
+                src_idx += 1;
+                src_off = 0;
+            }
+            assert!(
+                src_idx < source.len(),
+                "{} read back more rows than the source has",
+                path.display()
+            );
+            let src = &source[src_idx];
+            let n = (src.num_rows() - src_off).min(batch.num_rows() - taken);
+            for col in 0..src.num_columns() {
+                // Arrow array equality is logical, so comparing slices at
+                // different offsets is exact.
+                let expected = src.column(col).slice(src_off, n);
+                let actual = batch.column(col).slice(taken, n);
+                assert_eq!(
+                    &expected,
+                    &actual,
+                    "row values differ for column {col} at row {} in {}",
+                    rows + taken,
+                    path.display()
+                );
+            }
+            src_off += n;
+            taken += n;
         }
+        rows += batch.num_rows();
     }
 
-    let mut rows = 0usize;
-    for (idx, parts) in columns.into_iter().enumerate() {
-        let refs: Vec<&dyn arrow_array::Array> = parts.iter().map(|a| a.as_ref()).collect();
-        let actual = arrow_select::concat::concat(&refs)
-            .map_err(|e| ParquetError::General(e.to_string()))?;
-        assert_eq!(
-            expected[idx].len(),
-            actual.len(),
-            "row count mismatch for column {idx} in {}",
-            path.display()
-        );
-        assert_eq!(
-            &expected[idx],
-            &actual,
-            "row values differ for column {idx} in {}",
-            path.display()
-        );
-        rows = actual.len();
+    // Every source row must have been consumed.
+    while src_idx < source.len() && src_off == source[src_idx].num_rows() {
+        src_idx += 1;
+        src_off = 0;
     }
+    assert!(
+        src_idx == source.len(),
+        "{} read back fewer rows than the source has",
+        path.display()
+    );
     Ok(rows)
-}
-
-/// Concatenates every batch column-wise, giving the expected values to verify
-/// each written file against.
-fn expected_columns(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<Vec<ArrayRef>> {
-    (0..schema.fields().len())
-        .map(|idx| {
-            let parts: Vec<ArrayRef> = batches.iter().map(|b| b.column(idx).clone()).collect();
-            let refs: Vec<&dyn arrow_array::Array> = parts.iter().map(|a| a.as_ref()).collect();
-            arrow_select::concat::concat(&refs).map_err(|e| ParquetError::General(e.to_string()))
-        })
-        .collect()
 }
 
 /// Runs one writer `RUNS` times, checks the output is deterministic, and
@@ -1397,10 +1433,10 @@ fn expected_columns(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<Vec<A
 fn measure(
     writer: Writer,
     schema: &SchemaRef,
+    flat: &[RecordBatch],
     groups: &[Vec<RecordBatch>],
     props: &WriterProperties,
     path: &Path,
-    expected: &[ArrayRef],
 ) -> Result<Measurement> {
     let mut times = Vec::with_capacity(RUNS);
     let mut bytes = 0u64;
@@ -1421,7 +1457,7 @@ fn measure(
     }
     times.sort();
 
-    verify(path, expected)?;
+    verify(path, flat)?;
     let (encodings, row_groups) = final_encodings(path)?;
 
     Ok(Measurement {
@@ -1544,17 +1580,23 @@ fn run_case(
     name: &str,
     schema: &SchemaRef,
     batches: &[RecordBatch],
-    rows_per_row_group: usize,
+    row_group_sizes: &[usize],
     compression: (&str, Compression),
     dir: &Path,
     rows: &mut Vec<Row>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let (compression_label, compression_codec) = compression;
+    // Large enough that the baseline's own limit never fires before the
+    // explicit flush that ends each group.
+    let cap = row_group_sizes
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(ROW_GROUP_ROWS);
     let props = shared_properties(compression_codec)
-        .set_max_row_group_row_count(Some(rows_per_row_group))
+        .set_max_row_group_row_count(Some(cap))
         .build();
-    let groups = split_into_row_groups(batches, rows_per_row_group);
-    let expected = expected_columns(schema, batches)?;
+    let groups = split_into_row_groups(batches, row_group_sizes);
 
     let mut measurements = Vec::new();
     for writer in [
@@ -1564,7 +1606,7 @@ fn run_case(
         Writer::OptionC,
     ] {
         let path = dir.join("bakeoff.parquet");
-        measurements.push(measure(writer, schema, &groups, &props, &path, &expected)?);
+        measurements.push(measure(writer, schema, batches, &groups, &props, &path)?);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1586,9 +1628,86 @@ fn run_case(
     print_encodings(&measurements, &passthrough);
     println!(
         "    verified {} rows read back exactly from all four files",
-        expected.first().map(|c| c.len()).unwrap_or(0)
+        batches.iter().map(|b| b.num_rows()).sum::<usize>()
     );
-    Ok(())
+    Ok(encoding_summary(&measurements, &passthrough))
+}
+
+/// A compact account of where the arms' final encodings differ.
+///
+/// At ClickBench width, printing every column's encodings for every arm is
+/// several thousand characters of noise. What is actually informative is how
+/// many columns each arm moved off the baseline's choice, and which columns the
+/// arms disagree with each other about.
+fn encoding_summary(measurements: &[Measurement], passthrough: &[String]) -> Vec<String> {
+    /// Column names where two arms' final encodings differ.
+    fn differing<'a>(left: &'a Measurement, right: &Measurement) -> Vec<&'a str> {
+        left.encodings
+            .iter()
+            .zip(&right.encodings)
+            .filter(|((_, l), (_, r))| l != r)
+            .map(|((name, _), _)| name.as_str())
+            .collect()
+    }
+
+    /// Renders at most `cap` names, then says how many were left out.
+    fn listed(names: &[&str], cap: usize) -> String {
+        if names.is_empty() {
+            return "none".to_string();
+        }
+        let shown: Vec<&str> = names.iter().take(cap).copied().collect();
+        if names.len() > cap {
+            format!("{} and {} more", shown.join(", "), names.len() - cap)
+        } else {
+            shown.join(", ")
+        }
+    }
+
+    let total = measurements[0].encodings.len();
+    let mut notes = Vec::new();
+
+    let baseline = &measurements[0];
+    let counts: Vec<String> = measurements[1..]
+        .iter()
+        .map(|m| format!("{} on {}", m.writer.label(), differing(m, baseline).len()))
+        .collect();
+    notes.push(format!(
+        "Of {total} leaf columns, the arms change the baseline's encoding on: {}.",
+        counts.join("; ")
+    ));
+
+    if let (Some(a), Some(b), Some(c)) = (
+        measurements.iter().find(|m| m.writer == Writer::OptionA),
+        measurements.iter().find(|m| m.writer == Writer::OptionB),
+        measurements.iter().find(|m| m.writer == Writer::OptionC),
+    ) {
+        let ab = differing(a, b);
+        notes.push(format!(
+            "A and B disagree on {} columns: {}.",
+            ab.len(),
+            listed(&ab, 12)
+        ));
+        let ca = differing(c, a);
+        notes.push(format!(
+            "C differs from A on {} columns: {}.",
+            ca.len(),
+            listed(&ca, 12)
+        ));
+        let cb = differing(c, b);
+        notes.push(format!("C differs from B on {} columns.", cb.len()));
+    }
+
+    notes.push(if passthrough.is_empty() {
+        "No column shape was passed through: every leaf was raceable.".to_string()
+    } else {
+        format!(
+            "Passed through unraced in both harnesses ({}): {}.",
+            passthrough.len(),
+            passthrough.join(", ")
+        )
+    });
+
+    notes
 }
 
 /// The synthetic suite. Writes `parquet/BAKEOFF.md` alongside its stdout table.
@@ -1614,11 +1733,11 @@ fn run_synthetic(dir: &Path) -> Result<()> {
         // be resident at once.
         let dataset = builder();
         for (label, compression) in compressions() {
-            run_case(
+            let _ = run_case(
                 dataset.name,
                 &dataset.schema,
                 &dataset.batches,
-                ROW_GROUP_ROWS,
+                &[ROW_GROUP_ROWS],
                 (label, compression),
                 dir,
                 &mut rows,
@@ -1667,13 +1786,28 @@ fn run_files(paths: &[String], dir: &Path, public: Option<&str>) -> Result<()> {
         let metadata = builder.metadata().clone();
         let input_bytes = std::fs::metadata(input)?.len();
 
-        // Preserve the input's row group sizing.
-        let rows_per_row_group = metadata
+        // Preserve the input's own row group boundaries, which are often
+        // uneven, rather than collapsing them to a single size.
+        let row_group_sizes: Vec<usize> = metadata
             .row_groups()
-            .first()
+            .iter()
             .map(|rg| rg.num_rows() as usize)
             .filter(|n| *n > 0)
-            .unwrap_or(ROW_GROUP_ROWS);
+            .collect();
+        let row_group_sizes = if row_group_sizes.is_empty() {
+            vec![ROW_GROUP_ROWS]
+        } else {
+            row_group_sizes
+        };
+        let sizing = {
+            let min = row_group_sizes.iter().min().copied().unwrap_or(0);
+            let max = row_group_sizes.iter().max().copied().unwrap_or(0);
+            if min == max {
+                format!("{min} rows per row group")
+            } else {
+                format!("{min} to {max} rows per row group")
+            }
+        };
 
         let schema = builder.schema().clone();
         let reader = builder.with_batch_size(8192).build()?;
@@ -1681,7 +1815,7 @@ fn run_files(paths: &[String], dir: &Path, public: Option<&str>) -> Result<()> {
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
         println!(
-            "== {} ==\n  input {} ({}), {} rows, {} row groups, rewriting at {rows_per_row_group} rows per row group",
+            "== {} ==\n  input {} ({}), {} rows, {} row groups, reproducing its boundaries ({sizing})",
             input.display(),
             human(input_bytes),
             input_bytes,
@@ -1696,11 +1830,11 @@ fn run_files(paths: &[String], dir: &Path, public: Option<&str>) -> Result<()> {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| input.display().to_string());
-        run_case(
+        let summary = run_case(
             &name,
             &schema,
             &batches,
-            rows_per_row_group,
+            &row_group_sizes,
             compression,
             dir,
             &mut rows,
@@ -1708,11 +1842,13 @@ fn run_files(paths: &[String], dir: &Path, public: Option<&str>) -> Result<()> {
         println!("{}", render_table(&rows));
         if public.is_some() {
             notes.push(format!(
-                "`{name}`: {total_rows} rows, {} row groups in, rewritten at \
-                 {rows_per_row_group} rows per row group; source file {}.",
+                "* **`{name}`**: {total_rows} rows in {} row groups ({sizing}), \
+                 source file {}; the input's own row group boundaries are reproduced \
+                 by all four arms.",
                 metadata.num_row_groups(),
                 human(input_bytes)
             ));
+            notes.extend(summary.into_iter().map(|line| format!("  * {line}")));
             public_rows.extend(rows);
         }
     }
@@ -1748,38 +1884,71 @@ fn existing_public_section() -> String {
     }
 }
 
-/// Replaces the public-dataset section of the report, keeping everything the
-/// synthetic run wrote above it.
+/// Records one corpus's results in the report.
+///
+/// Keeps everything the synthetic run wrote above the public section, and keeps
+/// every *other* corpus already recorded in it: only the subsection with this
+/// label is replaced, so corpora can be measured in separate runs.
 fn record_public_results(label: &str, rows: &[Row], notes: &[String]) -> Result<()> {
     let path = report_path();
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let head = match existing.find(PUBLIC_MARKER) {
-        Some(at) => existing[..at].to_string(),
+
+    let (head, section) = match existing.find(PUBLIC_MARKER) {
+        Some(at) => (existing[..at].to_string(), existing[at..].to_string()),
         None => {
             let mut head = existing;
             if !head.is_empty() && !head.ends_with("\n\n") {
                 head.push('\n');
             }
-            head
+            (head, String::new())
         }
     };
 
-    let mut section = String::from(PUBLIC_MARKER);
-    section.push_str(
-        "\n\nResults over corpora anyone can obtain, measured the same way as the\n\
-         synthetic suite: ZSTD, the input's own row group sizing preserved, exact\n\
-         read-back verification, median of 3 release runs. Only the file name of\n\
-         each input is recorded.\n\n",
-    );
-    let _ = writeln!(section, "### {label}\n");
-    for note in notes {
-        let _ = writeln!(section, "* {note}");
+    // Split the existing public section into its preamble and its per-corpus
+    // subsections, keyed by heading.
+    let heading = format!("### {label}");
+    let mut preamble = String::new();
+    let mut others: Vec<String> = Vec::new();
+    if !section.is_empty() {
+        let mut parts = section.split("\n### ");
+        preamble = parts.next().unwrap_or_default().to_string();
+        for part in parts {
+            let sub = format!("### {part}");
+            // Drop any previous run of this same corpus; keep the rest.
+            if !sub.starts_with(&heading) {
+                others.push(sub);
+            }
+        }
     }
-    section.push_str("\n```\n");
-    section.push_str(&render_table(rows));
-    section.push_str("```\n");
+    if preamble.is_empty() {
+        preamble = format!(
+            "{PUBLIC_MARKER}\n\nResults over corpora anyone can obtain, measured the same way as the\n\
+             synthetic suite: ZSTD, the input's own row group sizing preserved, exact\n\
+             read-back verification, median of {RUNS} release runs. Only the file name of\n\
+             each input is recorded.\n"
+        );
+    }
 
-    std::fs::write(&path, format!("{head}{section}"))?;
+    let mut fresh = String::new();
+    let _ = writeln!(fresh, "{heading}\n");
+    for note in notes {
+        let _ = writeln!(fresh, "{note}");
+    }
+    fresh.push_str("\n```\n");
+    fresh.push_str(&render_table(rows));
+    fresh.push_str("```\n");
+
+    let mut out = head;
+    out.push_str(preamble.trim_end());
+    out.push_str("\n\n");
+    for sub in others {
+        out.push_str(sub.trim_end());
+        out.push_str("\n\n");
+    }
+    out.push_str(fresh.trim_end());
+    out.push('\n');
+
+    std::fs::write(&path, out)?;
     Ok(())
 }
 
@@ -2044,6 +2213,41 @@ per raced page and falls to a single encode once the column settles. C pays that
 only for leaves that are still deciding. B's cost is also charged per row group,
 so a file with many small row groups pays it more often.
 
+
+### Public corpora, and what 105 columns change
+
+TPC-H and ClickBench are in the Public datasets section below. Three findings
+there do not appear anywhere in the synthetic suite.
+
+**The hybrid makes exactly A's decisions and is still smaller than A.** On all
+five public files C's final encodings differ from A's on *zero* columns, yet C
+is smaller than A on every one of them, by 0.7 to 1.9 percentage points of the
+baseline. Same encoding vocabulary, different bytes: for a column that has
+settled, C writes through the ordinary column writer while A stays on the page
+grain, and the ordinary writer packs a settled column better. That is the
+clearest argument in these numbers for routing settled leaves off the page
+grain, and it is invisible in the narrow synthetic datasets where the two paths
+mostly agree byte for byte.
+
+**Width costs Option B, not Option A or C.** ClickBench `hits` is about 105
+mixed-character columns: URLs and titles, user agents, tiny enums, timestamps
+and 64 bit IDs. B is 2.0x to 2.7x the baseline's wall clock on these files
+against 0.9x to 1.2x for A and 0.86x to 0.94x for C, because B builds and drives
+K complete sets of column writers for all 105 leaves of every racing row group
+whether or not a given leaf is still racing. A and C pay only for the leaves
+that are actually deciding, and C is the fastest arm on all three files. B still
+wins bytes on two of the three, by 1.3 to 2.0 points.
+
+**Row group shape moves the answer more than the data does.** `hits_2` has very
+uneven input row groups (13 006 to 335 872 rows). There B changes the baseline's
+encoding on 68 of 105 columns while A and C change 23, and A and B disagree on
+58 columns, against 15 on the other two files. B decides per whole column chunk,
+so a 13 006 row chunk gives it very different evidence than a 335 872 row one.
+`hits_2` is also the one file where C beats B outright (-7.2% against -7.1%).
+
+No column shape in either corpus was passed through: all 9, 16 and 105 leaves
+were raceable, so nothing in these results is masked by an unraced column.
+
 ### Anomalies
 
 * Option A is 0.3% *larger* than the baseline on low-cardinality strings
@@ -2059,9 +2263,10 @@ so a file with many small row groups pays it more often.
   uncompressed, while every option's file is 2.91 MiB either way. Delta encoded
   output is already close to incompressible, so ZSTD narrows the gap from 84.8%
   to 62.5% without changing the ordering.
-* ClickBench partitioned `hits` could not be measured: the configured egress
-  proxy refuses CONNECT to `datasets.clickhouse.com` with a 403 policy denial.
-  No mirror was substituted.
+* On TPC-H `orders`, A and C pick `DELTA_BINARY_PACKED` for `o_orderdate` and
+  `DELTA_BYTE_ARRAY` for `o_clerk` where B keeps the dictionary, and B is still
+  smaller overall. Per-page switching can lose to a chunk-level dictionary once
+  a general compressor runs.
 ";
 
 // ---------------------------------------------------------------------------
