@@ -1298,7 +1298,7 @@ enum Writer {
 impl Writer {
     fn label(self) -> &'static str {
         match self {
-            Writer::Baseline => "baseline",
+            Writer::Baseline => "baseline (branch default)",
             Writer::OptionA => "option A (page-grain)",
             Writer::OptionB => "option B (K writers)",
             Writer::OptionC => "option C (hybrid)",
@@ -1484,6 +1484,52 @@ fn human(bytes: u64) -> String {
     format!("{v:.2} {}", UNITS[u])
 }
 
+/// Bytes produced by a stock `ArrowWriter` at these same properties on
+/// **vanilla upstream main** (merge base `2567a32`), measured separately with
+/// the identical data, identical properties and the same preserved row group
+/// boundaries as everything else here.
+///
+/// This is the primary reference for every percentage in the report. The
+/// baseline arm measured in this tree is *not* the same thing: this branch
+/// carries the #10777 dictionary-fallback re-encode port, which changes what a
+/// default writer emits on any column whose dictionary overflows. Comparing an
+/// option only against the branch default would silently fold #10777's effect
+/// into each option's result.
+///
+/// Keyed by synthetic dataset name and compression label, or by input file name
+/// for the public corpora, where only ZSTD was measured.
+fn vanilla_main_bytes(dataset: &str, compression: &str) -> Option<u64> {
+    let key = (dataset, compression);
+    let synthetic = match key {
+        // Byte-identical to the branch default: no dictionary overflows here,
+        // so #10777 never fires.
+        ("low-cardinality strings", "none") => 1_536_969,
+        ("low-cardinality strings", "zstd") => 1_520_065,
+        ("high-cardinality int64 timestamps", "none") => 20_052_805,
+        ("high-cardinality int64 timestamps", "zstd") => 8_154_384,
+        ("f64 measurements", "none") => 20_056_464,
+        ("f64 measurements", "zstd") => 18_937_240,
+        // Dictionary-overflow columns: the branch default differs.
+        ("shifting strings", "none") => 29_367_978,
+        ("shifting strings", "zstd") => 10_028_648,
+        ("records-like mixed schema", "none") => 79_708_639,
+        ("records-like mixed schema", "zstd") => 39_049_927,
+        _ => 0,
+    };
+    if synthetic != 0 {
+        return Some(synthetic);
+    }
+    // Public corpora, ZSTD only.
+    match dataset {
+        "lineitem.parquet" => Some(183_251_967),
+        "orders.parquet" => Some(45_834_964),
+        "hits_0.parquet" => Some(85_354_208),
+        "hits_1.parquet" => Some(121_026_589),
+        "hits_2.parquet" => Some(166_652_721),
+        _ => None,
+    }
+}
+
 /// One row of the printed and written table.
 struct Row {
     dataset: String,
@@ -1491,8 +1537,13 @@ struct Row {
     writer: String,
     bytes: u64,
     seconds: f64,
-    vs_baseline_bytes: f64,
+    /// Against vanilla upstream main, the primary reference.
+    vs_vanilla_bytes: Option<f64>,
+    /// Against this branch's own default writer, which includes #10777.
+    vs_branch_bytes: f64,
     vs_baseline_time: f64,
+    /// The vanilla reference itself, so each row stands on its own.
+    vanilla: Option<u64>,
 }
 
 fn render_table(rows: &[Row]) -> String {
@@ -1503,8 +1554,10 @@ fn render_table(rows: &[Row]) -> String {
         "bytes",
         "size",
         "median s",
-        "bytes vs base",
-        "time vs base",
+        "vanilla base",
+        "vs vanilla",
+        "vs branch base",
+        "time vs branch",
     ];
     let mut cells: Vec<Vec<String>> = vec![headers.iter().map(|h| h.to_string()).collect()];
     for row in rows {
@@ -1514,9 +1567,25 @@ fn render_table(rows: &[Row]) -> String {
             row.writer.clone(),
             row.bytes.to_string(),
             human(row.bytes),
-            format!("{:.3}", row.seconds),
-            format!("{:+.1}%", row.vs_baseline_bytes * 100.0),
-            format!("{:.2}x", row.vs_baseline_time),
+            if row.seconds.is_nan() {
+                "-".to_string()
+            } else {
+                format!("{:.3}", row.seconds)
+            },
+            row.vanilla.map(|v| v.to_string()).unwrap_or("n/a".into()),
+            row.vs_vanilla_bytes
+                .map(|v| format!("{:+.2}%", v * 100.0))
+                .unwrap_or("n/a".into()),
+            if row.vs_branch_bytes.is_nan() {
+                "n/a".to_string()
+            } else {
+                format!("{:+.2}%", row.vs_branch_bytes * 100.0)
+            },
+            if row.vs_baseline_time.is_nan() {
+                "-".to_string()
+            } else {
+                format!("{:.2}x", row.vs_baseline_time)
+            },
         ]);
     }
 
@@ -1611,6 +1680,23 @@ fn run_case(
     }
 
     let baseline = &measurements[0];
+    let vanilla = vanilla_main_bytes(name, compression_label);
+
+    // The vanilla reference leads each group, so the table reads against it.
+    rows.push(Row {
+        dataset: name.to_string(),
+        compression: compression_label.to_string(),
+        writer: "vanilla main (reference)".to_string(),
+        bytes: vanilla.unwrap_or(0),
+        seconds: f64::NAN,
+        vs_vanilla_bytes: vanilla.map(|_| 0.0),
+        vs_branch_bytes: vanilla
+            .map(|v| v as f64 / baseline.bytes as f64 - 1.0)
+            .unwrap_or(f64::NAN),
+        vs_baseline_time: f64::NAN,
+        vanilla,
+    });
+
     for m in &measurements {
         rows.push(Row {
             dataset: name.to_string(),
@@ -1618,8 +1704,10 @@ fn run_case(
             writer: m.writer.label().to_string(),
             bytes: m.bytes,
             seconds: m.median.as_secs_f64(),
-            vs_baseline_bytes: m.bytes as f64 / baseline.bytes as f64 - 1.0,
+            vs_vanilla_bytes: vanilla.map(|v| m.bytes as f64 / v as f64 - 1.0),
+            vs_branch_bytes: m.bytes as f64 / baseline.bytes as f64 - 1.0,
             vs_baseline_time: m.median.as_secs_f64() / baseline.median.as_secs_f64().max(1e-9),
+            vanilla,
         });
     }
 
@@ -2052,8 +2140,64 @@ Three, none of which are papered over in the harness:
 
 ## Results
 
+Every percentage in this report is measured against **vanilla upstream main**
+(merge base `2567a32`), not against the baseline arm measured in this tree.
+
+* `vanilla base` / `vs vanilla` — a stock `ArrowWriter` at these same
+  properties on unmodified upstream main. This is the reference a maintainer
+  cares about, because it is what the options would actually be replacing.
+* `baseline (branch default)` / `vs branch base` — a stock `ArrowWriter` in
+  *this* tree, which includes the #10777 dictionary-fallback re-encode port. It
+  is kept as a secondary reference so the options can also be read against the
+  writer they were developed alongside.
+
+The two baselines differ only on columns whose dictionary overflows, and the gap
+between them is #10777's isolated effect on default output. That gap is
+attributed in the next section; it is not any option's doing, and folding it
+into an option's result would overstate or understate that option.
+
 ```
 {table}```
+
+## What separates the two baselines
+
+The branch default and vanilla main emit identical bytes on every dataset with
+no dictionary overflow: low-cardinality strings, timestamps and f64 measurements
+match exactly at both compressions. Every cell where they differ is a cell with
+at least one dictionary-overflow column, and #10777 moves the bytes in both
+directions depending on *when* the overflow happens.
+
+**Overflow after a page has already been sealed makes the branch default
+larger.** This is the common case and the larger effect: shifting strings is
++15.02% uncompressed and +11.50% under ZSTD, records-like is +3.70% and +1.51%,
+TPC-H `lineitem` is +3.16%. When the dictionary overflows, #10777 re-encodes the
+buffered in-progress page through the fallback encoder rather than emitting it
+as one more dictionary-encoded page. Vanilla main kept those already-buffered
+values as `RLE_DICTIONARY` indices; the branch rewrites them as `PLAIN`, which
+is bigger. Every column that ends up delta encoded is by definition a column
+whose dictionary overflowed, so this is exactly the population where the two
+baselines part company.
+
+**Overflow before the first page is sealed makes the branch default smaller.**
+TPC-H `orders` is the one public file where the branch default is *smaller* than
+vanilla, by 0.81%. Its `o_comment` column overflows before any dictionary page
+has been referenced, in 10 of its 16 row groups. Under #10777 no dictionary page
+is written at all in those row groups and the whole chunk uses the fallback
+encoding; vanilla main still writes a nearly 1 MiB dictionary page that almost
+nothing references. Dropping an unreferenced dictionary page is a clear win, and
+it is why the sign flips here.
+
+The three ClickBench files sit between the two effects at a consistent +0.55% to
++0.57%: at 105 columns both cases occur across the schema and largely cancel.
+
+**Implication for #10777 upstream.** The two directions are separable. The win
+comes from not writing a dictionary page that ends up unreferenced; the loss
+comes from re-encoding values that were already validly written as dictionary
+indices. A narrower fix that re-encodes the buffered page *only* when the
+dictionary would otherwise be left unreferenced would keep the `orders` win and
+avoid the `lineitem` and shifting-strings regressions. That is a suggestion from
+these measurements, not a tested change: nothing in this repository implements
+or evaluates the narrowed variant.
 
 ## Complexity
 
@@ -2117,14 +2261,17 @@ fn count_lines(path: &Path) -> usize {
 /// numbers it describes.
 const INTERPRETATION: &str = r"## Interpretation
 
-Byte percentages below are deterministic and reproduce exactly on a re-run.
-Times are medians from one machine and move a little between runs; read them as
+Byte percentages below are measured against **vanilla upstream main**, are
+deterministic, and reproduce exactly on a re-run. Times are medians from one
+machine and move a little between runs, and are ratios against this branch's
+default writer since that is the one actually executed here; read them as
 ratios, not as absolutes.
 
 ### Where the baseline is already right
 
-**Low-cardinality strings.** Option B reproduces the baseline byte for byte, C
-is 0.1% larger and A 0.3% larger, and all four land on the same encodings. B
+**Low-cardinality strings.** Nothing overflows a dictionary here, so both
+baselines are byte-identical. Option B reproduces them byte for byte, C is 0.07%
+larger and A 0.29% larger, and all four land on the same encodings. B
 ties exactly because its winning candidate is the dictionary, and with a 48
 entry dictionary neither the 64 KiB candidate limit nor the 1 MiB default is
 approached, so the candidate properties and the baseline properties are
@@ -2133,18 +2280,20 @@ Racing costs time and buys nothing on data whose right answer is the default.
 
 ### Where every option wins, by the same amount
 
-**High-cardinality int64 timestamps.** A, B and C all land on
-`DELTA_BINARY_PACKED` and cut the file by 84.8% uncompressed and 62.5% with
-ZSTD, agreeing with each other to within 0.1%. The baseline footer shows
+**High-cardinality int64 timestamps.** Both baselines are identical here too.
+A, B and C all land on `DELTA_BINARY_PACKED` and cut the file by 84.8%
+uncompressed and 62.5% with ZSTD, agreeing with each other to within 0.1%. The
+baseline footer shows
 `PLAIN+RLE+RLE_DICTIONARY`: it builds a dictionary over effectively unique
 values and then spills to plain. All three options are also *faster* than the
 baseline here, for the same reason: none of them pays to build and then abandon
 a two million entry dictionary. This is the largest effect in the table, and no
 particular API is required to get it, only the willingness to measure.
 
-**f64 measurements.** Once Option A races floats (the dictionary against
-`PLAIN`) rather than only adapting per page, A and C match B: -20.2%
-uncompressed and -20.5% with ZSTD, within 0.02% of B's bytes, all three landing
+**f64 measurements.** Both baselines are identical here as well. Once Option A
+races floats (the dictionary against `PLAIN`) rather than only adapting per
+page, A and C match B: -20.17% uncompressed and -20.50% with ZSTD, within 0.02%
+of B's bytes, all three landing
 on `PLAIN+RLE`. Before that change A trailed at -16.3% / -16.5%, and the cause
 was visible in the footer as a residual `RLE_DICTIONARY`: the adapt-per-page
 rule's cold-start branch chose the dictionary for the first page of every chunk,
@@ -2156,8 +2305,11 @@ was a harness policy defect, not a property of the page-grain API.
 ### Where A wins
 
 **Uncompressed data whose character changes mid-file.** On shifting strings A is
-45.5% below the baseline against B's 28.8%, and on the records-like schema 51.9%
-against B's 40.0%. B's unit of decision is a whole column chunk, and a settled
+37.34% below vanilla main against B's 18.10%, and on the records-like schema
+50.16% against B's 37.77%. (Against the branch default these read 45.52% and
+28.80%, and 51.94% and 39.99%: both of those cells are dictionary-overflow
+cells, so the branch default is the inflated reference and flatters every arm.)
+B's unit of decision is a whole column chunk, and a settled
 leaf re-races only every 8 row groups, so after the data changes at row group 10
 it keeps writing the settled dictionary candidate until its next scheduled race.
 A re-opens every 4 row groups *and* watches the live dictionary inside a chunk,
@@ -2167,9 +2319,9 @@ concrete capability the page grain buys.
 
 ### Where B wins
 
-**Compressed versions of the two mixed datasets.** Under ZSTD, B is 17.3% and
-26.9% below the baseline on shifting strings and the records-like schema,
-against A's 14.5% and 26.0%. A's advantage on these two datasets is largest
+**Compressed versions of the two mixed datasets.** Under ZSTD, B is 7.77% and
+25.83% below vanilla main on shifting strings and the records-like schema,
+against A's 4.71% and 24.92%. A's advantage on these two datasets is largest
 uncompressed and shrinks or reverses once ZSTD runs, which is consistent with
 the general compressor already removing much of the redundancy that
 finer-grained encoding switching targets. Every option remains well ahead of the
@@ -2185,9 +2337,9 @@ low-cardinality strings, and beats B on both uncompressed mixed datasets.
 
 C fails to match its stronger parent in three cells, all for the same reason:
 
-* shifting strings, uncompressed: C is -42.4% against A's -45.5%.
-* records-like, uncompressed: C is -49.4% against A's -51.9%.
-* shifting strings, ZSTD: C is -16.6% against B's -17.3%.
+* shifting strings, uncompressed: C is -33.73% against A's -37.34%.
+* records-like, uncompressed: C is -47.54% against A's -50.16%.
+* shifting strings, ZSTD: C is -7.00% against B's -7.77%.
 
 In the two uncompressed cells C should have matched A and did not. Between
 scheduled re-races a settled leaf sits on the standard path, where its only way
@@ -2221,8 +2373,8 @@ there do not appear anywhere in the synthetic suite.
 
 **The hybrid makes exactly A's decisions and is still smaller than A.** On all
 five public files C's final encodings differ from A's on *zero* columns, yet C
-is smaller than A on every one of them, by 0.7 to 1.9 percentage points of the
-baseline. Same encoding vocabulary, different bytes: for a column that has
+is smaller than A on every one of them, by 0.70 to 1.86 percentage points of
+vanilla main. Same encoding vocabulary, different bytes: for a column that has
 settled, C writes through the ordinary column writer while A stays on the page
 grain. The cause is page cadence rather than encoding: a page-grain page can
 never span two `ArrowLeafColumn`s, because a `LeafCursor` covers one leaf and
@@ -2244,26 +2396,28 @@ at the memory cost of holding them.
 
 **Width costs Option B, not Option A or C.** ClickBench `hits` is about 105
 mixed-character columns: URLs and titles, user agents, tiny enums, timestamps
-and 64 bit IDs. B is 2.0x to 2.7x the baseline's wall clock on these files
-against 0.9x to 1.2x for A and 0.86x to 0.94x for C, because B builds and drives
+and 64 bit IDs. B is about 1.9x to 2.7x the branch default's wall clock on these
+files against 0.93x to 1.18x for A and 0.87x to 0.94x for C, because B builds
+and drives
 K complete sets of column writers for all 105 leaves of every racing row group
 whether or not a given leaf is still racing. A and C pay only for the leaves
 that are actually deciding, and C is the fastest arm on all three files. B still
-wins bytes on two of the three, by 1.3 to 2.0 points.
+wins bytes on two of the three, by 1.35 to 1.99 points.
 
 **Row group shape moves the answer more than the data does.** `hits_2` has very
-uneven input row groups (13 006 to 335 872 rows). There B changes the baseline's
-encoding on 68 of 105 columns while A and C change 23, and A and B disagree on
+uneven input row groups (13 006 to 335 872 rows). There B changes the branch
+default's encoding on 68 of 105 columns while A and C change 23, and A and B disagree on
 58 columns, against 15 on the other two files. B decides per whole column chunk,
 so a 13 006 row chunk gives it very different evidence than a 335 872 row one.
-`hits_2` is also the one file where C beats B outright (-7.2% against -7.1%).
+`hits_2` is also the one file where C beats B outright (-6.69% against
+-6.53%).
 
 No column shape in either corpus was passed through: all 9, 16 and 105 leaves
 were raceable, so nothing in these results is masked by an unraced column.
 
 ### Anomalies
 
-* Option A is 0.3% *larger* than the baseline on low-cardinality strings
+* Option A is 0.29% *larger* than both baselines on low-cardinality strings
   (4 479 bytes over 20 row groups, about 224 bytes per row group) while landing
   on the same encodings. Since the encodings match, this is page-boundary drift:
   A's pacing candidate seals pages at slightly different offsets than the
