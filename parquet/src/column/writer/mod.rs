@@ -32,7 +32,9 @@ use crate::basic::{
     SortOrder, Type,
 };
 use crate::column::page::{CompressedPage, Page, PageWriteSpec, PageWriter};
-use crate::column::writer::encoder::{ColumnValueEncoder, ColumnValueEncoderImpl, ColumnValues};
+use crate::column::writer::encoder::{
+    ColumnValueEncoder, ColumnValueEncoderImpl, ColumnValues, DictionaryPage,
+};
 use crate::compression::{Codec, CodecOptionsBuilder, create_codec};
 use crate::data_type::private::ParquetValueType;
 use crate::data_type::*;
@@ -243,7 +245,7 @@ impl ColumnCloseResult {
 
 // Metrics per page
 #[derive(Default)]
-struct PageMetrics {
+pub(crate) struct PageMetrics {
     num_buffered_values: u32,
     num_buffered_rows: u32,
     num_page_nulls: u64,
@@ -267,6 +269,26 @@ impl PageMetrics {
     fn with_definition_level_histogram(mut self, max_level: i16) -> Self {
         self.definition_level_histogram = LevelHistogram::try_new(max_level);
         self
+    }
+
+    /// Detach the finished page's metrics, leaving `self` reset (with the same
+    /// histogram shape) for the next page.
+    ///
+    /// This is the boundary that lets page *assembly* be separated from page
+    /// *commit*: the assembled page carries its own metrics rather than reading
+    /// them back off the writer, so a page assembled by one writer can be
+    /// committed to another (see [`GenericColumnWriter::assemble_data_page`]).
+    fn take_page(&mut self) -> PageMetrics {
+        let taken = PageMetrics {
+            num_buffered_values: self.num_buffered_values,
+            num_buffered_rows: self.num_buffered_rows,
+            num_page_nulls: self.num_page_nulls,
+            num_page_nans: self.num_page_nans,
+            repetition_level_histogram: self.repetition_level_histogram.clone(),
+            definition_level_histogram: self.definition_level_histogram.clone(),
+        };
+        self.new_page();
+        taken
     }
 
     /// Resets the state of this `PageMetrics` to the initial state.
@@ -469,6 +491,60 @@ pub struct GenericColumnWriter<'a, E: ColumnValueEncoder> {
     data_page_boundary_descending: bool,
     /// (min, max)
     last_non_null_data_page_min_max: Option<(E::T, E::T)>,
+
+    /// When set, this writer never flushes a page or falls back from the
+    /// dictionary on its own: [`Self::write_batch_inner`] stops at the first
+    /// point where [`Self::should_add_data_page`] trips and reports how much it
+    /// consumed, leaving the flush decision to the caller.
+    ///
+    /// This is what makes the page boundary an *output* of encoding rather than
+    /// an input: the same budget predicate the normal path uses is evaluated
+    /// against live encoder state, but instead of acting on it the writer hands
+    /// the split point back. Only the page-grain API
+    /// ([`crate::arrow::arrow_writer::page_grain`]) sets this; the default path
+    /// leaves it `false` and behaves exactly as before.
+    defer_page_flush: bool,
+}
+
+/// A data page that has been fully assembled (levels encoded, values encoded,
+/// compressed, header statistics computed) but not yet committed to any column
+/// chunk.
+///
+/// Produced by [`GenericColumnWriter::assemble_data_page`] and consumed by
+/// [`GenericColumnWriter::commit_data_page`]. Carrying the page's own metrics
+/// and statistics here — rather than reading them back off the writer that
+/// produced it — is what allows a page assembled by a throwaway *candidate*
+/// writer to be committed to the real column chunk writer, which is the basis
+/// of the page-grain API.
+pub(crate) struct PreparedDataPage<T: ParquetValueType> {
+    /// The compressed page, header statistics already truncated.
+    pub(crate) compressed: CompressedPage,
+    /// Per-page counters and level histograms.
+    pub(crate) metrics: PageMetrics,
+    /// Untruncated page statistics, used to build the column index.
+    pub(crate) index_statistics: Option<ValueStatistics<T>>,
+    /// Unencoded byte-array bytes in this page, if tracked.
+    pub(crate) variable_length_bytes: Option<i64>,
+    pub(crate) min_value: Option<T>,
+    pub(crate) max_value: Option<T>,
+    pub(crate) nan_count: Option<u64>,
+}
+
+impl<T: ParquetValueType> PreparedDataPage<T> {
+    /// The encoding of the page's values.
+    pub(crate) fn encoding(&self) -> Encoding {
+        self.compressed.encoding()
+    }
+
+    /// Compressed size of the page's body, excluding the page header.
+    pub(crate) fn compressed_len(&self) -> usize {
+        self.compressed.data().len()
+    }
+
+    /// Uncompressed size of the page's body, excluding the page header.
+    pub(crate) fn uncompressed_len(&self) -> usize {
+        self.compressed.uncompressed_size()
+    }
 }
 
 impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
@@ -478,10 +554,24 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         props: WriterPropertiesPtr,
         page_writer: Box<dyn PageWriter + 'a>,
     ) -> Self {
+        let encoder = E::try_new(&descr, props.as_ref()).unwrap();
+        Self::new_with_encoder(descr, props, page_writer, encoder)
+    }
+
+    /// As [`Self::new`], but with a caller-supplied [`ColumnValueEncoder`].
+    ///
+    /// Used by the page-grain API to build writers whose encoder has been
+    /// pinned to a particular [`Encoding`], or has had the chunk's shared
+    /// dictionary installed into it.
+    pub(crate) fn new_with_encoder(
+        descr: ColumnDescPtr,
+        props: WriterPropertiesPtr,
+        page_writer: Box<dyn PageWriter + 'a>,
+        encoder: E,
+    ) -> Self {
         let codec = props.compression(descr.path());
         let codec_options = CodecOptionsBuilder::default().build();
         let compressor = create_codec(codec, &codec_options).unwrap();
-        let encoder = E::try_new(&descr, props.as_ref()).unwrap();
 
         let statistics_enabled = props.statistics_enabled(descr.path());
 
@@ -534,7 +624,24 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             data_page_boundary_ascending: true,
             data_page_boundary_descending: true,
             last_non_null_data_page_min_max: None,
+            defer_page_flush: false,
         }
+    }
+
+    /// Put this writer into deferred-flush mode; see [`Self::defer_page_flush`].
+    pub(crate) fn set_defer_page_flush(&mut self, defer: bool) {
+        self.defer_page_flush = defer;
+    }
+
+    /// Mutable access to the value encoder, for lending the chunk's shared
+    /// dictionary and value-fed accumulators in and out.
+    pub(crate) fn encoder_mut(&mut self) -> &mut E {
+        &mut self.encoder
+    }
+
+    /// Whether any values are buffered for the in-progress page.
+    pub(crate) fn has_buffered_values(&self) -> bool {
+        self.page_metrics.num_buffered_values > 0
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -548,6 +655,38 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         max: Option<&E::T>,
         distinct_count: Option<u64>,
     ) -> Result<usize> {
+        Ok(self
+            .write_batch_inner(
+                values,
+                value_indices,
+                def_levels,
+                rep_levels,
+                min,
+                max,
+                distinct_count,
+            )?
+            .1)
+    }
+
+    /// As [`Self::write_batch_internal`], but also reports how many *levels*
+    /// were consumed.
+    ///
+    /// In the default (non-deferred) mode every level is consumed and the level
+    /// count is simply the input length. In deferred-flush mode the loop stops
+    /// at the first mini-batch boundary where [`Self::should_add_data_page`]
+    /// trips, and the returned `(levels, values)` pair is the span that belongs
+    /// in the page now buffered in the encoder.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_batch_inner(
+        &mut self,
+        values: &E::Values,
+        value_indices: Option<&[usize]>,
+        def_levels: LevelDataRef<'_>,
+        rep_levels: LevelDataRef<'_>,
+        min: Option<&E::T>,
+        max: Option<&E::T>,
+        distinct_count: Option<u64>,
+    ) -> Result<(usize, usize)> {
         // Check if number of definition levels is the same as number of repetition levels.
         if def_levels.len() != 0 && rep_levels.len() != 0 && def_levels.len() != rep_levels.len() {
             return Err(general_err!(
@@ -640,8 +779,9 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
                     chunk_def,
                     chunk_rep,
                 )?;
+                levels_offset = end_offset;
             } else {
-                values_offset += self.write_granular_chunk(
+                let (levels_written, values_written) = self.write_granular_chunk(
                     values,
                     values_offset,
                     value_indices,
@@ -650,12 +790,19 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
                     chunk_rep,
                     sub_batch_size,
                 )?;
+                values_offset += values_written;
+                levels_offset += levels_written;
             }
-            levels_offset = end_offset;
+
+            // Deferred-flush mode: the page budget the normal path would have
+            // acted on is instead reported back to the caller as a split point.
+            if self.defer_page_flush && self.should_add_data_page() {
+                break;
+            }
         }
 
-        // Return total number of values processed.
-        Ok(values_offset)
+        // Return total number of levels and values processed.
+        Ok((levels_offset, values_offset))
     }
 
     /// Writes batch of values, definition levels and repetition levels.
@@ -820,7 +967,9 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
     /// boundary to the next so a record never spans data pages, matching
     /// the parquet format rule.
     ///
-    /// Returns the total number of values consumed across all sub-batches.
+    /// Returns `(levels, values)` consumed across all sub-batches. In
+    /// deferred-flush mode the loop stops early at the sub-batch boundary where
+    /// the page budget trips, so `levels` may be less than `chunk_size`.
     ///
     /// `#[inline(never)]` keeps this slow path — only reached for
     /// variable-width columns whose values need page splitting — out of
@@ -836,7 +985,7 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         chunk_def: LevelDataRef<'_>,
         chunk_rep: LevelDataRef<'_>,
         sub_batch_size: usize,
-    ) -> Result<usize> {
+    ) -> Result<(usize, usize)> {
         // The chunker always sizes a sub-batch to at least one level, so each
         // iteration below makes progress (`sub_end > sub_start`).
         debug_assert!(sub_batch_size >= 1, "chunker must size at least one level");
@@ -871,8 +1020,11 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             )?;
             values_consumed += written;
             sub_start = sub_end;
+            if self.defer_page_flush && self.should_add_data_page() {
+                break;
+            }
         }
-        Ok(values_consumed)
+        Ok((sub_start, values_consumed))
     }
 
     /// Creates a new streaming level encoder appropriate for the writer version.
@@ -1007,6 +1159,14 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
 
         self.page_metrics.num_buffered_values += num_levels as u32;
 
+        // Deferred-flush mode hands both decisions to the caller: the page split
+        // point is reported by `write_batch_inner`, and dictionary abandonment
+        // is the harness's to make via the shared dictionary object. A single
+        // predictable branch per mini-batch (not per value).
+        if self.defer_page_flush {
+            return Ok(values_to_write);
+        }
+
         if self.should_add_data_page() {
             self.add_data_page()?;
         }
@@ -1064,9 +1224,9 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
 
     // For float columns, always provide Some(n), even if n is 0
     // For non-float columns, always provide None
-    fn get_nan_count<T: ParquetValueType>(&self) -> Option<i64> {
+    fn get_nan_count<T: ParquetValueType>(&self, page_metrics: &PageMetrics) -> Option<i64> {
         let nan_count = || {
-            let nan_count = self.page_metrics.num_page_nans.unwrap_or(0);
+            let nan_count = page_metrics.num_page_nans.unwrap_or(0);
             match i64::try_from(nan_count) {
                 Ok(count) => Some(count),
                 _ => Some(i64::MAX),
@@ -1086,12 +1246,12 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
     /// Update the column index and offset index when adding the data page
     fn update_column_offset_index(
         &mut self,
+        page_metrics: &PageMetrics,
         page_statistics: Option<&ValueStatistics<E::T>>,
         page_variable_length_bytes: Option<i64>,
     ) {
         // update the column index
-        let null_page =
-            (self.page_metrics.num_buffered_rows as u64) == self.page_metrics.num_page_nulls;
+        let null_page = (page_metrics.num_buffered_rows as u64) == page_metrics.num_page_nulls;
         // a page contains only null values,
         // and writers have to set the corresponding entries in min_values and max_values to byte[0]
         if null_page && self.column_index_builder.valid() {
@@ -1099,8 +1259,8 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
                 null_page,
                 vec![],
                 vec![],
-                self.page_metrics.num_page_nulls as i64,
-                self.get_nan_count::<E::T>(),
+                page_metrics.num_page_nulls as i64,
+                self.get_nan_count::<E::T>(page_metrics),
             );
         } else if self.column_index_builder.valid() {
             // from page statistics
@@ -1148,16 +1308,16 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
                                 stat.max_bytes_opt().unwrap(),
                             )
                             .0,
-                            self.page_metrics.num_page_nulls as i64,
-                            self.get_nan_count::<E::T>(),
+                            page_metrics.num_page_nulls as i64,
+                            self.get_nan_count::<E::T>(page_metrics),
                         );
                     } else {
                         self.column_index_builder.append(
                             null_page,
                             stat.min_bytes_opt().unwrap().to_vec(),
                             stat.max_bytes_opt().unwrap().to_vec(),
-                            self.page_metrics.num_page_nulls as i64,
-                            self.get_nan_count::<E::T>(),
+                            page_metrics.num_page_nulls as i64,
+                            self.get_nan_count::<E::T>(page_metrics),
                         );
                     }
                 }
@@ -1166,13 +1326,13 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
 
         // Append page histograms to the `ColumnIndex` histograms
         self.column_index_builder.append_histograms(
-            &self.page_metrics.repetition_level_histogram,
-            &self.page_metrics.definition_level_histogram,
+            &page_metrics.repetition_level_histogram,
+            &page_metrics.definition_level_histogram,
         );
 
         // Update the offset index
         if let Some(builder) = self.offset_index_builder.as_mut() {
-            builder.append_row_count(self.page_metrics.num_buffered_rows as i64);
+            builder.append_row_count(page_metrics.num_buffered_rows as i64);
             builder.append_unencoded_byte_array_data_bytes(page_variable_length_bytes);
         }
     }
@@ -1318,53 +1478,51 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
     /// Adds data page.
     /// Data page is either buffered in case of dictionary encoding or written directly.
     pub(crate) fn add_data_page(&mut self) -> Result<()> {
+        let page = self.assemble_data_page()?;
+        self.commit_data_page(page)
+    }
+
+    /// Encode, compress and header-ise the buffered values into a
+    /// [`PreparedDataPage`], leaving this writer's page state reset for the next
+    /// page.
+    ///
+    /// This is the *whole* of page assembly, and the only implementation of it
+    /// in the crate: the page-grain API's candidate encoders call this on their
+    /// own throwaway writers and hand the winner to
+    /// [`Self::commit_data_page`] on the real one.
+    ///
+    /// Nothing here touches chunk-level state, so an assembled page that is
+    /// never committed leaves no trace.
+    pub(crate) fn assemble_data_page(&mut self) -> Result<PreparedDataPage<E::T>> {
         // Extract encoded values
         let values_data = self.encoder.flush_data_page()?;
 
         let max_def_level = self.descr.max_def_level();
         let max_rep_level = self.descr.max_rep_level();
 
-        self.column_metrics.num_column_nulls += self.page_metrics.num_page_nulls;
-
         if let Some(nan_count) = values_data.nan_count {
-            *self.column_metrics.num_column_nans.get_or_insert(0) += nan_count;
             self.page_metrics.num_page_nans = Some(nan_count);
         }
 
-        let page_statistics = match (values_data.min_value, values_data.max_value) {
-            (Some(min), Some(max)) => {
-                // Update chunk level statistics
-                update_min(&self.descr, &min, &mut self.column_metrics.min_column_value);
-                update_max(&self.descr, &max, &mut self.column_metrics.max_column_value);
-
-                (self.statistics_enabled == EnabledStatistics::Page).then_some(
+        // Untruncated page statistics, kept for the column index.
+        let index_statistics = match (&values_data.min_value, &values_data.max_value) {
+            (Some(min), Some(max)) => (self.statistics_enabled == EnabledStatistics::Page)
+                .then(|| {
                     ValueStatistics::new(
-                        Some(min),
-                        Some(max),
+                        Some(min.clone()),
+                        Some(max.clone()),
                         None,
                         Some(self.page_metrics.num_page_nulls),
                         false,
                     )
-                    .with_nan_count(values_data.nan_count),
-                )
-            }
+                    .with_nan_count(values_data.nan_count)
+                }),
             _ => None,
         };
 
-        // update column and offset index
-        self.update_column_offset_index(
-            page_statistics.as_ref(),
-            values_data.variable_length_bytes,
-        );
-
-        // Update histograms and variable_length_bytes in column_metrics
-        self.column_metrics
-            .update_from_page_metrics(&self.page_metrics);
-        self.column_metrics
-            .update_variable_length_bytes(values_data.variable_length_bytes);
-
         // From here on, we only need page statistics if they will be written to the page header.
-        let page_statistics = page_statistics
+        let page_statistics = index_statistics
+            .clone()
             .filter(|_| self.props.write_page_header_statistics(self.descr.path()))
             .map(|stats| self.truncate_statistics(Statistics::from(stats)));
 
@@ -1463,6 +1621,61 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             }
         };
 
+        Ok(PreparedDataPage {
+            compressed: compressed_page,
+            metrics: self.page_metrics.take_page(),
+            index_statistics,
+            variable_length_bytes: values_data.variable_length_bytes,
+            min_value: values_data.min_value,
+            max_value: values_data.max_value,
+            nan_count: values_data.nan_count,
+        })
+    }
+
+    /// Commit an assembled page to this column chunk: fold its page-local facts
+    /// into the chunk-level metrics, column index and offset index, and write it
+    /// (or buffer it behind the dictionary page).
+    ///
+    /// Every chunk-level number derived here — chunk min/max, null count, NaN
+    /// count, `variable_length_bytes`, level histograms, row count — is an
+    /// aggregate of *committed pages only*. That is what makes racing K
+    /// candidate encodings for the same rows safe: the K-1 losers are never
+    /// committed and contribute nothing.
+    pub(crate) fn commit_data_page(&mut self, page: PreparedDataPage<E::T>) -> Result<()> {
+        let PreparedDataPage {
+            compressed,
+            metrics,
+            index_statistics,
+            variable_length_bytes,
+            min_value,
+            max_value,
+            nan_count,
+        } = page;
+
+        self.column_metrics.num_column_nulls += metrics.num_page_nulls;
+
+        if let Some(nan_count) = nan_count {
+            *self.column_metrics.num_column_nans.get_or_insert(0) += nan_count;
+        }
+
+        if let (Some(min), Some(max)) = (&min_value, &max_value) {
+            // Update chunk level statistics
+            update_min(&self.descr, min, &mut self.column_metrics.min_column_value);
+            update_max(&self.descr, max, &mut self.column_metrics.max_column_value);
+        }
+
+        // update column and offset index
+        self.update_column_offset_index(
+            &metrics,
+            index_statistics.as_ref(),
+            variable_length_bytes,
+        );
+
+        // Update histograms and variable_length_bytes in column_metrics
+        self.column_metrics.update_from_page_metrics(&metrics);
+        self.column_metrics
+            .update_variable_length_bytes(variable_length_bytes);
+
         // Check if we need to buffer data page or flush it to the sink directly.
         //
         // For dictionary-encoded columns the dictionary page must be written
@@ -1472,14 +1685,13 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         // at flush, so we stream the data pages straight through and never let
         // them accumulate in memory.
         if self.encoder.has_dictionary() && !self.page_writer.defers_dictionary_ordering() {
-            self.data_pages.push_back(compressed_page);
+            self.data_pages.push_back(compressed);
         } else {
-            self.write_data_page(compressed_page)?;
+            self.write_data_page(compressed)?;
         }
 
         // Update total number of rows.
-        self.column_metrics.total_rows_written += self.page_metrics.num_buffered_rows as u64;
-        self.page_metrics.new_page();
+        self.column_metrics.total_rows_written += metrics.num_buffered_rows as u64;
 
         Ok(())
     }
@@ -1591,11 +1803,21 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
     /// Writes dictionary page into underlying sink.
     #[inline]
     fn write_dictionary_page(&mut self) -> Result<()> {
+        let page = self
+            .encoder
+            .flush_dict_page()?
+            .ok_or_else(|| general_err!("Dictionary encoder is not set"))?;
+        self.write_dictionary_page_data(page)
+    }
+
+    /// Compress and write a caller-supplied dictionary page into this chunk.
+    ///
+    /// The page-grain API owns the chunk's dictionary as an explicit object
+    /// rather than hiding it inside the value encoder, so it hands the finished
+    /// dictionary page here at close.
+    pub(crate) fn write_dictionary_page_data(&mut self, page: DictionaryPage) -> Result<()> {
         let compressed_page = {
-            let mut page = self
-                .encoder
-                .flush_dict_page()?
-                .ok_or_else(|| general_err!("Dictionary encoder is not set"))?;
+            let mut page = page;
 
             let uncompressed_size = page.buf.len();
 

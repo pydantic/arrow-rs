@@ -18,7 +18,8 @@
 use crate::basic::Encoding;
 use crate::bloom_filter::Sbbf;
 use crate::column::writer::encoder::{
-    ColumnValueEncoder, DataPageValues, DictionaryPage, create_bloom_filter,
+    ColumnValueEncoder, DataPageValues, DictionaryPage, DynDictionary, ValueAccumulators,
+    create_bloom_filter,
 };
 use crate::data_type::{AsBytes, ByteArray, Int32Type};
 use crate::encodings::encoding::{DeltaBitPackEncoder, Encoder};
@@ -630,6 +631,67 @@ impl ColumnValueEncoder for ByteArrayEncoder {
 
     fn flush_geospatial_statistics(&mut self) -> Option<Box<GeospatialStatistics>> {
         self.geo_stats_accumulator.as_mut().map(|a| a.finish())?
+    }
+
+    fn try_new_page_candidate(descr: &ColumnDescPtr, props: &WriterProperties) -> Result<Self> {
+        let mut encoder = Self::try_new(descr, props)?;
+        // Strip every piece of chunk-level state; see the trait method's docs.
+        encoder.dict_encoder = None;
+        encoder.bloom_filter = None;
+        encoder.geo_stats_accumulator = None;
+        Ok(encoder)
+    }
+
+    fn take_dictionary(&mut self) -> Option<Box<dyn DynDictionary>> {
+        Some(Box::new(self.dict_encoder.take()?))
+    }
+
+    fn install_dictionary(&mut self, dictionary: Box<dyn DynDictionary>) -> Result<()> {
+        let dictionary = dictionary
+            .into_any()
+            .downcast::<DictEncoder>()
+            .map_err(|_| general_err!("dictionary encoder type does not match this column"))?;
+        self.dict_encoder = Some(*dictionary);
+        Ok(())
+    }
+
+    fn take_value_accumulators(&mut self) -> ValueAccumulators {
+        ValueAccumulators {
+            bloom_filter: self.bloom_filter.take(),
+            bloom_filter_target_fpp: self.bloom_filter_target_fpp,
+            geo_stats_accumulator: self.geo_stats_accumulator.take(),
+        }
+    }
+
+    fn install_value_accumulators(&mut self, accumulators: ValueAccumulators) {
+        self.bloom_filter = accumulators.bloom_filter;
+        self.bloom_filter_target_fpp = accumulators.bloom_filter_target_fpp;
+        self.geo_stats_accumulator = accumulators.geo_stats_accumulator;
+    }
+}
+
+impl DynDictionary for DictEncoder {
+    fn num_entries(&self) -> usize {
+        self.interner.storage().values.len()
+    }
+
+    fn dict_encoded_size(&self) -> usize {
+        self.estimated_dict_page_size()
+    }
+
+    fn rollback_pending(&mut self) {
+        // Entries stay interned (see `DynDictionary::rollback_pending`); only
+        // the abandoned page's indices and its byte tally are discarded.
+        self.indices.clear();
+        self.variable_length_bytes = 0;
+    }
+
+    fn into_dictionary_page(self: Box<Self>) -> Result<DictionaryPage> {
+        Ok((*self).flush_dict_page())
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
     }
 }
 
