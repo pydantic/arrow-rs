@@ -33,8 +33,9 @@
 //! * **Cross-row-group learning.** Carry the settled choice into later row
 //!   groups, and re-open the race every N row groups so the writer can notice
 //!   the data changing under it.
-//! * **Adapt per page.** For one column, never race: revisit the choice from
-//!   the numbers on the previous sealed page.
+//! * **Adapt per page.** For one column, keep revisiting the choice after it
+//!   has settled, from the numbers on the previous sealed page, rather than
+//!   pinning the winner for the rest of the chunk.
 //!
 //! Run with:
 //!
@@ -284,7 +285,9 @@ struct ColumnPolicy {
     reopen_every: usize,
     /// Race candidates for this column's physical type.
     challengers: Vec<Encoding>,
-    /// Never race: re-decide from the previous sealed page's numbers.
+    /// After this column has settled, re-decide each page from the previous
+    /// sealed page's numbers instead of pinning the settled choice outright.
+    /// This refines a settled column; it does not replace the race.
     adapt_per_page: bool,
     /// How many row groups have been written.
     row_groups: usize,
@@ -319,29 +322,6 @@ impl ColumnPolicy {
     ) -> Vec<Candidate> {
         let has_dictionary = chunk.dictionary().is_some();
 
-        if self.adapt_per_page {
-            // No race at all: one candidate, chosen from the previous page's
-            // measured numbers. A page that barely compressed is evidence the
-            // current encoding is not helping.
-            let choice = match last {
-                None if has_dictionary => Candidate::Dictionary,
-                None => Candidate::Pinned(self.challengers[0]),
-                Some(prev) => {
-                    let ratio = prev.compressed as f64 / prev.uncompressed.max(1) as f64;
-                    if prev.encoding == Encoding::RLE_DICTIONARY && ratio > 0.9 && has_dictionary {
-                        // The dictionary page is not buying compression; but we
-                        // can only leave the dictionary, never come back.
-                        Candidate::Pinned(self.challengers[0])
-                    } else if prev.is_dictionary && has_dictionary {
-                        Candidate::Dictionary
-                    } else {
-                        Candidate::Pinned(prev.encoding)
-                    }
-                }
-            };
-            return vec![choice];
-        }
-
         match state {
             Settled::Racing => {
                 let mut candidates = Vec::new();
@@ -356,7 +336,13 @@ impl ColumnPolicy {
                 }
                 candidates
             }
-            Settled::Dictionary if has_dictionary => vec![Candidate::Dictionary],
+            Settled::Dictionary if has_dictionary => {
+                if self.adapt_per_page {
+                    vec![self.adapt(state, last, has_dictionary)]
+                } else {
+                    vec![Candidate::Dictionary]
+                }
+            }
             // The dictionary was abandoned since we settled on it: race the
             // fallbacks now, and land on whichever wins at this moment.
             Settled::Dictionary => self
@@ -364,7 +350,43 @@ impl ColumnPolicy {
                 .iter()
                 .map(|e| Candidate::Pinned(*e))
                 .collect(),
-            Settled::Pinned(encoding) => vec![Candidate::Pinned(encoding)],
+            Settled::Pinned(encoding) => {
+                if self.adapt_per_page {
+                    vec![self.adapt(state, last, has_dictionary)]
+                } else {
+                    vec![Candidate::Pinned(encoding)]
+                }
+            }
+        }
+    }
+
+    /// One candidate, chosen from the previous sealed page's measured numbers.
+    ///
+    /// Used only after a column has settled. A page that barely compressed is
+    /// evidence the current encoding has stopped helping, and the dictionary
+    /// can only be left, never rejoined.
+    fn adapt(&self, state: Settled, last: Option<&PageReport>, has_dictionary: bool) -> Candidate {
+        match last {
+            // Cold start: the first page of a chunk has no previous page to
+            // learn from, so it continues from what this column settled on. It
+            // must not default to the dictionary, or every settled chunk would
+            // open with a dictionary page it then abandons.
+            None => match state {
+                Settled::Dictionary if has_dictionary => Candidate::Dictionary,
+                Settled::Pinned(encoding) => Candidate::Pinned(encoding),
+                _ if has_dictionary => Candidate::Dictionary,
+                _ => Candidate::Pinned(self.challengers[0]),
+            },
+            Some(prev) => {
+                let ratio = prev.compressed as f64 / prev.uncompressed.max(1) as f64;
+                if prev.encoding == Encoding::RLE_DICTIONARY && ratio > 0.9 && has_dictionary {
+                    Candidate::Pinned(self.challengers[0])
+                } else if prev.is_dictionary && has_dictionary {
+                    Candidate::Dictionary
+                } else {
+                    Candidate::Pinned(prev.encoding)
+                }
+            }
         }
     }
 
@@ -451,7 +473,7 @@ fn write_chunk(
             *policy.landed.entry(page.encoding()).or_default() += 1;
 
             // Settle: after enough raced pages agree, stop paying for the race.
-            if matches!(state, Settled::Racing) && !policy.adapt_per_page {
+            if matches!(state, Settled::Racing) {
                 races_left = races_left.saturating_sub(1);
                 if races_left == 0 {
                     state = if page.is_dictionary_indices() {
@@ -467,9 +489,7 @@ fn write_chunk(
     }
 
     policy.row_groups += 1;
-    if !policy.adapt_per_page {
-        policy.learned = state;
-    }
+    policy.learned = state;
     chunk.close()
 }
 

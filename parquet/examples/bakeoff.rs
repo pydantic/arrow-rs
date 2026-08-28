@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! A head-to-head bakeoff of three parquet writing strategies over identical
+//! A head-to-head bakeoff of four parquet writing strategies over identical
 //! inputs, identical row group boundaries and identical writer properties.
 //!
 //! 1. **Baseline** — a stock [`ArrowWriter`] at the shared properties.
@@ -29,8 +29,11 @@
 //!    `DictionaryFallback::WhenProfitable`: encode every leaf K times per row
 //!    group with K whole sets of column writers, keep the smallest chunk, drop
 //!    the rest. Adapted from `advanced_racing_writer`.
+//! 4. **Option C** — a hybrid: each leaf takes the page-grain path while it is
+//!    still deciding, and an ordinary column writer once it has settled, so
+//!    only the leaves actually making a decision leave the normal write path.
 //!
-//! The point of this example is that the three writers see *exactly* the same
+//! The point of this example is that the four writers see *exactly* the same
 //! bytes in, the same rows per row group, the same compression and the same
 //! page size limits, so the reported sizes and times differ only because of the
 //! encoding decisions each one makes.
@@ -41,13 +44,14 @@
 //! cargo run --release --features "arrow snap zstd" --example bakeoff
 //! ```
 //!
-//! Or rewrite real parquet files through the same three writers, reporting to
+//! Or rewrite real parquet files through the same four writers, reporting to
 //! stdout only:
 //!
 //! ```text
 //! cargo run --release --features "arrow snap zstd" --example bakeoff -- a.parquet b.parquet
 //! ```
 
+use std::fmt::Write as _;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -75,7 +79,7 @@ use parquet::schema::types::{ColumnDescPtr, ColumnPath};
 // ---------------------------------------------------------------------------
 // Shared configuration
 //
-// Every knob here is applied identically to all three writers. Nothing below
+// Every knob here is applied identically to all four writers. Nothing below
 // may set a property that is not also set for the other two.
 // ---------------------------------------------------------------------------
 
@@ -85,7 +89,7 @@ const ROWS: usize = 2_000_000;
 const ROW_GROUP_ROWS: usize = 100_000;
 /// Rows per record batch fed to the writers.
 const BATCH_ROWS: usize = 25_000;
-/// Page size limit, in rows, shared by all three writers.
+/// Page size limit, in rows, shared by all four writers.
 const DATA_PAGE_ROW_LIMIT: usize = 20_000;
 /// Timed runs per (dataset, compression, writer). The median is reported.
 const RUNS: usize = 3;
@@ -310,7 +314,7 @@ fn records() -> Dataset {
 // ---------------------------------------------------------------------------
 // Row group boundaries
 //
-// All three writers must cut row groups in exactly the same places, or the
+// All four writers must cut row groups in exactly the same places, or the
 // byte comparison is measuring row group count rather than encoding choice.
 // The baseline gets there via `max_row_group_row_count`; A and B drive the
 // boundaries themselves and use this exact split.
@@ -439,7 +443,9 @@ struct LeafPolicyA {
     learned: Settled,
     /// Race candidates for this leaf's physical type.
     challengers: Vec<Encoding>,
-    /// Never race: re-decide from the previous sealed page's numbers.
+    /// After this leaf has settled, re-decide each page from the previous
+    /// sealed page's numbers instead of pinning the settled choice outright.
+    /// This refines a settled leaf; it does not replace the race.
     adapt_per_page: bool,
     /// One candidate, always: this leaf's type or shape has no useful race.
     passthrough: bool,
@@ -466,8 +472,10 @@ impl LeafPolicyA {
             dictionary_limit: props.column_dictionary_page_size_limit(&path),
             learned: Settled::Racing,
             challengers,
-            // Floats have no alternative encoding worth racing, so instead of
-            // paying for a race they re-decide from the previous page.
+            // Floats race like every other type (the dictionary against
+            // PLAIN), and then keep adapting per page once they have settled:
+            // a float column's answer can drift with the data even when the
+            // set of candidates worth racing does not.
             adapt_per_page: raceable && descr.physical_type() == PhysicalType::DOUBLE,
             passthrough: !raceable,
             row_groups: 0,
@@ -500,28 +508,6 @@ impl LeafPolicyA {
             };
         }
 
-        if self.adapt_per_page {
-            // No race at all: one candidate, chosen from the previous page's
-            // measured numbers.
-            let choice = match last {
-                None if has_dictionary => PageCandidate::Dictionary,
-                None => PageCandidate::Pinned(self.challengers[0]),
-                Some(prev) => {
-                    let ratio = prev.compressed as f64 / prev.uncompressed.max(1) as f64;
-                    if prev.encoding == Encoding::RLE_DICTIONARY && ratio > 0.9 && has_dictionary {
-                        // The dictionary is not buying compression, and we can
-                        // only leave it, never come back.
-                        PageCandidate::Pinned(self.challengers[0])
-                    } else if prev.is_dictionary && has_dictionary {
-                        PageCandidate::Dictionary
-                    } else {
-                        PageCandidate::Pinned(prev.encoding)
-                    }
-                }
-            };
-            return vec![choice];
-        }
-
         match state {
             Settled::Racing => {
                 let mut candidates = Vec::new();
@@ -535,7 +521,13 @@ impl LeafPolicyA {
                 }
                 candidates
             }
-            Settled::Dictionary if has_dictionary => vec![PageCandidate::Dictionary],
+            Settled::Dictionary if has_dictionary => {
+                if self.adapt_per_page {
+                    vec![self.adapt(state, last, has_dictionary)]
+                } else {
+                    vec![PageCandidate::Dictionary]
+                }
+            }
             // The dictionary was abandoned since we settled on it: race the
             // fallbacks now and land on whichever wins at this moment.
             Settled::Dictionary => self
@@ -543,7 +535,86 @@ impl LeafPolicyA {
                 .iter()
                 .map(|e| PageCandidate::Pinned(*e))
                 .collect(),
-            Settled::Pinned(encoding) => vec![PageCandidate::Pinned(encoding)],
+            Settled::Pinned(encoding) => {
+                if self.adapt_per_page {
+                    vec![self.adapt(state, last, has_dictionary)]
+                } else {
+                    vec![PageCandidate::Pinned(encoding)]
+                }
+            }
+        }
+    }
+
+    /// One candidate, chosen from the previous sealed page's measured numbers.
+    ///
+    /// Used only after a leaf has settled. A page that barely compressed is
+    /// evidence the current encoding has stopped helping, and the dictionary
+    /// can only be left, never rejoined.
+    fn adapt(
+        &self,
+        state: Settled,
+        last: Option<&PageReport>,
+        has_dictionary: bool,
+    ) -> PageCandidate {
+        match last {
+            // Cold start: the first page of a chunk has no previous page to
+            // learn from, so it continues from what this leaf settled on. It
+            // must not default to the dictionary, or every settled chunk would
+            // open with a dictionary page it then abandons.
+            None => match state {
+                Settled::Dictionary if has_dictionary => PageCandidate::Dictionary,
+                Settled::Pinned(encoding) => PageCandidate::Pinned(encoding),
+                _ if has_dictionary => PageCandidate::Dictionary,
+                _ => PageCandidate::Pinned(self.challengers[0]),
+            },
+            Some(prev) => {
+                let ratio = prev.compressed as f64 / prev.uncompressed.max(1) as f64;
+                if prev.encoding == Encoding::RLE_DICTIONARY && ratio > 0.9 && has_dictionary {
+                    PageCandidate::Pinned(self.challengers[0])
+                } else if prev.is_dictionary && has_dictionary {
+                    PageCandidate::Dictionary
+                } else {
+                    PageCandidate::Pinned(prev.encoding)
+                }
+            }
+        }
+    }
+
+    /// Whether the race re-opens for the row group about to be written.
+    fn race_reopens(&self) -> bool {
+        self.row_groups.is_multiple_of(A_REOPEN_EVERY)
+    }
+
+    /// Whether this leaf still needs the page-grain path for the row group
+    /// about to be written, which is Option C's routing rule.
+    ///
+    /// A leaf needs it while it is actively deciding: it has never settled, its
+    /// race is re-opening this row group, or it adapts per page and so is never
+    /// finished deciding. Everything else, including every passthrough leaf and
+    /// every leaf resting on a settled choice, can take the ordinary column
+    /// writer path and the full library fast path with it.
+    fn needs_page_grain(&self) -> bool {
+        if self.passthrough {
+            return false;
+        }
+        self.adapt_per_page || self.race_reopens() || matches!(self.learned, Settled::Racing)
+    }
+
+    /// The standard-writer candidate matching this leaf's settled choice, used
+    /// when Option C routes it away from the page-grain path.
+    fn settled_candidate(&self, physical: PhysicalType) -> CandidateB {
+        if self.passthrough {
+            return CandidateB::Passthrough;
+        }
+        match self.learned {
+            Settled::Dictionary => CandidateB::Dictionary,
+            Settled::Pinned(Encoding::PLAIN) => CandidateB::Plain,
+            Settled::Pinned(_) if CandidateB::delta_encoding(physical).is_some() => {
+                CandidateB::Delta
+            }
+            // A settled non-PLAIN encoding with no delta form, or a leaf that
+            // never settled, is written as the file's properties would.
+            _ => CandidateB::Passthrough,
         }
     }
 
@@ -558,45 +629,61 @@ impl LeafPolicyA {
     }
 }
 
-/// Writes one column chunk under `policy`.
-fn write_chunk_a(
-    policy: &mut LeafPolicyA,
-    descr: ColumnDescPtr,
-    props: WriterPropertiesPtr,
-    leaves: &[ArrowLeafColumn],
-) -> Result<ArrowColumnChunk> {
-    let mut chunk = ColumnChunkBuilder::new(descr, props)?;
+/// One column chunk being written through the page-grain API.
+///
+/// Resumable across the record batches of a row group, so a caller can
+/// interleave it with leaves written by ordinary column writers. Option A uses
+/// one of these for every leaf; Option C uses one only for the leaves that are
+/// still making a decision.
+struct ChunkRacer {
+    chunk: ColumnChunkBuilder,
+    state: Settled,
+    last: Option<PageReport>,
+    races_left: usize,
+}
 
-    // Cross-row-group learning: start from what the previous row group settled
-    // on, unless it is time to re-open the race.
-    let reopen = policy.row_groups.is_multiple_of(A_REOPEN_EVERY);
-    let mut state = if reopen {
-        Settled::Racing
-    } else {
-        policy.learned
-    };
-    let mut last: Option<PageReport> = None;
-    let mut races_left = 2usize;
+impl ChunkRacer {
+    fn new(policy: &LeafPolicyA, descr: ColumnDescPtr, props: WriterPropertiesPtr) -> Result<Self> {
+        // Cross-row-group learning: start from what the previous row group
+        // settled on, unless it is time to re-open the race.
+        let state = if policy.race_reopens() {
+            Settled::Racing
+        } else {
+            policy.learned
+        };
+        Ok(Self {
+            chunk: ColumnChunkBuilder::new(descr, props)?,
+            state,
+            last: None,
+            races_left: 2,
+        })
+    }
 
-    for leaf in leaves {
-        let mut cursor: LeafCursor = chunk.cursor(leaf);
+    /// Encodes one leaf's worth of values, a page at a time.
+    fn feed(&mut self, policy: &mut LeafPolicyA, leaf: &ArrowLeafColumn) -> Result<()> {
+        let mut cursor: LeafCursor = self.chunk.cursor(leaf);
         while !cursor.is_empty() {
             // Dictionary watching: drop out of the dictionary the moment it
             // stops paying, and let the next race pick the landing encoding.
-            if matches!(state, Settled::Dictionary)
-                && !LeafPolicyA::dictionary_is_still_paying(&chunk)
+            if matches!(self.state, Settled::Dictionary)
+                && !LeafPolicyA::dictionary_is_still_paying(&self.chunk)
             {
-                state = Settled::Racing;
-                races_left = 1;
+                self.state = Settled::Racing;
+                self.races_left = 1;
             }
 
-            let candidates = policy.plan(&chunk, state, last.as_ref());
+            let candidates = policy.plan(&self.chunk, self.state, self.last.as_ref());
 
             // Read the dictionary either side of the encode so the indices
             // candidate can be charged for the dictionary bytes it created.
-            let before = chunk.dictionary().map(|d| d.encoded_bytes()).unwrap_or(0);
-            let pages = chunk.encode_page(&mut cursor, &candidates)?;
-            let growth = chunk
+            let before = self
+                .chunk
+                .dictionary()
+                .map(|d| d.encoded_bytes())
+                .unwrap_or(0);
+            let pages = self.chunk.encode_page(&mut cursor, &candidates)?;
+            let growth = self
+                .chunk
                 .dictionary()
                 .map(|d| d.encoded_bytes())
                 .unwrap_or(before)
@@ -610,7 +697,7 @@ fn write_chunk_a(
             let winner = pick_page(&pages, growth);
             let page = pages.into_iter().nth(winner).unwrap();
 
-            last = Some(PageReport {
+            self.last = Some(PageReport {
                 encoding: page.encoding(),
                 compressed: page.compressed_len(),
                 uncompressed: page.uncompressed_len(),
@@ -618,10 +705,10 @@ fn write_chunk_a(
             });
 
             // Settle: once enough raced pages agree, stop paying for the race.
-            if matches!(state, Settled::Racing) && !policy.adapt_per_page && !policy.passthrough {
-                races_left = races_left.saturating_sub(1);
-                if races_left == 0 {
-                    state = if page.is_dictionary_indices() {
+            if matches!(self.state, Settled::Racing) && !policy.passthrough {
+                self.races_left = self.races_left.saturating_sub(1);
+                if self.races_left == 0 {
+                    self.state = if page.is_dictionary_indices() {
                         Settled::Dictionary
                     } else {
                         Settled::Pinned(page.encoding())
@@ -629,15 +716,33 @@ fn write_chunk_a(
                 }
             }
 
-            chunk.append(page)?;
+            self.chunk.append(page)?;
         }
+        Ok(())
     }
 
-    policy.row_groups += 1;
-    if !policy.adapt_per_page && !policy.passthrough {
-        policy.learned = state;
+    /// Closes the chunk and records what this row group learned.
+    fn finish(self, policy: &mut LeafPolicyA) -> Result<ArrowColumnChunk> {
+        policy.row_groups += 1;
+        if !policy.passthrough {
+            policy.learned = self.state;
+        }
+        self.chunk.close()
     }
-    chunk.close()
+}
+
+/// Writes one column chunk under `policy`.
+fn write_chunk_a(
+    policy: &mut LeafPolicyA,
+    descr: ColumnDescPtr,
+    props: WriterPropertiesPtr,
+    leaves: &[ArrowLeafColumn],
+) -> Result<ArrowColumnChunk> {
+    let mut racer = ChunkRacer::new(policy, descr, props)?;
+    for leaf in leaves {
+        racer.feed(policy, leaf)?;
+    }
+    racer.finish(policy)
 }
 
 /// Writes a whole file through the page-grain API.
@@ -994,6 +1099,147 @@ fn write_option_b(
 }
 
 // ---------------------------------------------------------------------------
+// Option C: the hybrid
+//
+// Composition rule, per leaf per row group:
+//
+// * A leaf that is **actively deciding** (never settled, its race re-opens this
+//   row group, or it adapts per page) is written with the **page-grain
+//   builder**, racing candidates a page at a time with the dictionary-growth
+//   charge, exactly as Option A does.
+// * Every other leaf, which is every **settled** leaf and every leaf with
+//   **nothing to race**, is written with an ordinary `ArrowColumnWriter` from
+//   `create_column_writers_with_properties`, configured with the candidate that
+//   leaf settled on. That is Option B's path and the library's full fast path.
+// * Wherever a dictionary runs on that standard path, it runs under
+//   `DictionaryFallback::WhenProfitable`, so a settled dictionary leaf still
+//   leaves its dictionary when it stops paying without needing the page grain
+//   to watch it.
+//
+// Both paths produce an `ArrowColumnChunk`, so the two kinds of chunk are
+// appended to one `SerializedRowGroupWriter` in leaf order.
+// ---------------------------------------------------------------------------
+
+/// Writes a whole file, routing each leaf to the page-grain builder or to an
+/// ordinary column writer according to whether it is still deciding.
+fn write_option_c(
+    schema: &SchemaRef,
+    groups: &[Vec<RecordBatch>],
+    props: &WriterProperties,
+    path: &Path,
+) -> Result<Duration> {
+    let start = Instant::now();
+
+    let file = File::create(path)?;
+    let arrow_writer = ArrowWriter::try_new(file, schema.clone(), Some(props.clone()))?;
+    let (mut file_writer, factory) = arrow_writer.into_serialized_writer()?;
+
+    let descrs: Vec<ColumnDescPtr> = file_writer.schema_descr().columns().to_vec();
+    let mut policies: Vec<LeafPolicyA> = descrs
+        .iter()
+        .map(|descr| LeafPolicyA::new(descr, props))
+        .collect();
+
+    // The page-grain builders need the arrow schema in the file metadata just
+    // as Option A does; the `ArrowWriter` already put it in the file writer's
+    // properties, so the page-grain props only add the dictionary policy.
+    let mut page_grain_builder = props.clone().into_builder();
+    for descr in &descrs {
+        page_grain_builder = CandidateB::Dictionary.apply(
+            page_grain_builder,
+            descr.path().clone(),
+            descr.physical_type(),
+        );
+    }
+    let page_grain_props: WriterPropertiesPtr = Arc::new(page_grain_builder.build());
+
+    for (row_group, group) in groups.iter().enumerate() {
+        // Route every leaf before the row group starts.
+        let routes: Vec<bool> = policies.iter().map(|p| p.needs_page_grain()).collect();
+
+        // One set of standard column writers, carrying each settled leaf's
+        // candidate. Leaves on the page-grain path are never written to, so
+        // their entries in this set are dropped unused at the end of the row
+        // group.
+        let mut builder = props.clone().into_builder();
+        for (idx, policy) in policies.iter().enumerate() {
+            if !routes[idx] {
+                let candidate = policy.settled_candidate(descrs[idx].physical_type());
+                builder = candidate.apply(
+                    builder,
+                    descrs[idx].path().clone(),
+                    descrs[idx].physical_type(),
+                );
+            }
+        }
+        let standard_props = Arc::new(builder.build());
+        // `Option` so a writer can be moved out and closed individually while
+        // the unused ones stay in place to be dropped.
+        let mut standard: Vec<Option<ArrowColumnWriter>> = factory
+            .create_column_writers_with_properties(row_group, &standard_props)?
+            .into_iter()
+            .map(Some)
+            .collect();
+
+        // One page-grain builder per racing leaf, and none for the rest.
+        let mut racers: Vec<Option<ChunkRacer>> = Vec::with_capacity(descrs.len());
+        for (idx, policy) in policies.iter().enumerate() {
+            racers.push(if routes[idx] {
+                Some(ChunkRacer::new(
+                    policy,
+                    descrs[idx].clone(),
+                    page_grain_props.clone(),
+                )?)
+            } else {
+                None
+            });
+        }
+
+        for batch in group {
+            let mut leaf_idx = 0usize;
+            for (field, column) in schema.fields().iter().zip(batch.columns()) {
+                for leaf in compute_leaves(field.as_ref(), column)? {
+                    match &mut racers[leaf_idx] {
+                        Some(racer) => racer.feed(&mut policies[leaf_idx], &leaf)?,
+                        None => standard[leaf_idx]
+                            .as_mut()
+                            .expect("standard writer present for a non-racing leaf")
+                            .write(&leaf)?,
+                    }
+                    leaf_idx += 1;
+                }
+            }
+        }
+
+        // Close both kinds of chunk and append them in leaf order.
+        let mut chunks: Vec<ArrowColumnChunk> = Vec::with_capacity(descrs.len());
+        for (idx, racer) in racers.into_iter().enumerate() {
+            match racer {
+                Some(racer) => chunks.push(racer.finish(&mut policies[idx])?),
+                None => {
+                    policies[idx].row_groups += 1;
+                    chunks.push(
+                        standard[idx]
+                            .take()
+                            .expect("standard writer present for a non-racing leaf")
+                            .close()?,
+                    );
+                }
+            }
+        }
+
+        let mut rg = file_writer.next_row_group()?;
+        for chunk in chunks {
+            chunk.append_to_row_group(&mut rg)?;
+        }
+        rg.close()?;
+    }
+
+    file_writer.close()?;
+    Ok(start.elapsed())
+}
+
+// ---------------------------------------------------------------------------
 // Baseline
 // ---------------------------------------------------------------------------
 
@@ -1025,6 +1271,7 @@ enum Writer {
     Baseline,
     OptionA,
     OptionB,
+    OptionC,
 }
 
 impl Writer {
@@ -1033,6 +1280,7 @@ impl Writer {
             Writer::Baseline => "baseline",
             Writer::OptionA => "option A (page-grain)",
             Writer::OptionB => "option B (K writers)",
+            Writer::OptionC => "option C (hybrid)",
         }
     }
 
@@ -1047,6 +1295,7 @@ impl Writer {
             Writer::Baseline => write_baseline(schema, groups, props, path),
             Writer::OptionA => write_option_a(schema, groups, props, path),
             Writer::OptionB => write_option_b(schema, groups, props, path),
+            Writer::OptionC => write_option_c(schema, groups, props, path),
         }
     }
 }
@@ -1063,7 +1312,7 @@ struct Measurement {
 
 /// Reads the finished file's footer and reports the encodings each leaf column
 /// actually ended up with. Doing this from the file rather than from harness
-/// bookkeeping keeps the three writers comparable.
+/// bookkeeping keeps the four writers comparable.
 fn final_encodings(path: &Path) -> Result<(Vec<(String, String)>, usize)> {
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
@@ -1290,7 +1539,7 @@ fn print_encodings(measurements: &[Measurement], passthrough: &[String]) {
 // Drivers
 // ---------------------------------------------------------------------------
 
-/// Runs the three writers over one dataset at one compression.
+/// Runs the four writers over one dataset at one compression.
 fn run_case(
     name: &str,
     schema: &SchemaRef,
@@ -1308,7 +1557,12 @@ fn run_case(
     let expected = expected_columns(schema, batches)?;
 
     let mut measurements = Vec::new();
-    for writer in [Writer::Baseline, Writer::OptionA, Writer::OptionB] {
+    for writer in [
+        Writer::Baseline,
+        Writer::OptionA,
+        Writer::OptionB,
+        Writer::OptionC,
+    ] {
         let path = dir.join("bakeoff.parquet");
         measurements.push(measure(writer, schema, &groups, &props, &path, &expected)?);
         let _ = std::fs::remove_file(&path);
@@ -1331,7 +1585,7 @@ fn run_case(
     println!("  {name} / {compression_label}");
     print_encodings(&measurements, &passthrough);
     println!(
-        "    verified {} rows read back exactly from all three files",
+        "    verified {} rows read back exactly from all four files",
         expected.first().map(|c| c.len()).unwrap_or(0)
     );
     Ok(())
@@ -1380,19 +1634,31 @@ fn run_synthetic(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Rewrites externally supplied parquet files through the three writers.
+/// Rewrites externally supplied parquet files through the four writers.
 ///
-/// Results for these files go to stdout only: nothing here is written into
-/// `BAKEOFF.md` or any other file in the repository, and no input file is
-/// copied into the tree.
-fn run_files(paths: &[String], dir: &Path) -> Result<()> {
+/// By default the results go to stdout only: nothing is written into
+/// `BAKEOFF.md`, and no input file is copied into the tree. That is the mode
+/// for private or unpublished inputs.
+///
+/// With `public = true` the table is additionally recorded in `BAKEOFF.md`
+/// under a "Public datasets" section, which is appropriate only for inputs
+/// anyone can reproduce, such as a published benchmark corpus or data from a
+/// generator anyone can run. `label` names the corpus in that section.
+fn run_files(paths: &[String], dir: &Path, public: Option<&str>) -> Result<()> {
     let compression = compressions().pop().expect("at least one compression");
 
     println!(
         "bakeoff over supplied files: compression {}, median of {RUNS} runs\n\
-         (results for supplied files are printed here only and are not written to any file)\n",
-        compression.0
+         (results are {})\n",
+        compression.0,
+        match public {
+            Some(label) => format!("recorded in BAKEOFF.md under \"{label}\""),
+            None => "printed here only and are not written to any file".to_string(),
+        }
     );
+
+    let mut public_rows: Vec<Row> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
 
     for path in paths {
         let input = Path::new(path);
@@ -1424,8 +1690,14 @@ fn run_files(paths: &[String], dir: &Path) -> Result<()> {
         );
 
         let mut rows: Vec<Row> = Vec::new();
+        // Only the file name identifies the dataset in the report: an absolute
+        // path would leak where the corpus happened to be staged.
+        let name = input
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| input.display().to_string());
         run_case(
-            &input.display().to_string(),
+            &name,
             &schema,
             &batches,
             rows_per_row_group,
@@ -1434,6 +1706,20 @@ fn run_files(paths: &[String], dir: &Path) -> Result<()> {
             &mut rows,
         )?;
         println!("{}", render_table(&rows));
+        if public.is_some() {
+            notes.push(format!(
+                "`{name}`: {total_rows} rows, {} row groups in, rewritten at \
+                 {rows_per_row_group} rows per row group; source file {}.",
+                metadata.num_row_groups(),
+                human(input_bytes)
+            ));
+            public_rows.extend(rows);
+        }
+    }
+
+    if let Some(label) = public {
+        record_public_results(label, &public_rows, &notes)?;
+        println!("recorded the {label} results in BAKEOFF.md");
     }
     Ok(())
 }
@@ -1441,6 +1727,61 @@ fn run_files(paths: &[String], dir: &Path) -> Result<()> {
 // ---------------------------------------------------------------------------
 // The report
 // ---------------------------------------------------------------------------
+
+/// Heading that opens the public-dataset section of the report.
+///
+/// The synthetic run rewrites `BAKEOFF.md` wholesale, so it carries any
+/// existing public-dataset section through unchanged rather than dropping the
+/// results of a separate corpus run.
+const PUBLIC_MARKER: &str = "## Public datasets";
+
+fn report_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("BAKEOFF.md")
+}
+
+/// The existing public-dataset section, if the report already has one.
+fn existing_public_section() -> String {
+    let text = std::fs::read_to_string(report_path()).unwrap_or_default();
+    match text.find(PUBLIC_MARKER) {
+        Some(at) => text[at..].to_string(),
+        None => String::new(),
+    }
+}
+
+/// Replaces the public-dataset section of the report, keeping everything the
+/// synthetic run wrote above it.
+fn record_public_results(label: &str, rows: &[Row], notes: &[String]) -> Result<()> {
+    let path = report_path();
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let head = match existing.find(PUBLIC_MARKER) {
+        Some(at) => existing[..at].to_string(),
+        None => {
+            let mut head = existing;
+            if !head.is_empty() && !head.ends_with("\n\n") {
+                head.push('\n');
+            }
+            head
+        }
+    };
+
+    let mut section = String::from(PUBLIC_MARKER);
+    section.push_str(
+        "\n\nResults over corpora anyone can obtain, measured the same way as the\n\
+         synthetic suite: ZSTD, the input's own row group sizing preserved, exact\n\
+         read-back verification, median of 3 release runs. Only the file name of\n\
+         each input is recorded.\n\n",
+    );
+    let _ = writeln!(section, "### {label}\n");
+    for note in notes {
+        let _ = writeln!(section, "* {note}");
+    }
+    section.push_str("\n```\n");
+    section.push_str(&render_table(rows));
+    section.push_str("```\n");
+
+    std::fs::write(&path, format!("{head}{section}"))?;
+    Ok(())
+}
 
 fn write_report(table: &str) -> Result<()> {
     // Anchored to the crate directory so the report lands in the right place
@@ -1459,12 +1800,12 @@ file.
 
 ## Method
 
-All three writers see identical inputs and identical writer properties. The only
+All four writers see identical inputs and identical writer properties. The only
 difference between them is how each decides a column's encoding.
 
 * Datasets are deterministic ({ROWS} rows each, splitmix64 seeded per dataset),
   cut into {BATCH_ROWS} row record batches.
-* Row group boundaries are identical for all three writers: {ROW_GROUP_ROWS}
+* Row group boundaries are identical for all four writers: {ROW_GROUP_ROWS}
   rows, {row_groups} row groups per file. The baseline reaches them through
   `max_row_group_row_count`; options A and B cut the batches themselves at the
   same offsets.
@@ -1475,7 +1816,7 @@ difference between them is how each decides a column's encoding.
 * Time is the median of {RUNS} runs in a release build. Output size is asserted
   identical across those runs, so each writer is deterministic.
 
-The three writers:
+The four writers:
 
 1. **Baseline** — a stock `ArrowWriter` at the shared properties.
 2. **Option A (page-grain)** — races candidate encodings a page at a time
@@ -1491,6 +1832,54 @@ The three writers:
    `DictionaryFallback::WhenProfitable {{ worth_ratio: {DICT_WORTH_RATIO} }}`.
    A leaf settles when a row group's best and worst differ by at least
    {settle_pct}%, and re-races every {B_REOPEN_EVERY} row groups.
+4. **Option C (hybrid)** — routes each leaf, each row group, to whichever of
+   the two paths it needs. See below.
+
+### Option C's composition rule
+
+Per leaf, per row group:
+
+* A leaf that is **actively deciding** goes to the **page-grain builder** and
+  races candidates a page at a time with the dictionary-growth charge, exactly
+  as Option A does. "Actively deciding" means it has never settled, its race
+  re-opens this row group, or it adapts per page and so is never done deciding.
+* Every other leaf — every **settled** leaf and every leaf with **nothing to
+  race** — goes to an ordinary `ArrowColumnWriter` from
+  `create_column_writers_with_properties`, configured with the candidate that
+  leaf settled on. That is Option B's path, and it gets the library's normal
+  write path with no page-grain involvement at all.
+* Wherever a dictionary runs on that standard path it runs under
+  `DictionaryFallback::WhenProfitable`, so a settled dictionary leaf can still
+  leave its dictionary without the page grain watching it.
+
+Both paths produce an `ArrowColumnChunk`, and the two kinds are appended to one
+`SerializedRowGroupWriter` in leaf order. The intent is A's decisions at less
+than A's per-leaf library exposure and much less than B's CPU, since only the
+leaves actually deciding pay anything beyond the ordinary write path.
+
+### Seams the hybrid exposed
+
+Three, none of which are papered over in the harness:
+
+1. **`create_column_writers_with_properties` is all-or-nothing.** It returns one
+   writer per leaf in the schema, with no way to ask for a subset. Option C
+   allocates writers for its page-grain leaves and drops them unwritten. The
+   waste is an allocation rather than encoding work, so it does not show up in
+   the times, but a hybrid cannot express "give me writers for these three
+   leaves" today.
+2. **The two paths abandon a dictionary by different mechanisms.** `page_grain`
+   has no automatic fallback; the harness decides, which is what
+   `DictionaryFallback` does on the column-writer path. So a leaf changes its
+   dictionary-abandonment mechanism when it changes path, and the page-grain
+   path cannot use `WhenProfitable` at all. This is the direct cause of the
+   byte gap between C and A on the two uncompressed mixed datasets below.
+3. **The page-grain path cannot share the file writer's page store.**
+   `ColumnChunkBuilder::new_with_page_store` accepts a `PageStoreFactory`, and
+   `ArrowRowGroupWriterFactory` has a `with_page_store_factory` setter, but no
+   getter that would hand its factory over. A hybrid therefore buffers its
+   page-grain leaves in memory while its standard leaves use the file writer's
+   spilling store, so the memory bound the standard path offers does not extend
+   across the whole row group.
 
 ## Results
 
@@ -1537,6 +1926,12 @@ loop.
         interpretation = INTERPRETATION,
     );
 
+    let public = existing_public_section();
+    let body = if public.is_empty() {
+        body
+    } else {
+        format!("{body}\n{public}")
+    };
     std::fs::write(crate_dir.join("BAKEOFF.md"), body)?;
     Ok(())
 }
@@ -1559,88 +1954,114 @@ ratios, not as absolutes.
 
 ### Where the baseline is already right
 
-**Low-cardinality strings.** Option B reproduces the baseline byte for byte
-(1 536 969 bytes at both compressions' respective sizes), and Option A is 0.3%
-larger. All three land on the same encodings. B ties exactly because its winning
-candidate is the dictionary, and with a 48 entry dictionary neither the 64 KiB
-candidate limit nor the 1 MiB default limit is ever approached, so the candidate
-properties and the baseline properties are operationally identical for this
-column. The baseline is also the fastest of the three here. Racing costs time and
-buys nothing on data whose right answer is the default.
+**Low-cardinality strings.** Option B reproduces the baseline byte for byte, C
+is 0.1% larger and A 0.3% larger, and all four land on the same encodings. B
+ties exactly because its winning candidate is the dictionary, and with a 48
+entry dictionary neither the 64 KiB candidate limit nor the 1 MiB default is
+approached, so the candidate properties and the baseline properties are
+operationally identical for this column. The baseline is also the fastest.
+Racing costs time and buys nothing on data whose right answer is the default.
 
-### Where both options win, by the same amount
+### Where every option wins, by the same amount
 
-**High-cardinality int64 timestamps.** Both options land on
+**High-cardinality int64 timestamps.** A, B and C all land on
 `DELTA_BINARY_PACKED` and cut the file by 84.8% uncompressed and 62.5% with
-ZSTD; they agree with each other to within 0.1%. The baseline footer shows
-`PLAIN+RLE+RLE_DICTIONARY`: it builds a dictionary over effectively unique values
-and then spills to plain. This is also the one place where both options are
-*faster* than the baseline, for the same reason: neither pays to build and then
-abandon a two million entry dictionary. This is the largest effect in the table
-and neither API is required to get it, only the willingness to measure.
+ZSTD, agreeing with each other to within 0.1%. The baseline footer shows
+`PLAIN+RLE+RLE_DICTIONARY`: it builds a dictionary over effectively unique
+values and then spills to plain. All three options are also *faster* than the
+baseline here, for the same reason: none of them pays to build and then abandon
+a two million entry dictionary. This is the largest effect in the table, and no
+particular API is required to get it, only the willingness to measure.
+
+**f64 measurements.** Once Option A races floats (the dictionary against
+`PLAIN`) rather than only adapting per page, A and C match B: -20.2%
+uncompressed and -20.5% with ZSTD, within 0.02% of B's bytes, all three landing
+on `PLAIN+RLE`. Before that change A trailed at -16.3% / -16.5%, and the cause
+was visible in the footer as a residual `RLE_DICTIONARY`: the adapt-per-page
+rule's cold-start branch chose the dictionary for the first page of every chunk,
+because a fresh chunk has a dictionary and no previous page to learn from. One
+dictionary-encoded page per chunk is enough to force a dictionary page into that
+chunk. Honouring the settled choice at a chunk boundary removed it. The residual
+was a harness policy defect, not a property of the page-grain API.
 
 ### Where A wins
 
 **Uncompressed data whose character changes mid-file.** On shifting strings A is
-45.5% below the baseline against B's 28.8%, and on the records-like schema 51.0%
-against B's 40.0%. The mechanism is visible in the two policies: B's unit of
-decision is a whole column chunk, and a leaf that settles re-races only every 8
-row groups, so after the data changes at row group 10 it keeps writing the
-settled dictionary candidate until its next scheduled race. A re-opens every 4
-row groups *and* watches the live dictionary inside a chunk, abandoning it as
-soon as distinct entries pass a quarter of the values written, so it reacts
-within the row group in which the data changes rather than at the next race.
-That is the concrete capability the page grain buys here.
+45.5% below the baseline against B's 28.8%, and on the records-like schema 51.9%
+against B's 40.0%. B's unit of decision is a whole column chunk, and a settled
+leaf re-races only every 8 row groups, so after the data changes at row group 10
+it keeps writing the settled dictionary candidate until its next scheduled race.
+A re-opens every 4 row groups *and* watches the live dictionary inside a chunk,
+abandoning it as soon as distinct entries pass a quarter of the values written,
+so it reacts within the row group in which the data changes. That is the
+concrete capability the page grain buys.
 
 ### Where B wins
 
-**f64 measurements, at both compressions.** B is 20.2% / 20.5% below the
-baseline against A's 16.3% / 16.5%. The footers explain the gap: B writes
-`PLAIN+RLE` and A writes `PLAIN+RLE+RLE_DICTIONARY`. A does not race floats at
-all; its float policy is adapt-per-page, which starts each chunk on the
-dictionary and leaves it only after a sealed page reports a compression ratio
-above 0.9. Every chunk therefore pays for the dictionary pages written before
-that evidence arrives. B races plain against dictionary over the whole chunk and
-drops the dictionary outright. The same difference shows up on the `latency_ms`
-column of the records-like schema, which is the only column where the two
-options' footers disagree.
+**Compressed versions of the two mixed datasets.** Under ZSTD, B is 17.3% and
+26.9% below the baseline on shifting strings and the records-like schema,
+against A's 14.5% and 26.0%. A's advantage on these two datasets is largest
+uncompressed and shrinks or reverses once ZSTD runs, which is consistent with
+the general compressor already removing much of the redundancy that
+finer-grained encoding switching targets. Every option remains well ahead of the
+baseline in all of these cells.
 
-**Compressed versions of the two mixed datasets.** Under ZSTD the ranking on
-shifting strings and the records-like schema reverses: B is 17.3% and 26.9%
-below the baseline against A's 14.5% and 24.1%. A's advantage on these two
-datasets is largest uncompressed and shrinks or reverses once ZSTD runs, which
-is consistent with the general compressor already removing much of the
-redundancy that finer-grained encoding switching targets. Both options remain
-well ahead of the baseline in every one of these cells.
+### Where C lands
+
+C is the intended shape in most cells and the fastest arm overall: it is at or
+below A's time everywhere except a noise-level float cell, and far below B's
+everywhere, because only the leaves actually deciding leave the ordinary write
+path. On bytes it matches A exactly on floats and timestamps, beats A on
+low-cardinality strings, and beats B on both uncompressed mixed datasets.
+
+C fails to match its stronger parent in three cells, all for the same reason:
+
+* shifting strings, uncompressed: C is -42.4% against A's -45.5%.
+* records-like, uncompressed: C is -49.4% against A's -51.9%.
+* shifting strings, ZSTD: C is -16.6% against B's -17.3%.
+
+In the two uncompressed cells C should have matched A and did not. Between
+scheduled re-races a settled leaf sits on the standard path, where its only way
+to react to changing data is `DictionaryFallback::WhenProfitable`, a chunk-level
+dictionary decision. A, which stays on the page grain for every chunk, re-decides
+every page and can also switch to a delta encoding mid-chunk. That is seam 2
+above, priced: routing a settled leaf back to the standard path costs roughly
+2.5 to 3 percentage points on data that changes character between races. The
+gap would close if `WhenProfitable` and the page-grain dictionary watching were
+the same mechanism, or if C re-raced more often, at CPU it currently does not
+spend.
 
 ### Cost
 
-A's median write time is below the baseline on seven of the ten cells, and its
-worst cell is roughly 1.4x baseline. B is below the baseline on four of the ten
-and reaches roughly 3x on the two string datasets, where it races the widest
-candidate set. The structural reason is in the two designs
-rather than in tuning: B allocates and drives K complete sets of column writers
-for every leaf of every racing row group, including leaves that are not racing,
-while A's extra work is one additional encode per candidate per raced page and
-falls to a single encode as soon as the column settles. B's cost is also charged
-per row group, so a file with many small row groups pays it more often.
+A's median write time is below the baseline on most cells and its worst is about
+1.4x. C is below the baseline on more cells still and never much above it. B is
+below the baseline on four of the ten cells and reaches roughly 3x on the two
+string datasets, where it races the widest candidate set. The structural reason
+is in the designs rather than in tuning: B allocates and drives K complete sets
+of column writers for every leaf of every racing row group, including leaves
+that are not racing, while A's extra work is one additional encode per candidate
+per raced page and falls to a single encode once the column settles. C pays that
+only for leaves that are still deciding. B's cost is also charged per row group,
+so a file with many small row groups pays it more often.
 
 ### Anomalies
 
 * Option A is 0.3% *larger* than the baseline on low-cardinality strings
-  (4 479 bytes over 20 row groups, about 224 bytes per row group), while landing
-  on the same encodings the baseline uses. Since the encodings match, this is
-  page-boundary drift: A's pacing candidate seals pages at slightly different
-  offsets than the baseline's own page budget does, not a different encoding
-  decision. The losing candidates in a race are never committed and cannot
-  contribute bytes.
-* On the uncompressed timestamps dataset the two options differ by 3 722 bytes
-  (0.12%) despite both landing on `DELTA_BINARY_PACKED` for every row group,
-  which is the same page-boundary effect in the other direction.
-* The baseline's ZSTD file for timestamps is 8.15 MiB against 20.05 MiB
-  uncompressed, while both options' files are 2.91 MiB either way. Delta encoded
-  output is already close to incompressible, so ZSTD narrows the gap between the
-  baseline and the options from 84.8% to 62.5% without changing the ordering.
+  (4 479 bytes over 20 row groups, about 224 bytes per row group) while landing
+  on the same encodings. Since the encodings match, this is page-boundary drift:
+  A's pacing candidate seals pages at slightly different offsets than the
+  baseline's own page budget does. The losing candidates in a race are never
+  committed and cannot contribute bytes.
+* The options differ from each other by around 0.1% on datasets where they all
+  choose the same encoding for every row group, which is the same
+  page-boundary effect.
+* The baseline's ZSTD file for timestamps is 7.78 MiB against 19.12 MiB
+  uncompressed, while every option's file is 2.91 MiB either way. Delta encoded
+  output is already close to incompressible, so ZSTD narrows the gap from 84.8%
+  to 62.5% without changing the ordering.
+* ClickBench partitioned `hits` could not be measured: the configured egress
+  proxy refuses CONNECT to `datasets.clickhouse.com` with a 403 policy denial.
+  No mirror was substituted.
 ";
 
 // ---------------------------------------------------------------------------
@@ -1649,11 +2070,30 @@ fn main() -> Result<()> {
     let dir = std::env::temp_dir().join("parquet_bakeoff");
     std::fs::create_dir_all(&dir)?;
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `--public <label> <files...>` records the results in BAKEOFF.md; without
+    // it, supplied files are reported to stdout only.
+    let public = if args.first().map(String::as_str) == Some("--public") {
+        args.remove(0);
+        if args.is_empty() {
+            return Err(ParquetError::General(
+                "--public needs a corpus label followed by the files".to_string(),
+            ));
+        }
+        Some(args.remove(0))
+    } else {
+        None
+    };
+
     let result = if args.is_empty() {
+        if public.is_some() {
+            return Err(ParquetError::General(
+                "--public needs at least one parquet file".to_string(),
+            ));
+        }
         run_synthetic(&dir)
     } else {
-        run_files(&args, &dir)
+        run_files(&args, &dir, public.as_deref())
     };
 
     let _ = std::fs::remove_dir_all(&dir);
