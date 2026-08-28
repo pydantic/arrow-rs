@@ -1423,7 +1423,7 @@ mod tests {
             |_| vec![Candidate::Dictionary],
             |pages| {
                 // Every page holds whole records: 5 levels per record.
-                assert_eq!(pages[0].num_values() % 5, 0);
+                assert!(pages[0].num_values().is_multiple_of(5));
                 page_rows.push(pages[0].num_rows());
                 0
             },

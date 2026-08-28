@@ -68,81 +68,6 @@ pub struct DataPageValues<T> {
     pub variable_length_bytes: Option<i64>,
 }
 
-/// A column chunk's dictionary encoder, type-erased so it can be owned by the
-/// caller rather than buried inside a [`ColumnValueEncoder`].
-///
-/// The page-grain API turns "dictionary encoding" from a mode into an object:
-/// one dictionary per column chunk, lent to whichever page encoder is currently
-/// producing an indices page and handed back afterwards. Erasing the type is
-/// what lets the arrow byte-array dictionary and the generic
-/// [`DictEncoder`] live behind the same public handle.
-pub trait DynDictionary: std::any::Any {
-    /// Number of distinct entries interned so far.
-    fn num_entries(&self) -> usize;
-
-    /// Encoded size of the dictionary page's entries, in bytes.
-    fn dict_encoded_size(&self) -> usize;
-
-    /// Discard indices buffered for a page that was abandoned rather than
-    /// sealed.
-    ///
-    /// Entries interned by the abandoned page are deliberately *not* removed:
-    /// every candidate for a span sees the same values, so an entry a losing
-    /// candidate added is a value that genuinely occurs in that span. A
-    /// dictionary that is a superset of what its indices reference is valid;
-    /// see `PAGE_API_DESIGN.md`.
-    fn rollback_pending(&mut self);
-
-    /// Consume the dictionary, producing its page.
-    fn into_dictionary_page(self: Box<Self>) -> Result<DictionaryPage>;
-
-    /// Downcast support for reinstalling into a concrete encoder.
-    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any>;
-}
-
-impl<T: DataType> DynDictionary for DictEncoder<T> {
-    fn num_entries(&self) -> usize {
-        DictEncoder::num_entries(self)
-    }
-
-    fn dict_encoded_size(&self) -> usize {
-        DictEncoder::dict_encoded_size(self)
-    }
-
-    fn rollback_pending(&mut self) {
-        DictEncoder::clear_pending(self);
-    }
-
-    fn into_dictionary_page(self: Box<Self>) -> Result<DictionaryPage> {
-        Ok(DictionaryPage {
-            buf: self.write_dict()?,
-            num_values: self.num_entries(),
-            is_sorted: self.is_sorted(),
-        })
-    }
-
-    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
-        self
-    }
-}
-
-/// Chunk-level statistics that are fed by *values*, not by pages.
-///
-/// A bloom filter and a geospatial-statistics accumulator both see every value
-/// in the chunk exactly once and cannot be reconstructed by aggregating
-/// per-page facts. In the page-grain API they are owned by the column chunk and
-/// lent to whichever page encoder is *pacing* — the one that advances the
-/// cursor — for exactly the span it consumes. Raced candidates for that same
-/// span are constructed without them
-/// ([`ColumnValueEncoder::try_new_page_candidate`]), so K candidates still
-/// produce exactly one insert per value. See `PAGE_API_DESIGN.md`.
-#[derive(Default)]
-pub struct ValueAccumulators {
-    pub bloom_filter: Option<Sbbf>,
-    pub bloom_filter_target_fpp: f64,
-    pub geo_stats_accumulator: Option<Box<dyn GeoStatsAccumulator>>,
-}
-
 /// A generic encoder of [`ColumnValues`] to data and dictionary pages used by
 /// [`super::GenericColumnWriter`]
 pub trait ColumnValueEncoder {
@@ -710,4 +635,90 @@ where
         }
     }
     Some(n)
+}
+
+// ---------------------------------------------------------------------------
+// Page-grain support types.
+//
+// Deliberately placed at the end of the module, below the hot encoder code, for
+// the reason `plain_encoded_byte_size` documents: inserting items above the
+// `ColumnValueEncoder` trait shifts the trait and `ColumnValueEncoderImpl`
+// within the compiled module enough to perturb downstream code placement and
+// measurably regress the `string` / `string_and_binary_view` arrow-writer
+// benchmarks. Nothing below is reached on the default write path.
+// ---------------------------------------------------------------------------
+
+/// A column chunk's dictionary encoder, type-erased so it can be owned by the
+/// caller rather than buried inside a [`ColumnValueEncoder`].
+///
+/// The page-grain API turns "dictionary encoding" from a mode into an object:
+/// one dictionary per column chunk, lent to whichever page encoder is currently
+/// producing an indices page and handed back afterwards. Erasing the type is
+/// what lets the arrow byte-array dictionary and the generic
+/// [`DictEncoder`] live behind the same public handle.
+pub trait DynDictionary: std::any::Any {
+    /// Number of distinct entries interned so far.
+    fn num_entries(&self) -> usize;
+
+    /// Encoded size of the dictionary page's entries, in bytes.
+    fn dict_encoded_size(&self) -> usize;
+
+    /// Discard indices buffered for a page that was abandoned rather than
+    /// sealed.
+    ///
+    /// Entries interned by the abandoned page are deliberately *not* removed:
+    /// every candidate for a span sees the same values, so an entry a losing
+    /// candidate added is a value that genuinely occurs in that span. A
+    /// dictionary that is a superset of what its indices reference is valid;
+    /// see `PAGE_API_DESIGN.md`.
+    fn rollback_pending(&mut self);
+
+    /// Consume the dictionary, producing its page.
+    fn into_dictionary_page(self: Box<Self>) -> Result<DictionaryPage>;
+
+    /// Downcast support for reinstalling into a concrete encoder.
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any>;
+}
+
+impl<T: DataType> DynDictionary for DictEncoder<T> {
+    fn num_entries(&self) -> usize {
+        DictEncoder::num_entries(self)
+    }
+
+    fn dict_encoded_size(&self) -> usize {
+        DictEncoder::dict_encoded_size(self)
+    }
+
+    fn rollback_pending(&mut self) {
+        DictEncoder::clear_pending(self);
+    }
+
+    fn into_dictionary_page(self: Box<Self>) -> Result<DictionaryPage> {
+        Ok(DictionaryPage {
+            buf: self.write_dict()?,
+            num_values: self.num_entries(),
+            is_sorted: self.is_sorted(),
+        })
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
+/// Chunk-level statistics that are fed by *values*, not by pages.
+///
+/// A bloom filter and a geospatial-statistics accumulator both see every value
+/// in the chunk exactly once and cannot be reconstructed by aggregating
+/// per-page facts. In the page-grain API they are owned by the column chunk and
+/// lent to whichever page encoder is *pacing* — the one that advances the
+/// cursor — for exactly the span it consumes. Raced candidates for that same
+/// span are constructed without them
+/// ([`ColumnValueEncoder::try_new_page_candidate`]), so K candidates still
+/// produce exactly one insert per value. See `PAGE_API_DESIGN.md`.
+#[derive(Default)]
+pub struct ValueAccumulators {
+    pub bloom_filter: Option<Sbbf>,
+    pub bloom_filter_target_fpp: f64,
+    pub geo_stats_accumulator: Option<Box<dyn GeoStatsAccumulator>>,
 }
