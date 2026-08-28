@@ -1292,13 +1292,37 @@ impl ArrowRowGroupWriterFactory {
 
     /// Create column writers for a new row group, with the given row group index
     pub fn create_column_writers(&self, row_group_index: usize) -> Result<Vec<ArrowColumnWriter>> {
+        self.create_column_writers_with_properties(row_group_index, &self.props)
+    }
+
+    /// Create column writers for a new row group using `props` instead of the
+    /// [`WriterProperties`] the file writer was created with.
+    ///
+    /// The returned writers use the same page store factory (and, with the
+    /// `encryption` feature, the same file encryptor) as
+    /// [`Self::create_column_writers`]; only the encoding-level properties
+    /// differ. This makes it possible to encode the same row group more than
+    /// once with different properties, for example to race several candidate
+    /// encodings against each other and append only the smallest resulting
+    /// [`ArrowColumnChunk`]s.
+    ///
+    /// `props` must describe the same schema as the file writer: properties
+    /// that change the physical layout of the file (such as the writer
+    /// version, or the schema itself) will produce chunks that the file writer
+    /// cannot accept. Per-column encoding, compression, dictionary and
+    /// statistics settings are the intended use.
+    pub fn create_column_writers_with_properties(
+        &self,
+        row_group_index: usize,
+        props: &WriterPropertiesPtr,
+    ) -> Result<Vec<ArrowColumnWriter>> {
         let mut writers = Vec::with_capacity(self.arrow_schema.fields.len());
         let mut leaves = self.schema.columns().iter();
         let column_factory = self.column_writer_factory(row_group_index);
         for field in &self.arrow_schema.fields {
             column_factory.get_arrow_column_writer(
                 field.data_type(),
-                &self.props,
+                props,
                 &mut leaves,
                 &mut writers,
             )?;
@@ -5890,6 +5914,105 @@ mod tests {
         // index offset/length for this chunk.
         let cc = file_meta.row_group(0).column(0);
         assert!(cc.column_index_range().is_none());
+    }
+
+    /// Encodes `batch` through [`ArrowRowGroupWriterFactory`], using
+    /// `candidate_props` for the column writers when given, and returns the
+    /// finished file.
+    fn write_via_row_group_factory(
+        batch: &RecordBatch,
+        props: WriterProperties,
+        candidate_props: Option<WriterProperties>,
+    ) -> Bytes {
+        let props = Arc::new(props);
+        let schema = batch.schema();
+        let parquet_schema = ArrowSchemaConverter::new()
+            .with_coerce_types(props.coerce_types())
+            .convert(&schema)
+            .unwrap();
+
+        let mut buf = Vec::with_capacity(1024);
+        let mut writer =
+            SerializedFileWriter::new(&mut buf, parquet_schema.root_schema_ptr(), props.clone())
+                .unwrap();
+
+        let factory = ArrowRowGroupWriterFactory::new(&writer, Arc::clone(&schema));
+        let mut col_writers = match candidate_props {
+            Some(candidate) => factory
+                .create_column_writers_with_properties(0, &Arc::new(candidate))
+                .unwrap(),
+            None => factory.create_column_writers(0).unwrap(),
+        };
+
+        let mut writers = col_writers.iter_mut();
+        for (field, column) in schema.fields().iter().zip(batch.columns()) {
+            for leaf in compute_leaves(field.as_ref(), column).unwrap() {
+                writers.next().unwrap().write(&leaf).unwrap();
+            }
+        }
+
+        let mut rg = writer.next_row_group().unwrap();
+        for chunk in col_writers {
+            chunk.close().unwrap().append_to_row_group(&mut rg).unwrap();
+        }
+        rg.close().unwrap();
+        writer.close().unwrap();
+        Bytes::from(buf)
+    }
+
+    #[test]
+    fn create_column_writers_with_properties_matches_file_props() {
+        let array: ArrayRef = Arc::new(StringArray::from_iter_values(
+            (0..4096).map(|i| format!("value-{:04}", i % 97)),
+        ));
+        let batch = RecordBatch::try_from_iter([("col", array)]).unwrap();
+
+        let props = || {
+            WriterProperties::builder()
+                .set_statistics_enabled(EnabledStatistics::Page)
+                .set_dictionary_page_size_limit(4096)
+                .build()
+        };
+
+        // Handing the factory the file writer's own properties must reproduce
+        // `create_column_writers` byte for byte.
+        let implicit = write_via_row_group_factory(&batch, props(), None);
+        let explicit = write_via_row_group_factory(&batch, props(), Some(props()));
+        assert_eq!(implicit, explicit);
+
+        // Per-row-group properties really do change the encoding, and the
+        // resulting chunk is still appendable to the same file writer.
+        let pinned = write_via_row_group_factory(
+            &batch,
+            props(),
+            Some(
+                WriterProperties::builder()
+                    .set_statistics_enabled(EnabledStatistics::Page)
+                    .set_dictionary_enabled(false)
+                    .set_encoding(Encoding::DELTA_BYTE_ARRAY)
+                    .build(),
+            ),
+        );
+        assert_ne!(implicit, pinned);
+
+        let reader = SerializedFileReader::new(pinned.clone()).unwrap();
+        let column = reader.metadata().row_group(0).column(0);
+        assert!(column.dictionary_page_offset().is_none());
+        let encodings: Vec<_> = column.encodings().collect();
+        assert!(
+            encodings.contains(&Encoding::DELTA_BYTE_ARRAY),
+            "expected the candidate encoding, got {encodings:?}"
+        );
+
+        // Every variant reads back to the original rows.
+        for data in [implicit, explicit, pinned] {
+            let read = ParquetRecordBatchReader::try_new(data, 1024)
+                .unwrap()
+                .collect::<ArrowResult<Vec<_>>>()
+                .unwrap();
+            let read = arrow_select::concat::concat_batches(&batch.schema(), &read).unwrap();
+            assert_eq!(read, batch);
+        }
     }
 
     /// Writes a single-column RecordBatch to an in-memory Parquet buffer.
