@@ -189,6 +189,53 @@ pub trait ColumnValueEncoder {
     /// Computes [`GeospatialStatistics`], if any, and resets internal state such that any internal
     /// accumulator is prepared to accumulate statistics for the next column chunk.
     fn flush_geospatial_statistics(&mut self) -> Option<Box<GeospatialStatistics>>;
+
+    /// Create an encoder for one *candidate* page in the page-grain API.
+    ///
+    /// A candidate encodes rows that another candidate may end up winning, so
+    /// it must own no chunk-level state at all: no dictionary (the chunk's
+    /// dictionary is lent in explicitly when this candidate is the dictionary
+    /// one) and no value-fed accumulators (see [`ValueAccumulators`]). Page-local
+    /// state — min/max, null counts, `variable_length_bytes` — is fine, because
+    /// a page that loses is simply dropped.
+    fn try_new_page_candidate(descr: &ColumnDescPtr, props: &WriterProperties) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Self::try_new(descr, props)
+    }
+
+    /// Replace this encoder's value encoding with `encoding`, dropping any
+    /// dictionary.
+    ///
+    /// The page-grain API uses this to build a *pinned* candidate: one that
+    /// encodes a span with a caller-chosen encoding regardless of what the
+    /// column's [`WriterProperties`] say. Pinning by rebuilding the encoder,
+    /// rather than by cloning and editing the properties, keeps candidate
+    /// construction cheap enough to do per page.
+    fn pin_encoding(&mut self, _encoding: Encoding, _descr: &ColumnDescPtr) -> Result<()> {
+        Err(nyi_err!("this column value encoder cannot pin an encoding"))
+    }
+
+    /// Take this encoder's dictionary, if it has one, for the caller to own.
+    fn take_dictionary(&mut self) -> Option<Box<dyn DynDictionary>> {
+        None
+    }
+
+    /// Install a dictionary previously taken from an encoder of the same type.
+    fn install_dictionary(&mut self, _dictionary: Box<dyn DynDictionary>) -> Result<()> {
+        Err(general_err!(
+            "this column value encoder does not support an externally owned dictionary"
+        ))
+    }
+
+    /// Take this encoder's value-fed chunk accumulators for the caller to own.
+    fn take_value_accumulators(&mut self) -> ValueAccumulators {
+        ValueAccumulators::default()
+    }
+
+    /// Install value-fed chunk accumulators for the duration of one span.
+    fn install_value_accumulators(&mut self, _accumulators: ValueAccumulators) {}
 }
 
 pub struct ColumnValueEncoderImpl<T: DataType> {
@@ -455,6 +502,48 @@ impl<T: DataType> ColumnValueEncoder for ColumnValueEncoderImpl<T> {
     fn flush_geospatial_statistics(&mut self) -> Option<Box<GeospatialStatistics>> {
         self.geo_stats_accumulator.as_mut().map(|a| a.finish())?
     }
+
+    fn try_new_page_candidate(descr: &ColumnDescPtr, props: &WriterProperties) -> Result<Self> {
+        let mut encoder = Self::try_new(descr, props)?;
+        // Strip every piece of chunk-level state; see the trait method's docs.
+        encoder.dict_encoder = None;
+        encoder.bloom_filter = None;
+        encoder.geo_stats_accumulator = None;
+        Ok(encoder)
+    }
+
+    fn pin_encoding(&mut self, encoding: Encoding, descr: &ColumnDescPtr) -> Result<()> {
+        self.encoder = get_encoder(encoding, descr)?;
+        self.dict_encoder = None;
+        Ok(())
+    }
+
+    fn take_dictionary(&mut self) -> Option<Box<dyn DynDictionary>> {
+        Some(Box::new(self.dict_encoder.take()?))
+    }
+
+    fn install_dictionary(&mut self, dictionary: Box<dyn DynDictionary>) -> Result<()> {
+        let dictionary = dictionary
+            .into_any()
+            .downcast::<DictEncoder<T>>()
+            .map_err(|_| general_err!("dictionary encoder type does not match this column"))?;
+        self.dict_encoder = Some(*dictionary);
+        Ok(())
+    }
+
+    fn take_value_accumulators(&mut self) -> ValueAccumulators {
+        ValueAccumulators {
+            bloom_filter: self.bloom_filter.take(),
+            bloom_filter_target_fpp: self.bloom_filter_target_fpp,
+            geo_stats_accumulator: self.geo_stats_accumulator.take(),
+        }
+    }
+
+    fn install_value_accumulators(&mut self, accumulators: ValueAccumulators) {
+        self.bloom_filter = accumulators.bloom_filter;
+        self.bloom_filter_target_fpp = accumulators.bloom_filter_target_fpp;
+        self.geo_stats_accumulator = accumulators.geo_stats_accumulator;
+    }
 }
 
 // Get min and max values for all values in `iter`.
@@ -602,4 +691,90 @@ where
         }
     }
     Some(n)
+}
+
+// ---------------------------------------------------------------------------
+// Page-grain support types.
+//
+// Deliberately placed at the end of the module, below the hot encoder code, for
+// the reason `plain_encoded_byte_size` documents: inserting items above the
+// `ColumnValueEncoder` trait shifts the trait and `ColumnValueEncoderImpl`
+// within the compiled module enough to perturb downstream code placement and
+// measurably regress the `string` / `string_and_binary_view` arrow-writer
+// benchmarks. Nothing below is reached on the default write path.
+// ---------------------------------------------------------------------------
+
+/// A column chunk's dictionary encoder, type-erased so it can be owned by the
+/// caller rather than buried inside a [`ColumnValueEncoder`].
+///
+/// The page-grain API turns "dictionary encoding" from a mode into an object:
+/// one dictionary per column chunk, lent to whichever page encoder is currently
+/// producing an indices page and handed back afterwards. Erasing the type is
+/// what lets the arrow byte-array dictionary and the generic
+/// [`DictEncoder`] live behind the same public handle.
+pub trait DynDictionary: std::any::Any {
+    /// Number of distinct entries interned so far.
+    fn num_entries(&self) -> usize;
+
+    /// Encoded size of the dictionary page's entries, in bytes.
+    fn dict_encoded_size(&self) -> usize;
+
+    /// Discard indices buffered for a page that was abandoned rather than
+    /// sealed.
+    ///
+    /// Entries interned by the abandoned page are deliberately *not* removed:
+    /// every candidate for a span sees the same values, so an entry a losing
+    /// candidate added is a value that genuinely occurs in that span. A
+    /// dictionary that is a superset of what its indices reference is valid;
+    /// see `PAGE_API_DESIGN.md`.
+    fn rollback_pending(&mut self);
+
+    /// Consume the dictionary, producing its page.
+    fn into_dictionary_page(self: Box<Self>) -> Result<DictionaryPage>;
+
+    /// Downcast support for reinstalling into a concrete encoder.
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any>;
+}
+
+impl<T: DataType> DynDictionary for DictEncoder<T> {
+    fn num_entries(&self) -> usize {
+        DictEncoder::num_entries(self)
+    }
+
+    fn dict_encoded_size(&self) -> usize {
+        DictEncoder::dict_encoded_size(self)
+    }
+
+    fn rollback_pending(&mut self) {
+        DictEncoder::clear_pending(self);
+    }
+
+    fn into_dictionary_page(self: Box<Self>) -> Result<DictionaryPage> {
+        Ok(DictionaryPage {
+            buf: self.write_dict()?,
+            num_values: self.num_entries(),
+            is_sorted: self.is_sorted(),
+        })
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
+/// Chunk-level statistics that are fed by *values*, not by pages.
+///
+/// A bloom filter and a geospatial-statistics accumulator both see every value
+/// in the chunk exactly once and cannot be reconstructed by aggregating
+/// per-page facts. In the page-grain API they are owned by the column chunk and
+/// lent to whichever page encoder is *pacing* — the one that advances the
+/// cursor — for exactly the span it consumes. Raced candidates for that same
+/// span are constructed without them
+/// ([`ColumnValueEncoder::try_new_page_candidate`]), so K candidates still
+/// produce exactly one insert per value. See `PAGE_API_DESIGN.md`.
+#[derive(Default)]
+pub struct ValueAccumulators {
+    pub bloom_filter: Option<Sbbf>,
+    pub bloom_filter_target_fpp: f64,
+    pub geo_stats_accumulator: Option<Box<dyn GeoStatsAccumulator>>,
 }

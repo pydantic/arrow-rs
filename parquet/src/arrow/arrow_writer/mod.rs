@@ -56,6 +56,7 @@ use levels::{ArrayLevels, calculate_array_levels};
 
 mod byte_array;
 mod levels;
+pub mod page_grain;
 
 #[doc(inline)]
 pub use crate::column::page_store::{
@@ -1112,22 +1113,7 @@ impl ArrowColumnWriter {
     }
 
     fn write_internal(&mut self, levels: &ArrayLevels) -> Result<()> {
-        match &mut self.writer {
-            ArrowColumnWriterImpl::Column(c) => {
-                let leaf = levels.array();
-                match leaf.as_any_dictionary_opt() {
-                    Some(dictionary) => {
-                        let materialized =
-                            arrow_select::take::take(dictionary.values(), dictionary.keys(), None)?;
-                        write_leaf(c, &materialized, levels)?
-                    }
-                    None => write_leaf(c, leaf, levels)?,
-                };
-            }
-            ArrowColumnWriterImpl::ByteArray(c) => {
-                write_primitive(c, levels.array().as_ref(), levels)?;
-            }
-        }
+        write_levels(&mut self.writer, levels)?;
         Ok(())
     }
 
@@ -1500,11 +1486,38 @@ impl ArrowColumnWriterFactory {
     }
 }
 
+/// Write one [`ArrayLevels`] through an [`ArrowColumnWriterImpl`], returning
+/// `(levels, values)` consumed.
+///
+/// In the default mode the whole input is consumed. When the writer is in
+/// deferred-flush mode (the page-grain API) the write stops at the page
+/// boundary the encoder's own budget picked, and the returned pair is that
+/// span.
+fn write_levels(
+    writer: &mut ArrowColumnWriterImpl,
+    levels: &ArrayLevels,
+) -> Result<(usize, usize)> {
+    match writer {
+        ArrowColumnWriterImpl::Column(c) => {
+            let leaf = levels.array();
+            match leaf.as_any_dictionary_opt() {
+                Some(dictionary) => {
+                    let materialized =
+                        arrow_select::take::take(dictionary.values(), dictionary.keys(), None)?;
+                    write_leaf(c, &materialized, levels)
+                }
+                None => write_leaf(c, leaf, levels),
+            }
+        }
+        ArrowColumnWriterImpl::ByteArray(c) => write_primitive(c, levels.array().as_ref(), levels),
+    }
+}
+
 fn write_leaf(
     writer: &mut ColumnWriter<'_>,
     column: &dyn arrow_array::Array,
     levels: &ArrayLevels,
-) -> Result<usize> {
+) -> Result<(usize, usize)> {
     let indices = levels.non_null_indices();
 
     match writer {
@@ -1593,7 +1606,7 @@ fn write_leaf(
         ColumnWriter::BoolColumnWriter(typed) => {
             let array = column.as_boolean();
             let values = get_bool_array_slice(array, indices.iter().copied());
-            typed.write_batch_internal(
+            typed.write_batch_inner(
                 values.as_slice(),
                 None,
                 levels.def_level_data().as_ref(),
@@ -1751,7 +1764,7 @@ fn write_leaf(
                     ));
                 }
             };
-            typed.write_batch_internal(
+            typed.write_batch_inner(
                 bytes.as_slice(),
                 None,
                 levels.def_level_data().as_ref(),
@@ -1768,8 +1781,8 @@ fn write_primitive<E: ColumnValueEncoder>(
     writer: &mut GenericColumnWriter<E>,
     values: &E::Values,
     levels: &ArrayLevels,
-) -> Result<usize> {
-    writer.write_batch_internal(
+) -> Result<(usize, usize)> {
+    writer.write_batch_inner(
         values,
         Some(levels.non_null_indices()),
         levels.def_level_data().as_ref(),
