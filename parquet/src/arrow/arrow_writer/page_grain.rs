@@ -90,6 +90,17 @@
 //!   no longer offering [`Candidate::Dictionary`]. Dictionary-then-fallback is
 //!   expressible; fallback-then-dictionary is not representable.
 //!
+//! # Pages and record batches
+//!
+//! A [`LeafCursor`] covers exactly one [`ArrowLeafColumn`], and
+//! [`ColumnChunkBuilder::encode_page`] seals whatever the pacing candidate has
+//! buffered when that cursor runs out, so a page never spans two leaves. A
+//! caller feeding 8192 row record batches therefore gets 8192 row pages even
+//! where [`WriterProperties::data_page_row_count_limit`] and the byte budget
+//! would have allowed a larger page, and pays for the extra pages in page
+//! headers, column and offset index entries, and compression window. Feed the
+//! builder the largest leaves the caller can afford when page size matters.
+//!
 //! # Chunk-level accumulators
 //!
 //! Bloom filters and geospatial statistics are fed by *values*, once per value,

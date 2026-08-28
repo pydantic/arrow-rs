@@ -276,10 +276,23 @@ five public files C's final encodings differ from A's on *zero* columns, yet C
 is smaller than A on every one of them, by 0.7 to 1.9 percentage points of the
 baseline. Same encoding vocabulary, different bytes: for a column that has
 settled, C writes through the ordinary column writer while A stays on the page
-grain, and the ordinary writer packs a settled column better. That is the
-clearest argument in these numbers for routing settled leaves off the page
-grain, and it is invisible in the narrow synthetic datasets where the two paths
-mostly agree byte for byte.
+grain. The cause is page cadence rather than encoding: a page-grain page can
+never span two `ArrowLeafColumn`s, because a `LeafCursor` covers one leaf and
+`encode_page` seals whatever the pacer has buffered when that cursor runs out.
+With 8192 row record batches every one of A's pages is one batch, so A writes
+`ceil(rows / 8192)` pages per chunk (55 and 68 on `hits_0`) where the ordinary
+writer cuts at the 20000 row page budget (23 and 28). That is 12 922 pages for A
+against C's 8 212 and the baseline's 4 492, and it accounts for all but 112
+bytes of the 1 070 057 byte gap on `hits_0`: 826 987 bytes (77%) of extra
+compressed payload from smaller compression windows, with the uncompressed
+payload differing by only 39 462; 96 980 bytes (9%) of extra page headers; and
+145 978 bytes (14%) of extra column and offset index, which carry per page
+min/max. Re-reading the same input into whole row group record batches shrinks
+the gap to 53 192 bytes on `hits_0` and reverses it on TPC-H `orders`, where A
+then finishes 6 421 bytes *below* C, which places the cause in the cadence
+rather than in the path. Routing settled leaves off the page grain is one way to
+recover the ordinary cadence; feeding the page grain larger leaves is the other,
+at the memory cost of holding them.
 
 **Width costs Option B, not Option A or C.** ClickBench `hits` is about 105
 mixed-character columns: URLs and titles, user agents, tiny enums, timestamps
