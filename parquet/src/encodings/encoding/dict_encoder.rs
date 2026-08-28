@@ -88,6 +88,11 @@ pub struct DictEncoder<T: DataType> {
 
     /// The buffered indices
     indices: Vec<u64>,
+
+    /// Total bytes the values appended to this column chunk would occupy
+    /// PLAIN-encoded, accumulated over all appended values (not just the
+    /// dictionary's unique values); never reset per page
+    plain_encoded_bytes: u64,
 }
 
 impl<T: DataType> DictEncoder<T> {
@@ -102,6 +107,7 @@ impl<T: DataType> DictEncoder<T> {
         Self {
             interner: Interner::new(storage),
             indices: vec![],
+            plain_encoded_bytes: 0,
         }
     }
 
@@ -145,8 +151,37 @@ impl<T: DataType> DictEncoder<T> {
         Ok(encoder.consume().into())
     }
 
+    /// Returns the total bytes the values appended to this encoder would occupy
+    /// PLAIN-encoded.
+    pub fn plain_encoded_bytes(&self) -> u64 {
+        self.plain_encoded_bytes
+    }
+
     fn put_one(&mut self, value: &T::T) {
+        let (base_size, num_elements) = value.dict_encoding_size();
+        let plain_size = match T::get_physical_type() {
+            Type::BYTE_ARRAY => base_size + num_elements,
+            Type::FIXED_LEN_BYTE_ARRAY => self.interner.storage().type_length,
+            _ => base_size,
+        };
+        self.plain_encoded_bytes += plain_size as u64;
         self.indices.push(self.interner.intern(value));
+    }
+
+    /// Returns the values buffered for the in-progress data page, resolving
+    /// dictionary ids back to their values, and clears the buffer.
+    ///
+    /// Used on dictionary fallback to re-encode the buffered values with the
+    /// fallback encoder.
+    pub fn take_buffered_values(&mut self) -> Vec<T::T> {
+        let uniques = &self.interner.storage().uniques;
+        let values = self
+            .indices
+            .iter()
+            .map(|&i| uniques[i as usize].clone())
+            .collect();
+        self.indices.clear();
+        values
     }
 
     #[inline]

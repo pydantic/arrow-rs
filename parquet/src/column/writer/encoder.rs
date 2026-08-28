@@ -139,6 +139,18 @@ pub trait ColumnValueEncoder {
     /// Returns an estimate of the encoded size of dictionary page size in bytes, or `None` if no dictionary
     fn estimated_dict_page_size(&self) -> Option<usize>;
 
+    /// Returns an estimate of the total bytes the values appended to this column
+    /// chunk so far would occupy PLAIN-encoded, or `None` if unknown
+    ///
+    /// Used together with [`Self::estimated_dict_page_size`] to decide whether
+    /// dictionary encoding is still paying for itself relative to the fallback
+    /// encoding, see [`DictionaryFallback::WhenProfitable`]
+    ///
+    /// [`DictionaryFallback::WhenProfitable`]: crate::file::properties::DictionaryFallback::WhenProfitable
+    fn estimated_plain_encoded_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// Returns an estimate of the encoded data page size in bytes
     ///
     /// This should include:
@@ -151,6 +163,20 @@ pub trait ColumnValueEncoder {
     /// Note: [`Self::flush_data_page`] must be called first, as this will error if there
     /// are any pending page values
     fn flush_dict_page(&mut self) -> Result<Option<DictionaryPage>>;
+
+    /// Falls back from dictionary encoding to the fallback encoding for the
+    /// remainder of this column chunk: any values buffered for the in-progress
+    /// data page (currently held as dictionary ids) are re-encoded through the
+    /// fallback encoder, and subsequent writes will not be dictionary encoded.
+    ///
+    /// If `retain_dictionary` is true the dictionary itself is kept, so that a
+    /// subsequent call to [`Self::flush_dict_page`] can produce the dictionary
+    /// page required by dictionary-encoded data pages that were already
+    /// flushed. Otherwise the dictionary is discarded and
+    /// [`Self::flush_dict_page`] will return `None`.
+    ///
+    /// Does nothing if no dictionary encoder is active.
+    fn fall_back_from_dictionary(&mut self, retain_dictionary: bool) -> Result<()>;
 
     /// Flush the next data page for this column chunk
     fn flush_data_page(&mut self) -> Result<DataPageValues<Self::T>>;
@@ -168,6 +194,11 @@ pub trait ColumnValueEncoder {
 pub struct ColumnValueEncoderImpl<T: DataType> {
     encoder: Box<dyn Encoder<T>>,
     dict_encoder: Option<DictEncoder<T>>,
+    /// A dictionary encoder retained by [`Self::fall_back_from_dictionary`] so
+    /// that [`Self::flush_dict_page`] can still produce the dictionary page
+    /// required by already flushed dictionary-encoded data pages. It no longer
+    /// receives values.
+    retired_dict_encoder: Option<DictEncoder<T>>,
     descr: ColumnDescPtr,
     num_values: usize,
     statistics_enabled: EnabledStatistics,
@@ -255,6 +286,7 @@ impl<T: DataType> ColumnValueEncoder for ColumnValueEncoderImpl<T> {
         Ok(Self {
             encoder,
             dict_encoder,
+            retired_dict_encoder: None,
             descr: descr.clone(),
             num_values: 0,
             statistics_enabled,
@@ -351,6 +383,10 @@ impl<T: DataType> ColumnValueEncoder for ColumnValueEncoderImpl<T> {
         Some(self.dict_encoder.as_ref()?.dict_encoded_size())
     }
 
+    fn estimated_plain_encoded_bytes(&self) -> Option<u64> {
+        Some(self.dict_encoder.as_ref()?.plain_encoded_bytes())
+    }
+
     fn estimated_data_page_size(&self) -> usize {
         match &self.dict_encoder {
             Some(encoder) => encoder.estimated_data_encoded_size(),
@@ -359,24 +395,44 @@ impl<T: DataType> ColumnValueEncoder for ColumnValueEncoderImpl<T> {
     }
 
     fn flush_dict_page(&mut self) -> Result<Option<DictionaryPage>> {
-        match self.dict_encoder.take() {
+        let encoder = match self.dict_encoder.take() {
             Some(encoder) => {
                 if self.num_values != 0 {
                     return Err(general_err!(
                         "Must flush data pages before flushing dictionary"
                     ));
                 }
-
-                let buf = encoder.write_dict()?;
-
-                Ok(Some(DictionaryPage {
-                    buf,
-                    num_values: encoder.num_entries(),
-                    is_sorted: encoder.is_sorted(),
-                }))
+                encoder
             }
-            _ => Ok(None),
+            // A dictionary retained by `fall_back_from_dictionary`: the values
+            // buffered when the fallback happened were re-encoded through the
+            // fallback encoder, so pending page values are fine here.
+            None => match self.retired_dict_encoder.take() {
+                Some(encoder) => encoder,
+                None => return Ok(None),
+            },
+        };
+
+        let buf = encoder.write_dict()?;
+
+        Ok(Some(DictionaryPage {
+            buf,
+            num_values: encoder.num_entries(),
+            is_sorted: encoder.is_sorted(),
+        }))
+    }
+
+    fn fall_back_from_dictionary(&mut self, retain_dictionary: bool) -> Result<()> {
+        if let Some(mut dict_encoder) = self.dict_encoder.take() {
+            // Statistics, bloom filter and variable length bytes were all
+            // updated when these values were first written, so the re-encoded
+            // values deliberately bypass `write_slice`.
+            self.encoder.put(&dict_encoder.take_buffered_values())?;
+            if retain_dictionary {
+                self.retired_dict_encoder = Some(dict_encoder);
+            }
         }
+        Ok(())
     }
 
     fn flush_data_page(&mut self) -> Result<DataPageValues<T::T>> {

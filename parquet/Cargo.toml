@@ -164,6 +164,11 @@ name = "object_store"
 required-features = ["arrow", "async"]
 path = "./examples/object_store.rs"
 
+[[example]]
+name = "advanced_racing_writer"
+required-features = ["arrow", "snap"]
+path = "./examples/advanced_racing_writer.rs"
+
 [[test]]
 name = "arrow_reader"
 required-features = ["arrow"]
