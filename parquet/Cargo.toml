@@ -170,6 +170,11 @@ required-features = ["arrow", "async"]
 path = "./examples/object_store.rs"
 
 [[example]]
+name = "bakeoff"
+required-features = ["arrow", "snap"]
+path = "./examples/bakeoff.rs"
+
+[[example]]
 name = "advanced_racing_writer"
 required-features = ["arrow", "snap"]
 path = "./examples/advanced_racing_writer.rs"
