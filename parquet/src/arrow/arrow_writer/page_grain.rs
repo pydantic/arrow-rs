@@ -1311,6 +1311,145 @@ mod tests {
         );
     }
 
+    /// The crux: chunk-level accumulators are fed by values, and racing K
+    /// candidates must still feed each value exactly once.
+    ///
+    /// This test pins the failure mode a per-candidate design would have. The
+    /// pacer here is the dictionary candidate and it *always loses* — every
+    /// appended page is the pinned PLAIN one. If the bloom filter travelled
+    /// with a candidate and only the winner's were kept, the chunk's filter
+    /// would be empty. It must instead contain every value, and be identical to
+    /// the one `ArrowWriter` builds for the same data.
+    #[test]
+    fn bloom_filter_survives_the_pacer_always_losing() {
+        let values: Vec<String> = (0..40_000).map(|i| format!("value-{i}")).collect();
+        let refs: Vec<&str> = values.iter().map(|s| s.as_str()).collect();
+        let (schema, batch) = string_batch(&refs);
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_bloom_filter_enabled(true)
+                .set_data_page_row_count_limit(2_000)
+                .build(),
+        );
+
+        let mut appended = Vec::new();
+        let bytes = write_page_grain(
+            &schema,
+            std::slice::from_ref(&batch),
+            props.clone(),
+            |chunk| {
+                // The pacer is the dictionary while there is one, and a pinned
+                // DELTA_BYTE_ARRAY afterwards; either way it is index 0 and
+                // never the page that gets appended.
+                if chunk.dictionary().is_some() {
+                    vec![Candidate::Dictionary, Candidate::Pinned(Encoding::PLAIN)]
+                } else {
+                    vec![
+                        Candidate::Pinned(Encoding::DELTA_BYTE_ARRAY),
+                        Candidate::Pinned(Encoding::PLAIN),
+                    ]
+                }
+            },
+            |pages| {
+                // Always take the second page, never the pacer's.
+                assert_eq!(pages.len(), 2);
+                appended.push(pages[1].encoding());
+                1
+            },
+        );
+        assert!(
+            appended.len() > 10,
+            "expected many pages, got {}",
+            appended.len()
+        );
+        assert!(appended.iter().all(|e| *e == Encoding::PLAIN));
+
+        let ours = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+        let filter = ours
+            .get_row_group_column_bloom_filter(0, 0)
+            .unwrap()
+            .expect("chunk should have a bloom filter");
+        for value in &values {
+            assert!(
+                filter.check(&ByteArray::from(value.as_str())),
+                "bloom filter is missing {value}: a value fed by a rejected page was lost"
+            );
+        }
+
+        // And it is the same filter the ordinary writer builds.
+        let theirs = write_arrow(&schema, std::slice::from_ref(&batch), props);
+        let reference = ParquetRecordBatchReaderBuilder::try_new(theirs)
+            .unwrap()
+            .get_row_group_column_bloom_filter(0, 0)
+            .unwrap()
+            .unwrap();
+        for value in values.iter().take(2_000) {
+            let v = ByteArray::from(value.as_str());
+            assert_eq!(filter.check(&v), reference.check(&v));
+        }
+    }
+
+    /// A repeated column: pages must break only at record boundaries, and the
+    /// round trip must be exact.
+    #[test]
+    fn repeated_column_pages_never_split_a_record() {
+        use arrow_array::{Int32Array, ListArray};
+        use arrow_buffer::OffsetBuffer;
+
+        // 20_000 records of 5 values each.
+        let n = 20_000;
+        let values = Int32Array::from((0..(n * 5) as i32).collect::<Vec<_>>());
+        let offsets = OffsetBuffer::from_lengths(std::iter::repeat_n(5usize, n));
+        let field = Arc::new(Field::new("item", DataType::Int32, false));
+        let list = ListArray::new(field.clone(), offsets, Arc::new(values), None);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "l",
+            DataType::List(field),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list) as ArrayRef]).unwrap();
+
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_data_page_row_count_limit(1_500)
+                .build(),
+        );
+
+        let mut page_rows = Vec::new();
+        let bytes = write_page_grain(
+            &schema,
+            std::slice::from_ref(&batch),
+            props.clone(),
+            |_| vec![Candidate::Dictionary],
+            |pages| {
+                // Every page holds whole records: 5 levels per record.
+                assert_eq!(pages[0].num_values() % 5, 0);
+                page_rows.push(pages[0].num_rows());
+                0
+            },
+        );
+        assert!(page_rows.len() > 5);
+        assert_eq!(page_rows.iter().map(|r| *r as usize).sum::<usize>(), n);
+
+        let read = read_back(bytes);
+        assert_eq!(read.iter().map(|b| b.num_rows()).sum::<usize>(), n);
+
+        // And identical to what the ordinary writer produces.
+        let theirs = write_arrow(&schema, std::slice::from_ref(&batch), props);
+        let ours2 = write_page_grain(
+            &schema,
+            std::slice::from_ref(&batch),
+            Arc::new(
+                WriterProperties::builder()
+                    .set_data_page_row_count_limit(1_500)
+                    .build(),
+            ),
+            |_| vec![Candidate::Dictionary],
+            |_| 0,
+        );
+        assert_eq!(ours2, theirs);
+    }
+
     /// Index and chunk metadata are derived by the builder, so they must match
     /// what `ArrowWriter` produces for the same shape.
     #[test]
