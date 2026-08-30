@@ -15,27 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! An adaptive parquet writer built on the page-grain API.
+//! A minimal adaptive parquet writer built on the page-grain API.
 //!
 //! This is the harness side of
-//! [`parquet::arrow::arrow_writer::page_grain`]: a writer that chooses each
-//! column's encoding from measurements rather than from configuration. It
-//! demonstrates four policies that are only expressible once the page grain is
-//! open:
+//! [`parquet::arrow::arrow_writer::page_grain`]: a writer that chooses a
+//! column's encoding from measurements rather than from configuration. It is
+//! deliberately small, and shows the three things that are not obvious the
+//! first time you write one:
 //!
-//! * **Race then settle.** Encode the first spans of a chunk as dictionary,
-//!   delta and plain, compare real compressed bytes, and settle on a winner
-//!   with a near-tie preference for the cheaper thing to decode. Afterwards run
-//!   a single encoder.
-//! * **Dictionary watching.** Read the live dictionary while writing and
-//!   abandon it mid-chunk when its entries-to-values ratio stops paying,
-//!   choosing the landing encoding at that moment from a race.
-//! * **Cross-row-group learning.** Carry the settled choice into later row
-//!   groups, and re-open the race every N row groups so the writer can notice
-//!   the data changing under it.
-//! * **Adapt per page.** For one column, keep revisiting the choice after it
-//!   has settled, from the numbers on the previous sealed page, rather than
-//!   pinning the winner for the rest of the chunk.
+//! * **Race then settle.** Encode a span as dictionary, delta and plain,
+//!   compare real compressed bytes, and commit the winner. Once enough pages
+//!   agree, stop paying for the race and run a single encoder.
+//! * **Charge the dictionary for its page.** A dictionary-indices page looks
+//!   tiny precisely because its bytes went into the dictionary page instead.
+//!   Comparing raw `compressed_len` is systematically biased towards the
+//!   dictionary; see [`page_cost`].
+//! * **Watch the dictionary and leave it.** Read the live dictionary while
+//!   writing and abandon it mid-chunk when it stops deduplicating, letting the
+//!   next race pick the landing encoding.
+//!
+//! The dataset shifts character halfway through the file, so a writer that
+//! decides once at the top gets the second half wrong.
+//!
+//! For the full measured comparison against a stock `ArrowWriter`, across five
+//! datasets and two compression codecs, see `examples/bakeoff.rs` and
+//! `parquet/BAKEOFF.md`.
 //!
 //! Run with:
 //!
@@ -46,9 +50,8 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::page_grain::{
@@ -61,12 +64,15 @@ use parquet::errors::Result;
 use parquet::file::properties::{WriterProperties, WriterPropertiesPtr};
 use parquet::file::writer::SerializedFileWriter;
 
+const ROWS: usize = 2_000_000;
+const BATCH: usize = 65_536;
+const ROWS_PER_ROW_GROUP: usize = 250_000;
+
 // ---------------------------------------------------------------------------
 // Deterministic data generation
 // ---------------------------------------------------------------------------
 
-/// A tiny deterministic PRNG, so every run of this example produces the same
-/// files and the numbers it prints are comparable across runs.
+/// A tiny deterministic PRNG, so every run produces the same file.
 struct Rng(u64);
 
 impl Rng {
@@ -86,100 +92,11 @@ impl Rng {
     fn below(&mut self, n: u64) -> u64 {
         self.next_u64() % n
     }
-
-    fn unit(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
-    }
 }
 
-const ROWS: usize = 2_000_000;
-const BATCH: usize = 65_536;
-
-struct Dataset {
-    name: &'static str,
-    schema: Arc<Schema>,
-    batches: Vec<RecordBatch>,
-}
-
-/// (1) Low-cardinality strings: the dictionary should win everywhere.
-fn low_cardinality_strings() -> Dataset {
-    let schema = Arc::new(Schema::new(vec![Field::new("tag", DataType::Utf8, false)]));
-    let vocabulary: Vec<String> = (0..48).map(|i| format!("service-{i:02}-eu-west")).collect();
-    let mut rng = Rng::new(1);
-    let batches = (0..ROWS)
-        .step_by(BATCH)
-        .map(|start| {
-            let len = BATCH.min(ROWS - start);
-            let values: Vec<&str> = (0..len)
-                .map(|_| vocabulary[rng.below(vocabulary.len() as u64) as usize].as_str())
-                .collect();
-            let array: ArrayRef = Arc::new(StringArray::from(values));
-            RecordBatch::try_new(schema.clone(), vec![array]).unwrap()
-        })
-        .collect();
-    Dataset {
-        name: "low-cardinality strings",
-        schema,
-        batches,
-    }
-}
-
-/// (2) High-cardinality int64 timestamps: monotonic-ish, overflows any
-/// dictionary, and is exactly what delta encoding is for.
-fn timestamps() -> Dataset {
-    let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
-    let mut rng = Rng::new(2);
-    let mut now: i64 = 1_700_000_000_000;
-    let batches = (0..ROWS)
-        .step_by(BATCH)
-        .map(|start| {
-            let len = BATCH.min(ROWS - start);
-            let values: Vec<i64> = (0..len)
-                .map(|_| {
-                    now += rng.below(4_000) as i64;
-                    now
-                })
-                .collect();
-            let array: ArrayRef = Arc::new(Int64Array::from(values));
-            RecordBatch::try_new(schema.clone(), vec![array]).unwrap()
-        })
-        .collect();
-    Dataset {
-        name: "high-cardinality int64 timestamps",
-        schema,
-        batches,
-    }
-}
-
-/// (3) f64 values: nothing compresses these well; the point is that the writer
-/// should notice and stop paying to find out.
-fn floats() -> Dataset {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "value",
-        DataType::Float64,
-        false,
-    )]));
-    let mut rng = Rng::new(3);
-    let batches = (0..ROWS)
-        .step_by(BATCH)
-        .map(|start| {
-            let len = BATCH.min(ROWS - start);
-            let values: Vec<f64> = (0..len).map(|_| rng.unit() * 1_000.0).collect();
-            let array: ArrayRef = Arc::new(Float64Array::from(values));
-            RecordBatch::try_new(schema.clone(), vec![array]).unwrap()
-        })
-        .collect();
-    Dataset {
-        name: "f64 values",
-        schema,
-        batches,
-    }
-}
-
-/// (4) A string column whose character changes halfway: dictionary-friendly
-/// first half, high-cardinality second half. A writer that decides once at the
-/// top of the file gets the second half wrong.
-fn shifting_strings() -> Dataset {
+/// A string column whose character changes halfway: dictionary-friendly first
+/// half, high-cardinality second half.
+fn shifting_strings() -> (Arc<Schema>, Vec<RecordBatch>) {
     let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, false)]));
     let vocabulary: Vec<String> = (0..32).map(|i| format!("region-{i:02}")).collect();
     let mut rng = Rng::new(4);
@@ -203,11 +120,7 @@ fn shifting_strings() -> Dataset {
             RecordBatch::try_new(schema.clone(), vec![array]).unwrap()
         })
         .collect();
-    Dataset {
-        name: "strings that change character mid-file",
-        schema,
-        batches,
-    }
+    (schema, batches)
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +153,7 @@ fn decode_cost(encoding: Encoding) -> u8 {
 
 /// The true cost of a page.
 ///
-/// `EncodedPage::compressed_len` is the data page only. A dictionary-indices
+/// [`EncodedPage::compressed_len`] is the data page only. A dictionary-indices
 /// page is cheap precisely because its bytes went into the dictionary page
 /// instead, and that page is written once at close where no per-page comparison
 /// can see it. Comparing raw `compressed_len` is therefore systematically
@@ -248,10 +161,10 @@ fn decode_cost(encoding: Encoding) -> u8 {
 /// is tiny and the 500 KiB of dictionary entries it just created is invisible.
 ///
 /// `dictionary_growth` is how many bytes the chunk's dictionary gained while
-/// encoding this span, read from `ColumnChunkBuilder::dictionary` either side of
-/// the call. Charging it to the indices candidate is what makes the comparison
-/// honest, and it is the difference between this writer abandoning a dictionary
-/// on high-cardinality data and riding it off a cliff.
+/// encoding this span, read from [`ColumnChunkBuilder::dictionary`] either side
+/// of the call. Charging it to the indices candidate is what makes the
+/// comparison honest, and it is the difference between this writer abandoning a
+/// dictionary on high-cardinality data and riding it off a cliff.
 fn page_cost(page: &EncodedPage, dictionary_growth: usize) -> usize {
     if page.is_dictionary_indices() {
         page.compressed_len() + dictionary_growth
@@ -278,17 +191,10 @@ fn pick_winner(pages: &[EncodedPage], dictionary_growth: usize, tolerance: f64) 
 /// Per-column state that outlives a single row group. This is where
 /// "cross-row-group learning" lives.
 struct ColumnPolicy {
-    name: String,
     /// Choice carried forward from the previous row group.
     learned: Settled,
-    /// Re-open the race every this many row groups.
-    reopen_every: usize,
     /// Race candidates for this column's physical type.
     challengers: Vec<Encoding>,
-    /// After this column has settled, re-decide each page from the previous
-    /// sealed page's numbers instead of pinning the settled choice outright.
-    /// This refines a settled column; it does not replace the race.
-    adapt_per_page: bool,
     /// How many row groups have been written.
     row_groups: usize,
     /// Tally of landed encodings, for the report.
@@ -298,14 +204,18 @@ struct ColumnPolicy {
     total_pages: usize,
 }
 
+/// Re-open the race every this many row groups, so the writer can notice the
+/// data changing under it.
+const REOPEN_EVERY: usize = 4;
+
+/// Pages that must agree before the race is closed.
+const RACES_BEFORE_SETTLING: usize = 2;
+
 impl ColumnPolicy {
-    fn new(name: &str, challengers: Vec<Encoding>, adapt_per_page: bool) -> Self {
+    fn new(challengers: Vec<Encoding>) -> Self {
         Self {
-            name: name.to_string(),
             learned: Settled::Racing,
-            reopen_every: 4,
             challengers,
-            adapt_per_page,
             row_groups: 0,
             landed: HashMap::new(),
             raced_pages: 0,
@@ -314,79 +224,26 @@ impl ColumnPolicy {
     }
 
     /// Decide what to offer for the next page.
-    fn plan(
-        &self,
-        chunk: &ColumnChunkBuilder,
-        state: Settled,
-        last: Option<&PageReport>,
-    ) -> Vec<Candidate> {
+    fn plan(&self, chunk: &ColumnChunkBuilder, state: Settled) -> Vec<Candidate> {
         let has_dictionary = chunk.dictionary().is_some();
+        let challengers = || self.challengers.iter().copied().map(Candidate::Pinned);
 
         match state {
             Settled::Racing => {
-                let mut candidates = Vec::new();
                 // The dictionary paces when it is available: it is the encoding
                 // most likely to win on this kind of data, and pacing with it
                 // keeps its budget accounting honest.
-                if has_dictionary {
-                    candidates.push(Candidate::Dictionary);
-                }
-                for encoding in &self.challengers {
-                    candidates.push(Candidate::Pinned(*encoding));
-                }
-                candidates
+                has_dictionary
+                    .then_some(Candidate::Dictionary)
+                    .into_iter()
+                    .chain(challengers())
+                    .collect()
             }
-            Settled::Dictionary if has_dictionary => {
-                if self.adapt_per_page {
-                    vec![self.adapt(state, last, has_dictionary)]
-                } else {
-                    vec![Candidate::Dictionary]
-                }
-            }
+            Settled::Dictionary if has_dictionary => vec![Candidate::Dictionary],
             // The dictionary was abandoned since we settled on it: race the
             // fallbacks now, and land on whichever wins at this moment.
-            Settled::Dictionary => self
-                .challengers
-                .iter()
-                .map(|e| Candidate::Pinned(*e))
-                .collect(),
-            Settled::Pinned(encoding) => {
-                if self.adapt_per_page {
-                    vec![self.adapt(state, last, has_dictionary)]
-                } else {
-                    vec![Candidate::Pinned(encoding)]
-                }
-            }
-        }
-    }
-
-    /// One candidate, chosen from the previous sealed page's measured numbers.
-    ///
-    /// Used only after a column has settled. A page that barely compressed is
-    /// evidence the current encoding has stopped helping, and the dictionary
-    /// can only be left, never rejoined.
-    fn adapt(&self, state: Settled, last: Option<&PageReport>, has_dictionary: bool) -> Candidate {
-        match last {
-            // Cold start: the first page of a chunk has no previous page to
-            // learn from, so it continues from what this column settled on. It
-            // must not default to the dictionary, or every settled chunk would
-            // open with a dictionary page it then abandons.
-            None => match state {
-                Settled::Dictionary if has_dictionary => Candidate::Dictionary,
-                Settled::Pinned(encoding) => Candidate::Pinned(encoding),
-                _ if has_dictionary => Candidate::Dictionary,
-                _ => Candidate::Pinned(self.challengers[0]),
-            },
-            Some(prev) => {
-                let ratio = prev.compressed as f64 / prev.uncompressed.max(1) as f64;
-                if prev.encoding == Encoding::RLE_DICTIONARY && ratio > 0.9 && has_dictionary {
-                    Candidate::Pinned(self.challengers[0])
-                } else if prev.is_dictionary && has_dictionary {
-                    Candidate::Dictionary
-                } else {
-                    Candidate::Pinned(prev.encoding)
-                }
-            }
+            Settled::Dictionary => challengers().collect(),
+            Settled::Pinned(encoding) => vec![Candidate::Pinned(encoding)],
         }
     }
 
@@ -403,13 +260,9 @@ impl ColumnPolicy {
     }
 }
 
-/// What one sealed page measured, kept to feed the next decision.
-struct PageReport {
-    encoding: Encoding,
-    compressed: usize,
-    uncompressed: usize,
-    is_dictionary: bool,
-}
+// ---------------------------------------------------------------------------
+// The write loop
+// ---------------------------------------------------------------------------
 
 /// Write one column chunk under `policy`, returning the chunk.
 fn write_chunk(
@@ -422,15 +275,13 @@ fn write_chunk(
 
     // Cross-row-group learning: start from what the previous row group settled
     // on, unless it is time to re-open the race.
-    let reopen = policy.row_groups.is_multiple_of(policy.reopen_every);
+    let reopen = policy.row_groups.is_multiple_of(REOPEN_EVERY);
     let mut state = if reopen {
         Settled::Racing
     } else {
         policy.learned
     };
-    let mut last: Option<PageReport> = None;
-    // Pages to race before settling, when racing.
-    let mut races_left = 2usize;
+    let mut races_left = RACES_BEFORE_SETTLING;
 
     for leaf in leaves {
         let mut cursor: LeafCursor = chunk.cursor(leaf);
@@ -444,7 +295,7 @@ fn write_chunk(
                 races_left = 1;
             }
 
-            let candidates = policy.plan(&chunk, state, last.as_ref());
+            let candidates = policy.plan(&chunk, state);
 
             // Read the dictionary either side of the encode so the indices
             // candidate can be charged for the dictionary bytes it created.
@@ -463,13 +314,6 @@ fn write_chunk(
 
             let winner = pick_winner(&pages, dictionary_growth, 0.02);
             let page = pages.into_iter().nth(winner).unwrap();
-
-            last = Some(PageReport {
-                encoding: page.encoding(),
-                compressed: page.compressed_len(),
-                uncompressed: page.uncompressed_len(),
-                is_dictionary: page.is_dictionary_indices(),
-            });
             *policy.landed.entry(page.encoding()).or_default() += 1;
 
             // Settle: after enough raced pages agree, stop paying for the race.
@@ -495,129 +339,101 @@ fn write_chunk(
 
 /// Write a whole file through the page-grain API.
 fn write_adaptive(
-    dataset: &Dataset,
+    schema: &Arc<Schema>,
+    batches: &[RecordBatch],
     props: Arc<WriterProperties>,
     path: &str,
-    rows_per_row_group: usize,
-) -> Result<(u64, Duration, Vec<ColumnPolicy>)> {
+) -> Result<(u64, ColumnPolicy)> {
     let parquet_schema = ArrowSchemaConverter::new()
         .with_coerce_types(props.coerce_types())
-        .convert(&dataset.schema)?;
+        .convert(schema)?;
 
     let mut props = (*props).clone();
-    add_encoded_arrow_schema_to_metadata(&dataset.schema, &mut props);
+    add_encoded_arrow_schema_to_metadata(schema, &mut props);
     let props = Arc::new(props);
 
-    let mut policies: Vec<ColumnPolicy> = dataset
-        .schema
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(i, f)| {
-            let challengers = match f.data_type() {
-                DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary => {
-                    vec![Encoding::PLAIN, Encoding::DELTA_BYTE_ARRAY]
-                }
-                DataType::Int64 | DataType::Int32 => {
-                    vec![Encoding::PLAIN, Encoding::DELTA_BINARY_PACKED]
-                }
-                _ => vec![Encoding::PLAIN],
-            };
-            // One column per file here; the float column is the one that adapts
-            // per page instead of racing.
-            let adapt = matches!(f.data_type(), DataType::Float64);
-            ColumnPolicy::new(f.name(), challengers, adapt && i == 0)
-        })
-        .collect();
+    let mut policy = ColumnPolicy::new(vec![Encoding::PLAIN, Encoding::DELTA_BYTE_ARRAY]);
 
-    let start = Instant::now();
     let file = File::create(path)?;
     let mut writer =
         SerializedFileWriter::new(file, parquet_schema.root_schema_ptr(), props.clone())?;
 
+    let field = schema.field(0);
+    let descr = parquet_schema.columns()[0].clone();
     let mut pending: Vec<RecordBatch> = Vec::new();
     let mut pending_rows = 0usize;
 
     let flush = |writer: &mut SerializedFileWriter<File>,
-                 policies: &mut Vec<ColumnPolicy>,
+                 policy: &mut ColumnPolicy,
                  batches: &mut Vec<RecordBatch>|
      -> Result<()> {
         if batches.is_empty() {
             return Ok(());
         }
         let mut row_group = writer.next_row_group()?;
-        for (col, policy) in policies.iter_mut().enumerate() {
-            let field = dataset.schema.field(col);
-            let descr = parquet_schema.columns()[col].clone();
-            let mut leaves = Vec::new();
-            for batch in batches.iter() {
-                leaves.extend(compute_leaves(field, batch.column(col))?);
-            }
-            let chunk = write_chunk(policy, descr, props.clone(), &leaves)?;
-            chunk.append_to_row_group(&mut row_group)?;
+        let mut leaves = Vec::new();
+        for batch in batches.iter() {
+            leaves.extend(compute_leaves(field, batch.column(0))?);
         }
+        write_chunk(policy, descr.clone(), props.clone(), &leaves)?
+            .append_to_row_group(&mut row_group)?;
         row_group.close()?;
         batches.clear();
         Ok(())
     };
 
-    for batch in &dataset.batches {
+    for batch in batches {
         pending_rows += batch.num_rows();
         pending.push(batch.clone());
-        if pending_rows >= rows_per_row_group {
-            flush(&mut writer, &mut policies, &mut pending)?;
+        if pending_rows >= ROWS_PER_ROW_GROUP {
+            flush(&mut writer, &mut policy, &mut pending)?;
             pending_rows = 0;
         }
     }
-    flush(&mut writer, &mut policies, &mut pending)?;
+    flush(&mut writer, &mut policy, &mut pending)?;
     writer.close()?;
-    let elapsed = start.elapsed();
-    let bytes = std::fs::metadata(path)?.len();
-    Ok((bytes, elapsed, policies))
+    Ok((std::fs::metadata(path)?.len(), policy))
 }
 
 /// The baseline: plain `ArrowWriter` at the same properties.
 fn write_baseline(
-    dataset: &Dataset,
+    schema: &Arc<Schema>,
+    batches: &[RecordBatch],
     props: Arc<WriterProperties>,
     path: &str,
-) -> Result<(u64, Duration)> {
-    let start = Instant::now();
+) -> Result<u64> {
     let file = File::create(path)?;
-    let mut writer = ArrowWriter::try_new(file, dataset.schema.clone(), Some((*props).clone()))?;
-    for batch in &dataset.batches {
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some((*props).clone()))?;
+    for batch in batches {
         writer.write(batch)?;
     }
     writer.close()?;
-    let elapsed = start.elapsed();
-    Ok((std::fs::metadata(path)?.len(), elapsed))
+    Ok(std::fs::metadata(path)?.len())
 }
 
-/// Read both files back and require exact row equality against the source.
-fn verify(path: &str, dataset: &Dataset) -> Result<usize> {
-    let file = File::open(path)?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+/// Read the file back and require exact row equality against the source.
+fn verify(path: &str, batches: &[RecordBatch]) -> Result<usize> {
+    let concat = |arrays: &[ArrayRef]| -> Result<ArrayRef> {
+        arrow_select::concat::concat(&arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>())
+            .map_err(|e| parquet::errors::ParquetError::General(e.to_string()))
+    };
+
+    let expected = concat(
+        &batches
+            .iter()
+            .map(|b| b.column(0).clone())
+            .collect::<Vec<_>>(),
+    )?;
+
+    let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?
         .with_batch_size(8192)
         .build()?;
-
-    let expected: Vec<ArrayRef> = dataset
-        .batches
-        .iter()
-        .map(|b| b.column(0).clone())
-        .collect();
-    let expected =
-        arrow_select::concat::concat(&expected.iter().map(|a| a.as_ref()).collect::<Vec<_>>())
-            .map_err(|e| parquet::errors::ParquetError::General(e.to_string()))?;
-
     let mut actual: Vec<ArrayRef> = Vec::new();
     for batch in reader {
         actual.push(batch?.column(0).clone());
     }
-    let actual =
-        arrow_select::concat::concat(&actual.iter().map(|a| a.as_ref()).collect::<Vec<_>>())
-            .map_err(|e| parquet::errors::ParquetError::General(e.to_string()))?;
+    let actual = concat(&actual)?;
 
-    assert_eq!(expected.len(), actual.len(), "row count mismatch in {path}");
     assert_eq!(&expected, &actual, "row values differ in {path}");
     Ok(actual.len())
 }
@@ -636,76 +452,56 @@ fn human(bytes: u64) -> String {
 fn main() -> Result<()> {
     let dir = std::env::temp_dir().join("advanced_page_writer");
     std::fs::create_dir_all(&dir)?;
+    let adaptive_path = dir.join("adaptive.parquet");
+    let baseline_path = dir.join("baseline.parquet");
+    let adaptive_path = adaptive_path.to_str().unwrap();
+    let baseline_path = baseline_path.to_str().unwrap();
 
-    let rows_per_row_group = 250_000;
     // The same properties for both writers, including the row group size: a
     // dictionary page is written per column chunk, so comparing bytes across
     // different row group counts compares the wrong thing.
     let props = Arc::new(
         WriterProperties::builder()
             .set_data_page_row_count_limit(20_000)
-            .set_max_row_group_row_count(Some(rows_per_row_group))
+            .set_max_row_group_row_count(Some(ROWS_PER_ROW_GROUP))
             .build(),
     );
 
-    let datasets = [
-        low_cardinality_strings(),
-        timestamps(),
-        floats(),
-        shifting_strings(),
-    ];
+    let (schema, batches) = shifting_strings();
 
     println!(
         "adaptive parquet writing over the page-grain API\n\
-         {ROWS} rows per dataset, {rows_per_row_group} rows per row group\n"
+         strings that change character mid-file, {ROWS} rows, \
+         {ROWS_PER_ROW_GROUP} rows per row group\n"
     );
 
-    for dataset in &datasets {
-        let adaptive_path = dir.join("adaptive.parquet");
-        let baseline_path = dir.join("baseline.parquet");
-        let adaptive_path = adaptive_path.to_str().unwrap();
-        let baseline_path = baseline_path.to_str().unwrap();
+    let (adaptive_bytes, policy) = write_adaptive(&schema, &batches, props.clone(), adaptive_path)?;
+    let baseline_bytes = write_baseline(&schema, &batches, props, baseline_path)?;
 
-        let (adaptive_bytes, adaptive_time, policies) =
-            write_adaptive(dataset, props.clone(), adaptive_path, rows_per_row_group)?;
-        let (baseline_bytes, baseline_time) =
-            write_baseline(dataset, props.clone(), baseline_path)?;
+    let rows = verify(adaptive_path, &batches)?;
+    assert_eq!(rows, verify(baseline_path, &batches)?);
 
-        let adaptive_rows = verify(adaptive_path, dataset)?;
-        let baseline_rows = verify(baseline_path, dataset)?;
-        assert_eq!(adaptive_rows, baseline_rows);
+    let delta = adaptive_bytes as f64 / baseline_bytes as f64 - 1.0;
+    println!("  adaptive : {:>10}", human(adaptive_bytes));
+    println!(
+        "  baseline : {:>10}   (adaptive is {:+.1}% bytes)",
+        human(baseline_bytes),
+        delta * 100.0,
+    );
 
-        let delta = adaptive_bytes as f64 / baseline_bytes as f64 - 1.0;
-        println!("== {} ==", dataset.name);
-        println!(
-            "  adaptive : {:>10}  {:>7.2}s",
-            human(adaptive_bytes),
-            adaptive_time.as_secs_f64()
-        );
-        println!(
-            "  baseline : {:>10}  {:>7.2}s   (adaptive is {:+.1}% bytes, {:.2}x time)",
-            human(baseline_bytes),
-            baseline_time.as_secs_f64(),
-            delta * 100.0,
-            adaptive_time.as_secs_f64() / baseline_time.as_secs_f64().max(1e-9),
-        );
-        for policy in &policies {
-            let mut landed: Vec<_> = policy.landed.iter().collect();
-            landed.sort_by_key(|(_, count)| std::cmp::Reverse(**count));
-            let landed: Vec<String> = landed
-                .iter()
-                .map(|(encoding, count)| format!("{encoding} x{count}"))
-                .collect();
-            println!(
-                "  column {:<8} pages {:<5} raced {:<5} landed on {}",
-                policy.name,
-                policy.total_pages,
-                policy.raced_pages,
-                landed.join(", ")
-            );
-        }
-        println!("  verified {adaptive_rows} rows read back exactly\n");
-    }
+    let mut landed: Vec<_> = policy.landed.iter().collect();
+    landed.sort_by_key(|(_, count)| std::cmp::Reverse(**count));
+    let landed: Vec<String> = landed
+        .iter()
+        .map(|(encoding, count)| format!("{encoding} x{count}"))
+        .collect();
+    println!(
+        "  pages {} raced {} landed on {}",
+        policy.total_pages,
+        policy.raced_pages,
+        landed.join(", ")
+    );
+    println!("  verified {rows} rows read back exactly");
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
