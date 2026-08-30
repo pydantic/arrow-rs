@@ -19,19 +19,22 @@
 //! inputs, identical row group boundaries and identical writer properties.
 //!
 //! 1. **Baseline** — a stock [`ArrowWriter`] at the shared properties.
-//! 2. **Option A** — an adaptive harness over the page-grain API
-//!    (`parquet::arrow::arrow_writer::page_grain`): race candidate encodings a
-//!    page at a time, charge the dictionary candidate for the dictionary bytes
-//!    it creates, settle on a winner, watch the dictionary, and carry the
-//!    settled choice across row groups. Adapted from `advanced_page_writer`.
+//! 2. **Option A** — `examples/adaptive_writer/harness.rs` with
+//!    `always_page_grain` set: every decidable leaf stays on the page-grain API
+//!    (`parquet::arrow::arrow_writer::page_grain`) for the whole file, encoding
+//!    each page several ways, charging each page the dictionary bytes it
+//!    creates, settling on a winner, watching the dictionary, and carrying the
+//!    settled choice across row groups.
 //! 3. **Option B** — a K-full-column-writer racer over
 //!    `ArrowRowGroupWriterFactory::create_column_writers_with_properties` and
 //!    `DictionaryFallback::WhenProfitable`: encode every leaf K times per row
 //!    group with K whole sets of column writers, keep the smallest chunk, drop
 //!    the rest. Adapted from `advanced_racing_writer`.
-//! 4. **Option C** — a hybrid: each leaf takes the page-grain path while it is
-//!    still deciding, and an ordinary column writer once it has settled, so
-//!    only the leaves actually making a decision leave the normal write path.
+//! 4. **Option C** — the same harness as it ships: each leaf takes the
+//!    page-grain path while it is still deciding, and an ordinary column writer
+//!    once it has settled, so only the leaves actually making a decision leave
+//!    the normal write path. A and C are the same code, differing in the
+//!    routing rule alone.
 //!
 //! The point of this example is that the four writers see *exactly* the same
 //! bytes in, the same rows per row group, the same compression and the same
@@ -1497,8 +1500,13 @@ fn write_report(table: &str) -> Result<()> {
     // Anchored to the crate directory so the report lands in the right place
     // whatever the working directory of the run.
     let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let harness_a = count_lines(&crate_dir.join("examples/advanced_page_writer.rs"));
+    let harness = count_lines(&crate_dir.join("examples/adaptive_writer/harness.rs"));
+    let demo = count_lines(&crate_dir.join("examples/adaptive_writer/main.rs"));
     let bakeoff = count_lines(&crate_dir.join("examples/bakeoff.rs"));
+    // Counted from the harness's own section markers, so the split cannot
+    // drift away from the file it describes.
+    let (policy_lines, plumbing_lines) =
+        harness_split(&crate_dir.join("examples/adaptive_writer/harness.rs"));
 
     let body = format!(
         r#"# Parquet encoding policy bakeoff
@@ -1528,12 +1536,15 @@ difference between them is how each decides a column's encoding.
 The four writers:
 
 1. **Baseline** — a stock `ArrowWriter` at the shared properties.
-2. **Option A (page-grain)** — races candidate encodings a page at a time
-   through `ColumnChunkBuilder::encode_page`, charges the dictionary candidate
-   the dictionary bytes that span created, settles on a winner after two
-   agreeing pages, watches the live dictionary and abandons it when entries
-   exceed a quarter of the values written, and carries the settled choice into
-   later row groups, re-opening the race every {A_REOPEN_EVERY}.
+2. **Option A (page-grain)** — `examples/adaptive_writer/harness.rs` with
+   `always_page_grain` set, so every decidable leaf stays on the page-grain
+   path for the whole file. It encodes each page several ways through
+   `ColumnChunkBuilder::encode_page_alternatives`, charges each page the
+   dictionary bytes it created (`EncodedPage::dictionary_growth`), settles
+   after two agreeing pages, watches the live dictionary and abandons it when
+   entries exceed a quarter of the values sent through it, and carries the
+   settled choice into later row groups, looking again every
+   {A_REOPEN_EVERY}.
 3. **Option B (K writers)** — builds K complete sets of column writers per row
    group through `create_column_writers_with_properties`, one per candidate,
    feeds every leaf to all of them, keeps the smallest finished chunk and drops
@@ -1541,8 +1552,10 @@ The four writers:
    `DictionaryFallback::WhenProfitable {{ worth_ratio: {DICT_WORTH_RATIO} }}`.
    A leaf settles when a row group's best and worst differ by at least
    {settle_pct}%, and re-races every {B_REOPEN_EVERY} row groups.
-4. **Option C (hybrid)** — routes each leaf, each row group, to whichever of
-   the two paths it needs. See below.
+4. **Option C (hybrid)** — the same harness as it ships, with the routing rule
+   on: each leaf, each row group, takes whichever of the two paths it needs.
+   See below. A and C are the same code driven over the same batches, so the
+   difference between them is the routing rule and nothing else.
 
 ### Option C's composition rule
 
@@ -1554,9 +1567,10 @@ Per leaf, per row group:
   re-opens this row group, or it adapts per page and so is never done deciding.
 * Every other leaf — every **settled** leaf and every leaf with **nothing to
   race** — goes to an ordinary `ArrowColumnWriter` from
-  `create_column_writers_with_properties`, configured with the candidate that
-  leaf settled on. That is Option B's path, and it gets the library's normal
-  write path with no page-grain involvement at all.
+  `create_selected_column_writers`, configured with the candidate that leaf
+  settled on. That is Option B's path, and it gets the library's normal write
+  path with no page-grain involvement at all. No writer is created for the
+  leaves on the page-grain path.
 * Wherever a dictionary runs on that standard path it runs under
   `DictionaryFallback::WhenProfitable`, so a settled dictionary leaf can still
   leave its dictionary without the page grain watching it.
@@ -1568,27 +1582,26 @@ leaves actually deciding pay anything beyond the ordinary write path.
 
 ### Seams the hybrid exposed
 
-Three, none of which are papered over in the harness:
+Three. Two are now fixed in the library, and the third is deliberate.
 
-1. **`create_column_writers_with_properties` is all-or-nothing.** It returns one
-   writer per leaf in the schema, with no way to ask for a subset. Option C
-   allocates writers for its page-grain leaves and drops them unwritten. The
-   waste is an allocation rather than encoding work, so it does not show up in
-   the times, but a hybrid cannot express "give me writers for these three
-   leaves" today.
-2. **The two paths abandon a dictionary by different mechanisms.** `page_grain`
-   has no automatic fallback; the harness decides, which is what
-   `DictionaryFallback` does on the column-writer path. So a leaf changes its
-   dictionary-abandonment mechanism when it changes path, and the page-grain
-   path cannot use `WhenProfitable` at all. This is the direct cause of the
-   byte gap between C and A on the two uncompressed mixed datasets below.
-3. **The page-grain path cannot share the file writer's page store.**
-   `ColumnChunkBuilder::new_with_page_store` accepts a `PageStoreFactory`, and
-   `ArrowRowGroupWriterFactory` has a `with_page_store_factory` setter, but no
-   getter that would hand its factory over. A hybrid therefore buffers its
-   page-grain leaves in memory while its standard leaves use the file writer's
-   spilling store, so the memory bound the standard path offers does not extend
-   across the whole row group.
+1. **Subset writer creation (fixed).** `create_column_writers_with_properties`
+   was all-or-nothing, so the hybrid allocated a writer per leaf and dropped
+   the ones it wrote itself: with a spilling page store that is a temp file per
+   unused leaf per row group. `create_selected_column_writers` takes a
+   predicate over leaf index and returns `Vec<Option<ArrowColumnWriter>>`,
+   creating nothing for the leaves the caller declined.
+2. **Sharing the file writer's page store (fixed).**
+   `ArrowRowGroupWriterFactory::with_page_store_factory` had no getter, so the
+   page-grain leaves buffered in memory while the standard leaves spilled, and
+   the memory bound did not cover the whole row group. `page_store_factory()`
+   returns it, and the harness hands it to
+   `ColumnChunkBuilder::new_with_page_store`.
+3. **The two paths abandon a dictionary by different mechanisms (kept).** The
+   standard path uses `DictionaryFallback`; the page grain has no automatic
+   fallback, because deciding that per page with the numbers in hand is the
+   whole point of it. So a leaf changes mechanism when it changes path, and
+   keeping the two consistent is the harness's job. This is the direct cause of
+   the byte gap between C and A on the two uncompressed mixed datasets below.
 
 ## Results
 
@@ -1655,47 +1668,44 @@ or evaluates the narrowed variant.
 
 Library cost, from each option's design document.
 
-| | Option A (page-grain) | Option B (merged bespoke APIs) |
+| | Option A/C (page-grain) | Option B (merged bespoke APIs) |
 | --- | ---: | ---: |
-| Library production lines added | 1 507 | 374 |
-| Library test lines added | 470 | 623 |
-| Library lines removed or rewritten | 78 | 109 |
+| Library production lines added | 1 687 | 374 |
+| Library test lines added | 529 | 623 |
+| Library lines removed or rewritten | 92 | 109 |
 | Files touched in the library | 5 | 6 |
 
-Option A's figure is its 1 977 added library lines less its 470 lines of module
-tests; 978 of those are one new self-contained module (`page_grain`), and the
-largest change to an existing file is a mechanical split of `write_data_page`
-into `assemble_data_page` and `commit_data_page`. Option B adds no new module:
-its 374 lines are spread over the properties type, the column writer's
-dictionary fallback, and the encoders.
+The page-grain figure is measured from the merge of the Option B ports, so the
+two columns do not overlap. 1 011 of its production lines are one new
+self-contained module (`page_grain`), and the largest change to an existing
+file is a mechanical split of `write_data_page` into `assemble_data_page` and
+`commit_data_page`. Option B adds no new module: its 374 lines are spread over
+the properties type, the column writer's dictionary fallback, and the encoders.
 
-These are the figures after the simplification pass described in
-`PAGE_API_DESIGN.md`. Option A entered that pass at 1 601 production lines and
-30 public items in `page_grain`, and leaves it at 1 507 and 23; Option B was
-untouched, since it is a faithful port of apache/arrow-rs#10775 and #10777.
-Every byte count in this report is identical before and after.
+Public items: 22 in `page_grain` plus 2 on `ArrowRowGroupWriterFactory` for
+A/C; Option B's surface is one method on the factory and one properties enum.
+`PAGE_API_DESIGN.md` lists both and the reasoning behind each cut.
 
 Harness cost, counted from the files in this repository:
 
 | Harness | Lines |
 | --- | ---: |
-| `examples/advanced_page_writer.rs` (minimal page-grain harness) | {harness_a} |
-| `examples/bakeoff.rs` (all four writers, datasets and reporting) | {bakeoff} |
+| `examples/adaptive_writer/harness.rs` (policy {policy}, plumbing {plumbing}) | {harness} |
+| `examples/adaptive_writer/main.rs` (dataset, comparison, verification) | {demo} |
+| `examples/bakeoff.rs` (four writers, five datasets and reporting) | {bakeoff} |
 
-The two standalone policy harnesses that used to sit beside `bakeoff.rs`
-(`advanced_page_writer.rs` at 712 lines and `advanced_racing_writer.rs` at 837)
-each carried their own copy of the datasets and of a policy engine that also
-lives in `bakeoff.rs`, and the duplication had already drifted once.
-`advanced_racing_writer.rs` is gone: Option B's consumer surface is the single
-method `create_column_writers_with_properties`, exercised here and covered by a
-unit test. `advanced_page_writer.rs` was cut back to the one job no other file
-does, showing how to write a page-grain harness; its policy core is about 190
-of its {harness_a} lines, the rest being one dataset, verification and
-printing.
+`harness.rs` is the harness measured as options A and C above: the bakeoff
+includes that same file rather than a copy, so these numbers describe the code
+that ships. Its policy half is the part a different writer would rewrite: which
+encodings to try, what a page costs, when to settle, when to look again, when
+to leave a dictionary, and which path a leaf takes. Its plumbing half opens row
+groups, routes leaves and appends the chunks both paths produce.
 
 {interpretation}
 "#,
         row_groups = ROWS / ROW_GROUP_ROWS,
+        policy = policy_lines,
+        plumbing = plumbing_lines,
         settle_pct = (SETTLE_GAP * 100.0) as u32,
         interpretation = INTERPRETATION,
     );
@@ -1708,6 +1718,22 @@ printing.
     };
     std::fs::write(crate_dir.join("BAKEOFF.md"), body)?;
     Ok(())
+}
+
+/// Lines in the harness's policy half and plumbing half, delimited by the
+/// `// Policy` and `// Plumbing` banners in that file.
+fn harness_split(path: &Path) -> (usize, usize) {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().collect();
+    let find = |needle: &str| lines.iter().position(|l| l.trim_start() == needle);
+    match (find("// Policy"), find("// Plumbing")) {
+        // Each banner opens two lines above its `// ===` rule.
+        (Some(policy), Some(plumbing)) => (
+            plumbing.saturating_sub(policy),
+            lines.len().saturating_sub(plumbing),
+        ),
+        _ => (0, 0),
+    }
 }
 
 fn count_lines(path: &Path) -> usize {
@@ -1806,12 +1832,12 @@ In the two uncompressed cells C should have matched A and did not. Between
 scheduled re-races a settled leaf sits on the standard path, where its only way
 to react to changing data is `DictionaryFallback::WhenProfitable`, a chunk-level
 dictionary decision. A, which stays on the page grain for every chunk, re-decides
-every page and can also switch to a delta encoding mid-chunk. That is seam 2
-above, priced: routing a settled leaf back to the standard path costs roughly
+every page and can also switch to a delta encoding mid-chunk. That is the third
+seam above, priced: routing a settled leaf back to the standard path costs roughly
 2.5 to 3 percentage points on data that changes character between races. The
-gap would close if `WhenProfitable` and the page-grain dictionary watching were
-the same mechanism, or if C re-raced more often, at CPU it currently does not
-spend.
+gap would close if C looked again more often, at CPU it currently does not
+spend, or if the harness applied a chunk-level dictionary rule on the standard
+path that matched its per-page one more closely.
 
 ### Cost
 
@@ -1839,7 +1865,7 @@ vanilla main. Same encoding vocabulary, different bytes: for a column that has
 settled, C writes through the ordinary column writer while A stays on the page
 grain. The cause is page cadence rather than encoding: a page-grain page can
 never span two `ArrowLeafColumn`s, because a `LeafCursor` covers one leaf and
-`encode_page` seals whatever the pacer has buffered when that cursor runs out.
+encoding seals whatever the candidate has buffered when that cursor runs out.
 With 8192 row record batches every one of A's pages is one batch, so A writes
 `ceil(rows / 8192)` pages per chunk (55 and 68 on `hits_0`) where the ordinary
 writer cuts at the 20000 row page budget (23 and 28). That is 12 922 pages for A
@@ -1881,9 +1907,17 @@ were raceable, so nothing in these results is masked by an unraced column.
 * Option A is 0.29% *larger* than both baselines on low-cardinality strings
   (4 479 bytes over 20 row groups, about 224 bytes per row group) while landing
   on the same encodings. Since the encodings match, this is page-boundary drift:
-  A's pacing candidate seals pages at slightly different offsets than the
-  baseline's own page budget does. The losing candidates in a race are never
-  committed and cannot contribute bytes.
+  the candidate that decides A's page boundaries seals pages at slightly
+  different offsets than the baseline's own page budget does. A candidate that
+  loses is never committed and cannot contribute bytes.
+* Option A's synthetic bytes moved by at most 0.016% (four cells, largest 1 498
+  bytes) when both adaptive arms became one shared harness. The harness counts
+  the values it has sent through a dictionary from each page's `num_values`,
+  which counts levels, where the previous page-grain-only harness read a
+  library-side counter of non-null values. The two differ only on nullable
+  columns, and only in when the dictionary-watching rule fires. Every Option B
+  and Option C cell, and every cell of every public file, is byte-identical
+  across that change.
 * The options differ from each other by around 0.1% on datasets where they all
   choose the same encoding for every row group, which is the same
   page-boundary effect.
