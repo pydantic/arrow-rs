@@ -43,23 +43,25 @@
 //! for leaf in compute_leaves(field, array)? {
 //!     let mut cursor = chunk.cursor(&leaf);
 //!     while !cursor.is_empty() {
-//!         // The first candidate paces: it encodes until *its* page budget
-//!         // trips, and the span it stopped at is what every other candidate
-//!         // is given. The split point is an output of encoding.
-//!         let pages = chunk.encode_page(
+//!         // Encode the next page as indices into the chunk's dictionary, and
+//!         // the very same rows again as PLAIN. The first candidate encodes
+//!         // until its own page budget is reached, and that is where the page
+//!         // ends; the alternatives are handed exactly the rows it consumed.
+//!         let pages = chunk.encode_page_alternatives(
 //!             &mut cursor,
-//!             &[Candidate::Dictionary, Candidate::Pinned(Encoding::PLAIN)],
+//!             Candidate::Dictionary,
+//!             &[Candidate::Encoding(Encoding::PLAIN)],
 //!         )?;
 //!
-//!         // Nothing has entered the chunk yet. Every page here is fully
-//!         // encoded and measurable, and the ones not appended are dropped.
+//!         // Nothing has entered the chunk yet: every page here is fully
+//!         // encoded and measured, and rejecting one is just dropping it.
+//!         // A dictionary-indices page is small because its bytes went into
+//!         // the dictionary instead, so charge it what it added there.
 //!         let best = pages
-//!             .iter()
-//!             .enumerate()
-//!             .min_by_key(|(_, p)| p.compressed_len())
-//!             .map(|(i, _)| i)
-//!             .unwrap();
-//!         chunk.append(pages.into_iter().nth(best).unwrap())?;
+//!             .into_iter()
+//!             .min_by_key(|p| p.compressed_len() + p.dictionary_growth())
+//!             .expect("at least one page");
+//!         chunk.append(best)?;
 //!     }
 //! }
 //!
@@ -70,12 +72,13 @@
 //!
 //! # What the API guarantees
 //!
-//! * **Decide before commit.** [`ColumnChunkBuilder::encode_page`] returns
-//!   sealed [`EncodedPage`]s. They are fully encoded and compressed, so
+//! * **Decide before commit.** [`ColumnChunkBuilder::encode_page`] and
+//!   [`ColumnChunkBuilder::encode_page_alternatives`] return sealed
+//!   [`EncodedPage`]s. They are fully encoded and compressed, so
 //!   [`EncodedPage::compressed_len`] is a measurement rather than an estimate,
 //!   and dropping one costs nothing but the work already done.
 //! * **The split point is an output.** The caller never names a row offset.
-//!   [`LeafCursor`] advances only by whatever the pacing candidate's own budget
+//!   [`LeafCursor`] advances only by whatever the encoding candidate's own budget
 //!   ([`WriterProperties::data_page_size_limit`],
 //!   [`WriterProperties::data_page_row_count_limit`], and the byte-budget walk
 //!   in `count_values_within_byte_budget`) decided, and only ever at a record
@@ -92,9 +95,9 @@
 //!
 //! # Pages and record batches
 //!
-//! A [`LeafCursor`] covers exactly one [`ArrowLeafColumn`], and
-//! [`ColumnChunkBuilder::encode_page`] seals whatever the pacing candidate has
-//! buffered when that cursor runs out, so a page never spans two leaves. A
+//! A [`LeafCursor`] covers exactly one [`ArrowLeafColumn`], and encoding seals
+//! whatever the candidate has buffered when that cursor runs out, so a page
+//! never spans two leaves. A
 //! caller feeding 8192 row record batches therefore gets 8192 row pages even
 //! where [`WriterProperties::data_page_row_count_limit`] and the byte budget
 //! would have allowed a larger page, and pays for the extra pages in page
@@ -107,8 +110,8 @@
 //! and belong to the chunk rather than to any page — so racing K candidate
 //! encodings of the same rows must not insert each value K times. See
 //! `parquet/PAGE_API_DESIGN.md` for the resolution; the short version is that
-//! the builder owns them and lends them only to the pacing candidate, for
-//! exactly the span it consumes, and that this happens at *pace* time rather
+//! the builder owns them and lends them only to the candidate that decides the
+//! page boundary, for exactly the rows it consumes, and that this happens at *pace* time rather
 //! than at append time because the values are in the chunk no matter which
 //! encoding wins.
 //!
@@ -142,30 +145,26 @@ use crate::errors::{ParquetError, Result};
 use crate::file::properties::WriterPropertiesPtr;
 use crate::schema::types::ColumnDescPtr;
 
-/// One candidate encoding for a page.
-///
-/// The first candidate passed to [`ColumnChunkBuilder::encode_page`] is the
-/// *pacer*: it decides where the page ends, and every other candidate is given
-/// exactly the span it consumed so the resulting pages are comparable.
+/// One way of encoding a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Candidate {
-    /// Encode indices against the column chunk's shared dictionary.
+    /// Encode indices into the column chunk's dictionary.
     ///
-    /// At most one candidate per race may be `Dictionary`, and the chunk must
-    /// still have a dictionary (it is dropped once a non-dictionary page has
-    /// been appended, or if dictionary encoding was disabled in the properties).
+    /// A page may be encoded this way only while the chunk still has a
+    /// dictionary: it is dropped once a page that is not dictionary indices has
+    /// been appended, or if dictionary encoding was disabled in the properties.
+    /// One page has one dictionary candidate, because the chunk has one
+    /// dictionary.
     Dictionary,
-    /// Encode with a fixed encoding, ignoring what the properties would have
-    /// chosen.
-    Pinned(Encoding),
+    /// Encode with this encoding, whatever the properties would have chosen.
+    Encoding(Encoding),
 }
 
 /// A position within an [`ArrowLeafColumn`], advanced only by encoding.
 ///
 /// There is deliberately no way to construct a cursor at, or move one to, a
-/// caller-chosen row offset: the only thing that moves it is
-/// [`ColumnChunkBuilder::encode_page`], by exactly as much as the pacing
-/// candidate's page budget consumed.
+/// caller-chosen row offset. The only thing that moves it is encoding a page,
+/// by exactly as many rows as that page holds.
 #[derive(Debug)]
 pub struct LeafCursor {
     levels: ArrayLevels,
@@ -186,7 +185,7 @@ impl LeafCursor {
     }
 
     /// Levels (values plus nulls plus repeats) still to encode.
-    pub fn levels_remaining(&self) -> usize {
+    fn levels_remaining(&self) -> usize {
         self.total_levels - self.level_offset
     }
 
@@ -218,7 +217,7 @@ impl LeafCursor {
         }
     }
 
-    /// Cut exactly the span a pacer consumed, so the other candidates can encode
+    /// Cut exactly the rows the first candidate consumed, so the alternatives encode
     /// the same rows.
     fn span(&self, num_levels: usize, num_values: usize) -> CdcChunk {
         CdcChunk {
@@ -242,7 +241,6 @@ impl LeafCursor {
 pub struct DictionaryView {
     entries: usize,
     encoded_bytes: usize,
-    values_written: u64,
 }
 
 impl DictionaryView {
@@ -252,16 +250,11 @@ impl DictionaryView {
     }
 
     /// Encoded size of the dictionary page's entries, in bytes.
+    ///
+    /// This is what the chunk will pay for the dictionary page at close, and it
+    /// grows as pages intern new values.
     pub fn encoded_bytes(&self) -> usize {
         self.encoded_bytes
-    }
-
-    /// Values that have been routed through the dictionary so far.
-    ///
-    /// `entries` over `values_written` is the ratio worth watching: as it
-    /// approaches one, the dictionary is no longer buying anything.
-    pub fn values_written(&self) -> u64 {
-        self.values_written
     }
 }
 
@@ -293,6 +286,7 @@ pub struct EncodedPage {
     num_rows: u32,
     compressed_len: usize,
     uncompressed_len: usize,
+    dictionary_growth: usize,
 }
 
 impl std::fmt::Debug for EncodedPage {
@@ -303,6 +297,7 @@ impl std::fmt::Debug for EncodedPage {
             .field("num_rows", &self.num_rows)
             .field("compressed_len", &self.compressed_len)
             .field("uncompressed_len", &self.uncompressed_len)
+            .field("dictionary_growth", &self.dictionary_growth)
             .finish_non_exhaustive()
     }
 }
@@ -336,8 +331,20 @@ impl EncodedPage {
         self.uncompressed_len
     }
 
+    /// Bytes this page's encoding added to the column chunk's dictionary.
+    ///
+    /// Zero for every page that does not encode dictionary indices. A
+    /// dictionary-indices page is small precisely because the values it interned
+    /// are written once, later, in the chunk's dictionary page; those bytes are
+    /// invisible in [`Self::compressed_len`], and this is how many of them this
+    /// page created. Comparing `compressed_len() + dictionary_growth()` across
+    /// the candidates for one page compares like with like.
+    pub fn dictionary_growth(&self) -> usize {
+        self.dictionary_growth
+    }
+
     /// Whether this page encodes indices into the chunk's dictionary.
-    pub fn is_dictionary_indices(&self) -> bool {
+    fn is_dictionary_indices(&self) -> bool {
         matches!(
             self.encoding,
             Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
@@ -384,7 +391,6 @@ pub struct ColumnChunkBuilder {
     /// never enabled. Lent to a `Candidate::Dictionary` encoder for the
     /// duration of one page.
     dictionary: Option<Box<dyn DynDictionary>>,
-    dictionary_values_written: u64,
     /// Set once a dictionary-indices page has been appended, so `close` knows a
     /// dictionary page is owed.
     dictionary_page_owed: bool,
@@ -466,7 +472,6 @@ impl ColumnChunkBuilder {
             writer,
             chunk,
             dictionary,
-            dictionary_values_written: 0,
             dictionary_page_owed: false,
             dictionary_closed: false,
             accumulators,
@@ -483,7 +488,6 @@ impl ColumnChunkBuilder {
         Some(DictionaryView {
             entries: dictionary.num_entries(),
             encoded_bytes: dictionary.dict_encoded_size(),
-            values_written: self.dictionary_values_written,
         })
     }
 
@@ -516,62 +520,93 @@ impl ColumnChunkBuilder {
         }
     }
 
-    /// Encode the next page `candidates.len()` different ways and return the
-    /// results, without committing anything.
+    /// Encode the next page with `candidate`, without committing it.
     ///
-    /// `candidates[0]` paces: it encodes forward until its own page budget
-    /// trips, and the span it consumed is what the remaining candidates are
-    /// given, so all the returned pages describe the same rows and their
-    /// [`compressed_len`](EncodedPage::compressed_len)s are directly
-    /// comparable. The cursor advances by that span.
+    /// The page ends where `candidate`'s own page budget
+    /// ([`WriterProperties::data_page_size_limit`],
+    /// [`WriterProperties::data_page_row_count_limit`]) says it ends, or where
+    /// the cursor runs out, whichever comes first; `cursor` advances by exactly
+    /// that many rows. The returned page is fully encoded and compressed, and
+    /// enters the chunk only when it is passed to [`Self::append`].
     ///
-    /// Passing a single candidate is the "no race, just adapt" case and costs
-    /// exactly one encode.
+    /// [`WriterProperties::data_page_size_limit`]: crate::file::properties::WriterProperties::data_page_size_limit
+    /// [`WriterProperties::data_page_row_count_limit`]: crate::file::properties::WriterProperties::data_page_row_count_limit
     pub fn encode_page(
         &mut self,
         cursor: &mut LeafCursor,
-        candidates: &[Candidate],
+        candidate: Candidate,
+    ) -> Result<EncodedPage> {
+        let mut pages = self.encode_page_alternatives(cursor, candidate, &[])?;
+        Ok(pages.pop().expect("one candidate encodes one page"))
+    }
+
+    /// Encode the next page with `candidate`, and the same rows again with each
+    /// of `alternatives`, without committing any of them.
+    ///
+    /// `candidate` alone decides where the page ends, exactly as in
+    /// [`Self::encode_page`]. Every alternative is then handed precisely the
+    /// rows it consumed, so the returned pages all describe the same rows and
+    /// their [`compressed_len`](EncodedPage::compressed_len)s can be compared
+    /// directly. The result holds `candidate`'s page first, then one page per
+    /// alternative in order, and the cursor advances once.
+    ///
+    /// Only `candidate` may be [`Candidate::Dictionary`]: an alternative
+    /// encoding is never allowed to intern values into the chunk's dictionary,
+    /// since it may be the page that is thrown away.
+    pub fn encode_page_alternatives(
+        &mut self,
+        cursor: &mut LeafCursor,
+        candidate: Candidate,
+        alternatives: &[Candidate],
     ) -> Result<Vec<EncodedPage>> {
-        if candidates.is_empty() {
-            return Err(general_err!("encode_page requires at least one candidate"));
-        }
         if cursor.is_empty() {
-            return Err(general_err!("encode_page called on an exhausted cursor"));
-        }
-        if candidates
-            .iter()
-            .filter(|c| matches!(c, Candidate::Dictionary))
-            .count()
-            > 1
-        {
             return Err(general_err!(
-                "at most one Candidate::Dictionary may be raced per page: \
-                 there is one dictionary per column chunk"
+                "cannot encode a page from an exhausted cursor"
             ));
         }
-        if candidates.contains(&Candidate::Dictionary) && self.dictionary.is_none() {
+        if alternatives.contains(&Candidate::Dictionary) {
+            return Err(general_err!(
+                "Candidate::Dictionary cannot be an alternative encoding: a column chunk \
+                 has one dictionary, and only the candidate that decides the page \
+                 boundary may add to it"
+            ));
+        }
+        if candidate == Candidate::Dictionary && self.dictionary.is_none() {
             return Err(general_err!(
                 "this column chunk has no dictionary: it was either disabled in the \
                  writer properties or abandoned when a non-dictionary page was appended"
             ));
         }
 
-        let (span, mut pages) = self.pace(cursor, candidates[0])?;
+        let dictionary_before = self.dictionary_encoded_size();
+        let (span, mut pages) = self.pace(cursor, candidate)?;
+        // Whatever this page interned is a real cost of encoding it this way,
+        // and it is paid later in the chunk's dictionary page.
+        pages[0].dictionary_growth = self
+            .dictionary_encoded_size()
+            .saturating_sub(dictionary_before);
 
-        for candidate in &candidates[1..] {
-            let mut writer = self.candidate_writer(*candidate, false)?;
+        for alternative in alternatives {
+            let mut writer = self.candidate_writer(*alternative, false)?;
             let sliced = cursor.levels.slice_for_chunk(&span);
             let (levels, _) = write_levels(&mut writer, &sliced)?;
             debug_assert_eq!(levels, span.num_levels);
-            pages.push(self.seal(&mut writer, *candidate)?);
+            pages.push(self.seal(&mut writer, *alternative)?);
         }
 
         cursor.advance(span.num_levels, span.num_values);
         Ok(pages)
     }
 
-    /// Run the pacing candidate forwards until its page budget trips, returning
-    /// the span it settled on and its sealed page.
+    /// The dictionary's encoded size, or zero if the chunk has no dictionary.
+    fn dictionary_encoded_size(&self) -> usize {
+        self.dictionary
+            .as_ref()
+            .map_or(0, |d| d.dict_encoded_size())
+    }
+
+    /// Run the boundary-deciding candidate forwards until its page budget trips,
+    /// returning the rows it settled on and its sealed page.
     fn pace(
         &mut self,
         cursor: &LeafCursor,
@@ -579,8 +614,8 @@ impl ColumnChunkBuilder {
     ) -> Result<(CdcChunk, Vec<EncodedPage>)> {
         let mut writer = self.candidate_writer(candidate, true)?;
 
-        // The pacer is the one candidate that sees each value exactly once for
-        // this span, so it is the one that carries the chunk's value-fed
+        // This is the one candidate that sees each value of the page exactly
+        // once, so it is the one that carries the chunk's value-fed
         // accumulators. They go in before any value is written and come back out
         // before the page is sealed, so they survive the page being rejected —
         // which is correct: the values are in the chunk whichever encoding wins.
@@ -635,14 +670,11 @@ impl ColumnChunkBuilder {
 
         if levels_taken == 0 {
             return Err(general_err!(
-                "pacing candidate consumed no levels; this column cannot make progress"
+                "the candidate encoded no rows; this column cannot make progress"
             ));
         }
 
         let page = self.seal(&mut writer, candidate)?;
-        if candidate == Candidate::Dictionary {
-            self.dictionary_values_written += values_taken as u64;
-        }
         Ok((cursor.span(levels_taken, values_taken), vec![page]))
     }
 
@@ -658,7 +690,7 @@ impl ColumnChunkBuilder {
                     .take()
                     .ok_or_else(|| general_err!("this column chunk has no dictionary"))?,
             ),
-            Candidate::Pinned(_) => None,
+            Candidate::Encoding(_) => None,
         };
         let mut writer = build_writer(&self.descr, &self.props, Box::new(NullPageWriter))?;
         // A candidate encodes rows another candidate may end up winning, so it
@@ -670,7 +702,7 @@ impl ColumnChunkBuilder {
         if let Some(dictionary) = dictionary {
             install_dictionary(&mut writer, dictionary)?;
         }
-        if let Candidate::Pinned(encoding) = candidate {
+        if let Candidate::Encoding(encoding) = candidate {
             pin_encoding(&mut writer, encoding, &self.descr)?;
         }
         set_page_boundary_action(
@@ -844,7 +876,7 @@ fn write_dictionary_page(writer: &mut ArrowColumnWriterImpl, page: DictionaryPag
 ///
 /// This is the only place the module builds a writer. The builder lifts the
 /// chunk-level state out of the one it keeps ([`ColumnChunkBuilder::new`]) and
-/// throws it away for the ones it races ([`ColumnChunkBuilder::candidate_writer`]).
+/// throws it away for the throwaway ones ([`ColumnChunkBuilder::candidate_writer`]).
 fn build_writer(
     descr: &ColumnDescPtr,
     props: &WriterPropertiesPtr,
@@ -972,6 +1004,7 @@ impl EncodedPage {
             num_rows,
             compressed_len,
             uncompressed_len,
+            dictionary_growth: 0,
         }
     }
 }
@@ -1039,7 +1072,10 @@ mod tests {
                 let mut cursor = chunk.cursor(&leaf);
                 while !cursor.is_empty() {
                     let candidates = plan(&chunk);
-                    let pages = chunk.encode_page(&mut cursor, &candidates).unwrap();
+                    let (first, alternatives) = candidates.split_first().unwrap();
+                    let pages = chunk
+                        .encode_page_alternatives(&mut cursor, *first, alternatives)
+                        .unwrap();
                     let winner = pick(&pages);
                     chunk
                         .append(pages.into_iter().nth(winner).unwrap())
@@ -1157,17 +1193,15 @@ mod tests {
             props,
             |chunk| {
                 // Dictionary-watching: stop offering the dictionary once it
-                // stops paying for itself.
+                // has interned enough distinct values to have stopped paying
+                // for itself.
                 match chunk.dictionary() {
-                    Some(d)
-                        if d.values_written() < 2_000
-                            || (d.entries() as u64) * 4 < d.values_written() =>
-                    {
-                        vec![Candidate::Dictionary, Candidate::Pinned(Encoding::PLAIN)]
+                    Some(d) if d.entries() < 4_000 => {
+                        vec![Candidate::Dictionary, Candidate::Encoding(Encoding::PLAIN)]
                     }
                     _ => vec![
-                        Candidate::Pinned(Encoding::PLAIN),
-                        Candidate::Pinned(Encoding::DELTA_BYTE_ARRAY),
+                        Candidate::Encoding(Encoding::PLAIN),
+                        Candidate::Encoding(Encoding::DELTA_BYTE_ARRAY),
                     ],
                 }
             },
@@ -1223,18 +1257,74 @@ mod tests {
         let mut cursor = chunk.cursor(&leaf);
 
         // Land on PLAIN first.
-        let pages = chunk
-            .encode_page(&mut cursor, &[Candidate::Pinned(Encoding::PLAIN)])
+        let page = chunk
+            .encode_page(&mut cursor, Candidate::Encoding(Encoding::PLAIN))
             .unwrap();
-        chunk.append(pages.into_iter().next().unwrap()).unwrap();
+        chunk.append(page).unwrap();
 
         // The dictionary is gone, so even asking for it fails.
         assert!(chunk.dictionary().is_none());
         let err = chunk
-            .encode_page(&mut cursor, &[Candidate::Dictionary])
+            .encode_page(&mut cursor, Candidate::Dictionary)
             .unwrap_err()
             .to_string();
         assert!(err.contains("no dictionary"), "{err}");
+    }
+
+    /// `dictionary_growth` is what makes candidates comparable: the indices
+    /// page is cheap only because its bytes went into the dictionary, and the
+    /// alternative that never touches the dictionary is charged nothing.
+    #[test]
+    fn dictionary_growth_is_charged_to_the_indices_page() {
+        let values: Vec<String> = (0..20_000).map(|i| format!("value-number-{i}")).collect();
+        let refs: Vec<&str> = values.iter().map(|s| s.as_str()).collect();
+        let (schema, batch) = string_batch(&refs);
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_data_page_row_count_limit(2_000)
+                .build(),
+        );
+
+        let parquet_schema = ArrowSchemaConverter::new().convert(&schema).unwrap();
+        let descr = parquet_schema.columns()[0].clone();
+        let mut chunk = ColumnChunkBuilder::new(descr, props).unwrap();
+        let leaf = compute_leaves(schema.field(0), batch.column(0))
+            .unwrap()
+            .remove(0);
+        let mut cursor = chunk.cursor(&leaf);
+
+        let pages = chunk
+            .encode_page_alternatives(
+                &mut cursor,
+                Candidate::Dictionary,
+                &[Candidate::Encoding(Encoding::PLAIN)],
+            )
+            .unwrap();
+
+        assert_eq!(pages.len(), 2);
+        let dictionary_page = &pages[0];
+        let plain_page = &pages[1];
+        assert!(dictionary_page.is_dictionary_indices());
+        assert_eq!(plain_page.dictionary_growth(), 0);
+        // Every value in this page is distinct, so the dictionary grew by
+        // roughly the whole page's worth of bytes, and the raw indices page is
+        // far smaller than the PLAIN page it is being compared against.
+        assert!(
+            dictionary_page.dictionary_growth() > dictionary_page.compressed_len(),
+            "{dictionary_page:?}"
+        );
+        assert!(
+            dictionary_page.compressed_len() + dictionary_page.dictionary_growth()
+                > plain_page.compressed_len(),
+            "charging the dictionary must make the indices page the loser here"
+        );
+
+        // A page whose boundary was decided without the dictionary is charged
+        // nothing, even when the chunk still has one.
+        let page = chunk
+            .encode_page(&mut cursor, Candidate::Encoding(Encoding::PLAIN))
+            .unwrap();
+        assert_eq!(page.dictionary_growth(), 0);
     }
 
     /// The dictionary page is written first even though it is produced last.
@@ -1279,7 +1369,7 @@ mod tests {
     /// would be empty. It must instead contain every value, and be identical to
     /// the one `ArrowWriter` builds for the same data.
     #[test]
-    fn bloom_filter_survives_the_pacer_always_losing() {
+    fn bloom_filter_survives_the_boundary_page_always_losing() {
         let values: Vec<String> = (0..40_000).map(|i| format!("value-{i}")).collect();
         let refs: Vec<&str> = values.iter().map(|s| s.as_str()).collect();
         let (schema, batch) = string_batch(&refs);
@@ -1296,20 +1386,21 @@ mod tests {
             std::slice::from_ref(&batch),
             props.clone(),
             |chunk| {
-                // The pacer is the dictionary while there is one, and a pinned
-                // DELTA_BYTE_ARRAY afterwards; either way it is index 0 and
-                // never the page that gets appended.
+                // The page boundary is decided by the dictionary while there
+                // is one, and by DELTA_BYTE_ARRAY afterwards; either way it is
+                // index 0, and never the page that gets appended.
                 if chunk.dictionary().is_some() {
-                    vec![Candidate::Dictionary, Candidate::Pinned(Encoding::PLAIN)]
+                    vec![Candidate::Dictionary, Candidate::Encoding(Encoding::PLAIN)]
                 } else {
                     vec![
-                        Candidate::Pinned(Encoding::DELTA_BYTE_ARRAY),
-                        Candidate::Pinned(Encoding::PLAIN),
+                        Candidate::Encoding(Encoding::DELTA_BYTE_ARRAY),
+                        Candidate::Encoding(Encoding::PLAIN),
                     ]
                 }
             },
             |pages| {
-                // Always take the second page, never the pacer's.
+                // Always take the alternative, never the page whose candidate
+                // decided the boundary.
                 assert_eq!(pages.len(), 2);
                 appended.push(pages[1].encoding());
                 1

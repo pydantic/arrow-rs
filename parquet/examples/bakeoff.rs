@@ -62,7 +62,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::page_grain::{
-    Candidate as PageCandidate, ColumnChunkBuilder, EncodedPage, LeafCursor,
+    Candidate, ColumnChunkBuilder, EncodedPage, LeafCursor,
 };
 use parquet::arrow::arrow_writer::{
     ArrowColumnChunk, ArrowColumnWriter, ArrowLeafColumn, ArrowWriter, compute_leaves,
@@ -395,7 +395,7 @@ enum Settled {
     /// Settled on the chunk's dictionary.
     Dictionary,
     /// Settled on a fixed encoding.
-    Pinned(Encoding),
+    Fixed(Encoding),
 }
 
 /// Ranks encodings by how cheap they are to decode, lowest first. Used to break
@@ -410,26 +410,24 @@ fn decode_cost(encoding: Encoding) -> u8 {
     }
 }
 
-/// The true cost of a page.
-///
-/// `EncodedPage::compressed_len` covers the data page only. A dictionary
-/// indices page is cheap precisely because its bytes went into the dictionary
-/// page instead, and that page is written once at close where no per-page
-/// comparison can see it. `dictionary_growth` is how many bytes the chunk's
-/// dictionary gained while encoding this span, and charging it to the indices
-/// candidate is what keeps the comparison honest.
-fn page_cost(page: &EncodedPage, dictionary_growth: usize) -> usize {
-    if page.is_dictionary_indices() {
-        page.compressed_len() + dictionary_growth
-    } else {
-        page.compressed_len()
-    }
+/// Whether an encoding indexes into the column chunk's dictionary.
+fn is_dictionary_indices(encoding: Encoding) -> bool {
+    matches!(
+        encoding,
+        Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+    )
+}
+
+/// The true cost of a page: its own compressed bytes plus whatever it added to
+/// the chunk's dictionary, which is paid later in the dictionary page.
+fn page_cost(page: &EncodedPage) -> usize {
+    page.compressed_len() + page.dictionary_growth()
 }
 
 /// Cheapest page wins, but a cheaper-to-decode page within `NEAR_TIE` of the
 /// cheapest is preferred.
-fn pick_page(pages: &[EncodedPage], dictionary_growth: usize) -> usize {
-    let cost = |p: &EncodedPage| page_cost(p, dictionary_growth);
+fn pick_page(pages: &[EncodedPage]) -> usize {
+    let cost = |p: &EncodedPage| page_cost(p);
     let smallest = pages.iter().map(cost).min().unwrap_or(0);
     let budget = (smallest as f64 * (1.0 + NEAR_TIE)) as usize;
     pages
@@ -503,7 +501,7 @@ impl LeafPolicyA {
         chunk: &ColumnChunkBuilder,
         state: Settled,
         last: Option<&PageReport>,
-    ) -> Vec<PageCandidate> {
+    ) -> Vec<Candidate> {
         let dictionary = chunk.dictionary();
         let has_dictionary = dictionary.is_some();
 
@@ -515,9 +513,9 @@ impl LeafPolicyA {
                 .map(|d| d.encoded_bytes() <= self.dictionary_limit)
                 .unwrap_or(false);
             return if within_limit {
-                vec![PageCandidate::Dictionary]
+                vec![Candidate::Dictionary]
             } else {
-                vec![PageCandidate::Pinned(Encoding::PLAIN)]
+                vec![Candidate::Encoding(Encoding::PLAIN)]
             };
         }
 
@@ -527,10 +525,10 @@ impl LeafPolicyA {
                 // The dictionary paces when it is available: pacing with it
                 // keeps its budget accounting honest.
                 if has_dictionary {
-                    candidates.push(PageCandidate::Dictionary);
+                    candidates.push(Candidate::Dictionary);
                 }
                 for encoding in &self.challengers {
-                    candidates.push(PageCandidate::Pinned(*encoding));
+                    candidates.push(Candidate::Encoding(*encoding));
                 }
                 candidates
             }
@@ -538,7 +536,7 @@ impl LeafPolicyA {
                 if self.adapt_per_page {
                     vec![self.adapt(state, last, has_dictionary)]
                 } else {
-                    vec![PageCandidate::Dictionary]
+                    vec![Candidate::Dictionary]
                 }
             }
             // The dictionary was abandoned since we settled on it: race the
@@ -546,13 +544,13 @@ impl LeafPolicyA {
             Settled::Dictionary => self
                 .challengers
                 .iter()
-                .map(|e| PageCandidate::Pinned(*e))
+                .map(|e| Candidate::Encoding(*e))
                 .collect(),
-            Settled::Pinned(encoding) => {
+            Settled::Fixed(encoding) => {
                 if self.adapt_per_page {
                     vec![self.adapt(state, last, has_dictionary)]
                 } else {
-                    vec![PageCandidate::Pinned(encoding)]
+                    vec![Candidate::Encoding(encoding)]
                 }
             }
         }
@@ -563,31 +561,26 @@ impl LeafPolicyA {
     /// Used only after a leaf has settled. A page that barely compressed is
     /// evidence the current encoding has stopped helping, and the dictionary
     /// can only be left, never rejoined.
-    fn adapt(
-        &self,
-        state: Settled,
-        last: Option<&PageReport>,
-        has_dictionary: bool,
-    ) -> PageCandidate {
+    fn adapt(&self, state: Settled, last: Option<&PageReport>, has_dictionary: bool) -> Candidate {
         match last {
             // Cold start: the first page of a chunk has no previous page to
             // learn from, so it continues from what this leaf settled on. It
             // must not default to the dictionary, or every settled chunk would
             // open with a dictionary page it then abandons.
             None => match state {
-                Settled::Dictionary if has_dictionary => PageCandidate::Dictionary,
-                Settled::Pinned(encoding) => PageCandidate::Pinned(encoding),
-                _ if has_dictionary => PageCandidate::Dictionary,
-                _ => PageCandidate::Pinned(self.challengers[0]),
+                Settled::Dictionary if has_dictionary => Candidate::Dictionary,
+                Settled::Fixed(encoding) => Candidate::Encoding(encoding),
+                _ if has_dictionary => Candidate::Dictionary,
+                _ => Candidate::Encoding(self.challengers[0]),
             },
             Some(prev) => {
                 let ratio = prev.compressed as f64 / prev.uncompressed.max(1) as f64;
                 if prev.encoding == Encoding::RLE_DICTIONARY && ratio > 0.9 && has_dictionary {
-                    PageCandidate::Pinned(self.challengers[0])
+                    Candidate::Encoding(self.challengers[0])
                 } else if prev.is_dictionary && has_dictionary {
-                    PageCandidate::Dictionary
+                    Candidate::Dictionary
                 } else {
-                    PageCandidate::Pinned(prev.encoding)
+                    Candidate::Encoding(prev.encoding)
                 }
             }
         }
@@ -621,8 +614,8 @@ impl LeafPolicyA {
         }
         match self.learned {
             Settled::Dictionary => CandidateB::Dictionary,
-            Settled::Pinned(Encoding::PLAIN) => CandidateB::Plain,
-            Settled::Pinned(_) if CandidateB::delta_encoding(physical).is_some() => {
+            Settled::Fixed(Encoding::PLAIN) => CandidateB::Plain,
+            Settled::Fixed(_) if CandidateB::delta_encoding(physical).is_some() => {
                 CandidateB::Delta
             }
             // A settled non-PLAIN encoding with no delta form, or a leaf that
@@ -634,10 +627,14 @@ impl LeafPolicyA {
     /// Should the dictionary be abandoned now? Once enough values have gone
     /// through it, distinct entries above a quarter of the values written means
     /// it has stopped deduplicating anything.
-    fn dictionary_is_still_paying(chunk: &ColumnChunkBuilder) -> bool {
+    ///
+    /// `values_through_dictionary` is the harness's own count, summed from the
+    /// pages the dictionary candidate encoded: the library reports what the
+    /// dictionary holds, not how much traffic a policy has sent through it.
+    fn dictionary_is_still_paying(chunk: &ColumnChunkBuilder, values: u64) -> bool {
         match chunk.dictionary() {
             None => false,
-            Some(d) => d.values_written() < 50_000 || (d.entries() as u64) * 4 < d.values_written(),
+            Some(d) => values < 50_000 || (d.entries() as u64) * 4 < values,
         }
     }
 }
@@ -653,6 +650,9 @@ struct ChunkRacer {
     state: Settled,
     last: Option<PageReport>,
     races_left: usize,
+    /// Values this chunk has routed through the dictionary, summed from the
+    /// pages the dictionary candidate encoded.
+    values_through_dictionary: u64,
 }
 
 impl ChunkRacer {
@@ -669,6 +669,7 @@ impl ChunkRacer {
             state,
             last: None,
             races_left: 2,
+            values_through_dictionary: 0,
         })
     }
 
@@ -679,7 +680,10 @@ impl ChunkRacer {
             // Dictionary watching: drop out of the dictionary the moment it
             // stops paying, and let the next race pick the landing encoding.
             if matches!(self.state, Settled::Dictionary)
-                && !LeafPolicyA::dictionary_is_still_paying(&self.chunk)
+                && !LeafPolicyA::dictionary_is_still_paying(
+                    &self.chunk,
+                    self.values_through_dictionary,
+                )
             {
                 self.state = Settled::Racing;
                 self.races_left = 1;
@@ -687,44 +691,37 @@ impl ChunkRacer {
 
             let candidates = policy.plan(&self.chunk, self.state, self.last.as_ref());
 
-            // Read the dictionary either side of the encode so the indices
-            // candidate can be charged for the dictionary bytes it created.
-            let before = self
+            let (first, alternatives) = candidates.split_first().expect("a candidate");
+            let pages = self
                 .chunk
-                .dictionary()
-                .map(|d| d.encoded_bytes())
-                .unwrap_or(0);
-            let pages = self.chunk.encode_page(&mut cursor, &candidates)?;
-            let growth = self
-                .chunk
-                .dictionary()
-                .map(|d| d.encoded_bytes())
-                .unwrap_or(before)
-                .saturating_sub(before);
+                .encode_page_alternatives(&mut cursor, *first, alternatives)?;
 
             policy.total_pages += 1;
             if pages.len() > 1 {
                 policy.raced_pages += 1;
             }
+            if *first == Candidate::Dictionary {
+                self.values_through_dictionary += u64::from(pages[0].num_values());
+            }
 
-            let winner = pick_page(&pages, growth);
+            let winner = pick_page(&pages);
             let page = pages.into_iter().nth(winner).unwrap();
 
             self.last = Some(PageReport {
                 encoding: page.encoding(),
                 compressed: page.compressed_len(),
                 uncompressed: page.uncompressed_len(),
-                is_dictionary: page.is_dictionary_indices(),
+                is_dictionary: is_dictionary_indices(page.encoding()),
             });
 
             // Settle: once enough raced pages agree, stop paying for the race.
             if matches!(self.state, Settled::Racing) && !policy.passthrough {
                 self.races_left = self.races_left.saturating_sub(1);
                 if self.races_left == 0 {
-                    self.state = if page.is_dictionary_indices() {
+                    self.state = if is_dictionary_indices(page.encoding()) {
                         Settled::Dictionary
                     } else {
-                        Settled::Pinned(page.encoding())
+                        Settled::Fixed(page.encoding())
                     };
                 }
             }
