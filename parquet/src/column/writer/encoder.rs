@@ -190,21 +190,6 @@ pub trait ColumnValueEncoder {
     /// accumulator is prepared to accumulate statistics for the next column chunk.
     fn flush_geospatial_statistics(&mut self) -> Option<Box<GeospatialStatistics>>;
 
-    /// Create an encoder for one *candidate* page in the page-grain API.
-    ///
-    /// A candidate encodes rows that another candidate may end up winning, so
-    /// it must own no chunk-level state at all: no dictionary (the chunk's
-    /// dictionary is lent in explicitly when this candidate is the dictionary
-    /// one) and no value-fed accumulators (see [`ValueAccumulators`]). Page-local
-    /// state — min/max, null counts, `variable_length_bytes` — is fine, because
-    /// a page that loses is simply dropped.
-    fn try_new_page_candidate(descr: &ColumnDescPtr, props: &WriterProperties) -> Result<Self>
-    where
-        Self: Sized,
-    {
-        Self::try_new(descr, props)
-    }
-
     /// Replace this encoder's value encoding with `encoding`, dropping any
     /// dictionary.
     ///
@@ -503,15 +488,6 @@ impl<T: DataType> ColumnValueEncoder for ColumnValueEncoderImpl<T> {
         self.geo_stats_accumulator.as_mut().map(|a| a.finish())?
     }
 
-    fn try_new_page_candidate(descr: &ColumnDescPtr, props: &WriterProperties) -> Result<Self> {
-        let mut encoder = Self::try_new(descr, props)?;
-        // Strip every piece of chunk-level state; see the trait method's docs.
-        encoder.dict_encoder = None;
-        encoder.bloom_filter = None;
-        encoder.geo_stats_accumulator = None;
-        Ok(encoder)
-    }
-
     fn pin_encoding(&mut self, encoding: Encoding, descr: &ColumnDescPtr) -> Result<()> {
         self.encoder = get_encoder(encoding, descr)?;
         self.dict_encoder = None;
@@ -753,9 +729,8 @@ impl<T: DataType> DynDictionary for DictEncoder<T> {
 /// per-page facts. In the page-grain API they are owned by the column chunk and
 /// lent to whichever page encoder is *pacing* — the one that advances the
 /// cursor — for exactly the span it consumes. Raced candidates for that same
-/// span are constructed without them
-/// ([`ColumnValueEncoder::try_new_page_candidate`]), so K candidates still
-/// produce exactly one insert per value. See `PAGE_API_DESIGN.md`.
+/// span have theirs taken away and dropped, so K candidates still produce
+/// exactly one insert per value. See `PAGE_API_DESIGN.md`.
 #[derive(Default)]
 pub struct ValueAccumulators {
     pub bloom_filter: Option<Sbbf>,

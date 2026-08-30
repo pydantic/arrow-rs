@@ -431,18 +431,18 @@ impl ColumnChunkBuilder {
         let page_writer = Box::new(ArrowPageWriter::new(store));
         let chunk = page_writer.buffer.clone();
 
+        // Build the writer the normal path would build, then lift the two
+        // pieces of chunk-level state out of its encoder into the builder. That
+        // is how the builder gets a dictionary and accumulators configured
+        // exactly as `WriterProperties` says, without reimplementing either.
+        //
         // The real writer must own no dictionary of its own: the chunk's
         // dictionary is an explicit object here, and a writer that thinks it has
         // one would buffer data pages and try to emit a dictionary page at
-        // close. `try_new_page_candidate` also strips the value-fed
-        // accumulators, which the builder holds instead; they are handed back to
-        // this encoder just before `close` so the chunk's bloom filter and geo
-        // statistics land in the metadata by the normal path.
-        // Build the writer the normal path would build, then lift the two
-        // pieces of chunk-level state out of its encoder into the builder. This
-        // is how the builder gets a dictionary and accumulators configured
-        // exactly as `WriterProperties` says, without reimplementing either.
-        let mut writer = build_writer(&descr, &props, page_writer, true)?;
+        // close. The accumulators are handed back to this encoder just before
+        // `close`, so the chunk's bloom filter and geospatial statistics land in
+        // the metadata by the normal path.
+        let mut writer = build_writer(&descr, &props, page_writer)?;
         let accumulators = take_accumulators(&mut writer);
         let dictionary = take_dictionary(&mut writer);
 
@@ -658,7 +658,13 @@ impl ColumnChunkBuilder {
             ),
             Candidate::Pinned(_) => None,
         };
-        let mut writer = build_writer(&self.descr, &self.props, Box::new(NullPageWriter), false)?;
+        let mut writer = build_writer(&self.descr, &self.props, Box::new(NullPageWriter))?;
+        // A candidate encodes rows another candidate may end up winning, so it
+        // must own no chunk-level state. Its own value-fed accumulators are
+        // dropped here; its own dictionary is overwritten below, either by the
+        // chunk's (`install_dictionary`) or by nothing (`pin_encoding` drops
+        // it), so there is nothing left to strip.
+        drop(take_accumulators(&mut writer));
         if let Some(dictionary) = dictionary {
             install_dictionary(&mut writer, dictionary)?;
         }
@@ -827,22 +833,17 @@ fn write_dictionary_page(writer: &mut ArrowColumnWriterImpl, page: DictionaryPag
 /// Build a column writer for `descr`, choosing the encoder the arrow writer
 /// would choose for the same leaf.
 ///
-/// `full` selects between the encoder the normal path builds (with its
-/// dictionary and value-fed accumulators) and a page *candidate* encoder, which
-/// owns no chunk-level state at all.
+/// This is the only place the module builds a writer. The builder lifts the
+/// chunk-level state out of the one it keeps ([`ColumnChunkBuilder::new`]) and
+/// throws it away for the ones it races ([`ColumnChunkBuilder::candidate_writer`]).
 fn build_writer(
     descr: &ColumnDescPtr,
     props: &WriterPropertiesPtr,
     page_writer: Box<dyn PageWriter + 'static>,
-    full: bool,
 ) -> Result<ArrowColumnWriterImpl> {
     macro_rules! typed {
         ($t:ty, $variant:ident) => {{
-            let encoder = if full {
-                <crate::column::writer::encoder::ColumnValueEncoderImpl<$t> as ColumnValueEncoder>::try_new(descr, props)?
-            } else {
-                <crate::column::writer::encoder::ColumnValueEncoderImpl<$t> as ColumnValueEncoder>::try_new_page_candidate(descr, props)?
-            };
+            let encoder = <crate::column::writer::encoder::ColumnValueEncoderImpl<$t> as ColumnValueEncoder>::try_new(descr, props)?;
             ArrowColumnWriterImpl::Column(ColumnWriter::$variant(
                 GenericColumnWriter::new_with_encoder(
                     descr.clone(),
@@ -862,11 +863,7 @@ fn build_writer(
         // writer handles by materializing the dictionary. Same values, same
         // output, one fewer specialisation.
         Type::BYTE_ARRAY => {
-            let encoder = if full {
-                <ByteArrayEncoder as ColumnValueEncoder>::try_new(descr, props)?
-            } else {
-                <ByteArrayEncoder as ColumnValueEncoder>::try_new_page_candidate(descr, props)?
-            };
+            let encoder = <ByteArrayEncoder as ColumnValueEncoder>::try_new(descr, props)?;
             ArrowColumnWriterImpl::ByteArray(GenericColumnWriter::new_with_encoder(
                 descr.clone(),
                 props.clone(),

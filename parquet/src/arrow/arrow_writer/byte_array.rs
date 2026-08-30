@@ -684,15 +684,6 @@ impl ColumnValueEncoder for ByteArrayEncoder {
         self.geo_stats_accumulator.as_mut().map(|a| a.finish())?
     }
 
-    fn try_new_page_candidate(descr: &ColumnDescPtr, props: &WriterProperties) -> Result<Self> {
-        let mut encoder = Self::try_new(descr, props)?;
-        // Strip every piece of chunk-level state; see the trait method's docs.
-        encoder.dict_encoder = None;
-        encoder.bloom_filter = None;
-        encoder.geo_stats_accumulator = None;
-        Ok(encoder)
-    }
-
     fn pin_encoding(&mut self, encoding: Encoding, _descr: &ColumnDescPtr) -> Result<()> {
         self.fallback = FallbackEncoder::with_encoding(encoding)?;
         self.dict_encoder = None;
