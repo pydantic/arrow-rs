@@ -1271,6 +1271,17 @@ impl ArrowRowGroupWriterFactory {
         self
     }
 
+    /// The [`PageStoreFactory`] this factory allocates column chunk buffers
+    /// from, as set by [`Self::with_page_store_factory`].
+    ///
+    /// A caller that builds some of a row group's column chunks by another
+    /// route can hand this to that route as well, so that every chunk in the
+    /// row group is bounded by the same page store, whether it spills to a temp
+    /// file, to object storage or to the heap.
+    pub fn page_store_factory(&self) -> &Arc<dyn PageStoreFactory> {
+        &self.page_store_factory
+    }
+
     fn create_row_group_writer(&self, row_group_index: usize) -> Result<ArrowRowGroupWriter> {
         let writers = self.create_column_writers(row_group_index)?;
         Ok(ArrowRowGroupWriter::new(writers, &self.arrow_schema))
@@ -1302,6 +1313,31 @@ impl ArrowRowGroupWriterFactory {
         row_group_index: usize,
         props: &WriterPropertiesPtr,
     ) -> Result<Vec<ArrowColumnWriter>> {
+        let writers = self.create_selected_column_writers(row_group_index, props, |_| true)?;
+        Ok(writers
+            .into_iter()
+            .map(|w| w.expect("every leaf column was selected"))
+            .collect())
+    }
+
+    /// Create column writers for only the leaf columns `select` accepts.
+    ///
+    /// The returned vector has one entry per leaf column of the schema, in leaf
+    /// order, holding `None` wherever `select` returned `false` for that leaf's
+    /// index. Nothing is allocated for those columns: in particular no page
+    /// store is created, which matters when the page store factory allocates
+    /// something more expensive than a heap buffer.
+    ///
+    /// This is for a writer that produces some of a row group's
+    /// [`ArrowColumnChunk`]s by another route and needs ordinary column writers
+    /// for the rest. Otherwise use [`Self::create_column_writers_with_properties`],
+    /// which selects every column.
+    pub fn create_selected_column_writers(
+        &self,
+        row_group_index: usize,
+        props: &WriterPropertiesPtr,
+        select: impl Fn(usize) -> bool,
+    ) -> Result<Vec<Option<ArrowColumnWriter>>> {
         let mut writers = Vec::with_capacity(self.arrow_schema.fields.len());
         let mut leaves = self.schema.columns().iter();
         let column_factory = self.column_writer_factory(row_group_index);
@@ -1311,6 +1347,7 @@ impl ArrowRowGroupWriterFactory {
                 props,
                 &mut leaves,
                 &mut writers,
+                &select,
             )?;
         }
         Ok(writers)
@@ -1408,28 +1445,35 @@ impl ArrowColumnWriterFactory {
         data_type: &ArrowDataType,
         props: &WriterPropertiesPtr,
         leaves: &mut Iter<'_, ColumnDescPtr>,
-        out: &mut Vec<ArrowColumnWriter>,
+        out: &mut Vec<Option<ArrowColumnWriter>>,
+        select: &dyn Fn(usize) -> bool,
     ) -> Result<()> {
         // Instantiate writers for normal columns
-        let col = |desc: &ColumnDescPtr| -> Result<ArrowColumnWriter> {
+        let col = |desc: &ColumnDescPtr| -> Result<Option<ArrowColumnWriter>> {
+            if !select(out.len()) {
+                return Ok(None);
+            }
             let page_writer = self.create_page_writer(desc, out.len())?;
             let chunk = page_writer.buffer.clone();
             let writer = get_column_writer(desc.clone(), props.clone(), page_writer);
-            Ok(ArrowColumnWriter {
+            Ok(Some(ArrowColumnWriter {
                 chunk,
                 writer: ArrowColumnWriterImpl::Column(writer),
-            })
+            }))
         };
 
         // Instantiate writers for byte arrays (e.g. Utf8,  Binary, etc)
-        let bytes = |desc: &ColumnDescPtr| -> Result<ArrowColumnWriter> {
+        let bytes = |desc: &ColumnDescPtr| -> Result<Option<ArrowColumnWriter>> {
+            if !select(out.len()) {
+                return Ok(None);
+            }
             let page_writer = self.create_page_writer(desc, out.len())?;
             let chunk = page_writer.buffer.clone();
             let writer = GenericColumnWriter::new(desc.clone(), props.clone(), page_writer);
-            Ok(ArrowColumnWriter {
+            Ok(Some(ArrowColumnWriter {
                 chunk,
                 writer: ArrowColumnWriterImpl::ByteArray(writer),
-            })
+            }))
         };
 
         match data_type {
@@ -1448,17 +1492,17 @@ impl ArrowColumnWriterFactory {
             | ArrowDataType::FixedSizeList(f, _)
             | ArrowDataType::ListView(f)
             | ArrowDataType::LargeListView(f) => {
-                self.get_arrow_column_writer(f.data_type(), props, leaves, out)?
+                self.get_arrow_column_writer(f.data_type(), props, leaves, out, select)?
             }
             ArrowDataType::Struct(fields) => {
                 for field in fields {
-                    self.get_arrow_column_writer(field.data_type(), props, leaves, out)?
+                    self.get_arrow_column_writer(field.data_type(), props, leaves, out, select)?
                 }
             }
             ArrowDataType::Map(f, _) => match f.data_type() {
                 ArrowDataType::Struct(f) => {
-                    self.get_arrow_column_writer(f[0].data_type(), props, leaves, out)?;
-                    self.get_arrow_column_writer(f[1].data_type(), props, leaves, out)?
+                    self.get_arrow_column_writer(f[0].data_type(), props, leaves, out, select)?;
+                    self.get_arrow_column_writer(f[1].data_type(), props, leaves, out, select)?
                 }
                 _ => unreachable!("invalid map type"),
             },
@@ -1474,7 +1518,7 @@ impl ArrowColumnWriterFactory {
                 _ => out.push(col(leaves.next().unwrap())?),
             },
             ArrowDataType::RunEndEncoded(_, value_field) => {
-                self.get_arrow_column_writer(value_field.data_type(), props, leaves, out)?
+                self.get_arrow_column_writer(value_field.data_type(), props, leaves, out, select)?
             }
             _ => {
                 return Err(ParquetError::NYI(format!(
@@ -6340,6 +6384,95 @@ mod tests {
                 .unwrap();
             let read = arrow_select::concat::concat_batches(&batch.schema(), &read).unwrap();
             assert_eq!(read, batch);
+        }
+    }
+
+    /// A selected subset must line up with the schema's leaves, including
+    /// across a nested field that expands into several leaves, and the chunks
+    /// it produces must be indistinguishable from writing every column.
+    #[test]
+    fn create_selected_column_writers_aligns_with_leaves() {
+        let ints: ArrayRef = Arc::new(Int32Array::from_iter_values(0..64));
+        let inner_a: ArrayRef = Arc::new(Int32Array::from_iter_values((0..64).map(|i| i * 2)));
+        let inner_b: ArrayRef = Arc::new(StringArray::from_iter_values(
+            (0..64).map(|i| format!("s{i}")),
+        ));
+        let structs: ArrayRef = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(Field::new("a", ArrowDataType::Int32, false)),
+                inner_a,
+            ),
+            (
+                Arc::new(Field::new("b", ArrowDataType::Utf8, false)),
+                inner_b,
+            ),
+        ]));
+        let tail: ArrayRef = Arc::new(StringArray::from_iter_values(
+            (0..64).map(|i| format!("t{}", i % 4)),
+        ));
+        let batch = RecordBatch::try_from_iter([("i", ints), ("s", structs), ("t", tail)]).unwrap();
+
+        let schema = batch.schema();
+        let props = Arc::new(WriterProperties::builder().build());
+        let parquet_schema = ArrowSchemaConverter::new().convert(&schema).unwrap();
+        let mut buf = Vec::with_capacity(1024);
+        let writer =
+            SerializedFileWriter::new(&mut buf, parquet_schema.root_schema_ptr(), props.clone())
+                .unwrap();
+        let factory = ArrowRowGroupWriterFactory::new(&writer, Arc::clone(&schema));
+
+        // Four leaves: i, s.a, s.b, t. Select the two on either side of the
+        // struct's leaves.
+        assert_eq!(parquet_schema.num_columns(), 4);
+        let wanted = [0usize, 3];
+        let writers = factory
+            .create_selected_column_writers(0, &props, |leaf| wanted.contains(&leaf))
+            .unwrap();
+
+        assert_eq!(writers.len(), 4);
+        let present: Vec<usize> = writers
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(present, wanted);
+
+        // The selected writers accept their own leaves and produce chunks
+        // identical to the ones the all-columns call produces.
+        let all = factory
+            .create_selected_column_writers(0, &props, |_| true)
+            .unwrap();
+        assert_eq!(all.len(), 4);
+
+        let mut selected = writers;
+        let mut all = all;
+        let mut leaf_idx = 0usize;
+        for (field, column) in schema.fields().iter().zip(batch.columns()) {
+            for leaf in compute_leaves(field.as_ref(), column).unwrap() {
+                if let Some(writer) = selected[leaf_idx].as_mut() {
+                    writer.write(&leaf).unwrap();
+                }
+                all[leaf_idx].as_mut().unwrap().write(&leaf).unwrap();
+                leaf_idx += 1;
+            }
+        }
+
+        for (idx, writer) in selected.into_iter().enumerate() {
+            let Some(writer) = writer else {
+                assert!(!wanted.contains(&idx));
+                continue;
+            };
+            let ours_chunk = writer.close().unwrap();
+            let ours = ours_chunk.close();
+            let theirs_chunk = all[idx].take().unwrap().close().unwrap();
+            let theirs = theirs_chunk.close();
+            assert_eq!(
+                ours.metadata.compressed_size(),
+                theirs.metadata.compressed_size(),
+                "selected leaf {idx} encoded differently from the all-columns writer"
+            );
+            assert_eq!(ours.metadata.num_values(), theirs.metadata.num_values());
         }
     }
 
