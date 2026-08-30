@@ -77,8 +77,8 @@ dozen lines per page plus the bookkeeping to keep the pacer and the pinned
 candidates straight. In the collapsed shape it is: build a `Vec<Candidate>`,
 call `encode_page`, `min_by_key` on `compressed_len`, `append`. The
 `advanced_page_writer` example's *entire* policy engine — race-then-settle,
-dictionary watching, cross-row-group learning and adapt-per-page — is under 200
-lines of decision logic (see the accounting section).
+dictionary watching with honest cost accounting, and cross-row-group learning —
+is under 200 lines of decision logic (see the accounting section).
 
 What did **not** change is the four invariants, which are the actual contract:
 
@@ -159,9 +159,13 @@ Concretely, in `ColumnChunkBuilder::pace`:
    builder — **before the page is sealed, and regardless of whether the page is
    ever appended.**
 
-Every other candidate is constructed by `ColumnValueEncoder::try_new_page_candidate`,
-which strips the bloom filter, the geo accumulator and the dictionary. A pinned
-candidate has no chunk-level state at all and cannot contribute to any.
+Every other candidate is built by the ordinary `ColumnValueEncoder::try_new`
+and then has its value-fed accumulators taken away and dropped by
+`candidate_writer`, using the same `take_value_accumulators` hook. Its own
+dictionary needs no stripping: it is overwritten immediately, either by the
+chunk's (`install_dictionary`) or by nothing (`pin_encoding` drops it). A pinned
+candidate therefore has no chunk-level state at all and cannot contribute to
+any.
 
 At `close`, the accumulators are installed back into the *real* writer's encoder
 just before `GenericColumnWriter::close`, so `flush_bloom_filter` and
@@ -194,8 +198,9 @@ performance cost and a correctness hazard far larger than the one it removes.
 The mitigations are that the lend is confined to one method with no `?` between
 the take and the return (the inner loop is a closure whose result is checked
 only *after* the accumulators are given back, so an encoding error cannot strand
-them), and that `try_new_page_candidate` makes "candidate encoders own no chunk
-state" a property of construction rather than of discipline.
+them), and that `candidate_writer` is the single place a candidate is built, so
+"candidate encoders own no chunk state" holds at one site rather than by
+discipline spread across the module.
 
 **`ValueAccumulators` names two unrelated things.** Bloom filters and
 geospatial statistics have nothing in common except *when* they need to be fed.
@@ -256,17 +261,25 @@ predicate the default path acts on, so the pacer *asks* rather than infers.
 
 ## Deferred flush, and not regressing the hot path
 
-Two booleans were added to `GenericColumnWriter`:
+One field was added to `GenericColumnWriter`, a `PageBoundaryAction` with three
+variants:
 
-* `defer_page_flush` — never flush a page or fall back from the dictionary on
-  its own. Checked once per mini-batch, at the *end* of `write_mini_batch`,
-  where a `should_add_data_page()` call already lived.
-* `stop_at_page_boundary` — additionally *stop* the write loop at the boundary
-  rather than merely declining to act on it. This is the pacer/non-pacer
-  distinction: the pacer stops where its budget says, the candidates handed its
-  span must encode all of it.
+* `Flush` — the default, and the only value the ordinary write path ever holds:
+  flush the page, and fall back from the dictionary if that is due. Checked once
+  per mini-batch, at the *end* of `write_mini_batch`, where a
+  `should_add_data_page()` call already lived.
+* `Stop` — stop the write loop at the boundary and report how many levels were
+  consumed. This is the pacer.
+* `Continue` — keep encoding and never flush. This is a candidate handed the
+  span the pacer chose; it must encode all of it.
 
-Both default to `false` and the default path takes one extra, perfectly
+An earlier revision spelled this as two booleans, `defer_page_flush` and
+`stop_at_page_boundary`, where the second was meaningless without the first and
+the setter enforced that by hand. The enum makes the fourth state
+unrepresentable and replaces twenty lines of doc comment keeping the pair
+straight.
+
+The field defaults to `Flush` and the default path takes one extra, perfectly
 predictable, not-taken branch per mini-batch — that is, once per ~1 024 values,
 not once per value. No per-value code changed.
 
@@ -275,15 +288,13 @@ not once per value. No per-value code changed.
 regress the `string` and `string_and_binary_view` arrow-writer benchmarks by
 5-9%. That note was taken seriously: the new `DynDictionary` trait,
 `ValueAccumulators` and the `DictEncoder` impl are placed *above* the trait,
-which is the position the comment warns about. The new trait methods
-(`try_new_page_candidate`, `pin_encoding`, the four lend/return hooks) are all
-appended at the *end* of the trait and the end of each impl, and none of them is
-called on any default-path code path. To respect it, every
+which is the position the comment warns about. To respect it, every
 page-grain addition to that module — the `DynDictionary` trait and its
 `DictEncoder` impl, `ValueAccumulators` — is placed at the *end* of the module,
 below the hot encoder code, with a comment pointing back at the original note.
-The six new trait methods are appended at the end of the trait and of each impl,
-and none is reachable from the default write path. This is the right shape by
+The five new trait methods (`pin_encoding` and the four lend/return hooks) are
+appended at the end of the trait and of each impl, and none is reachable from
+the default write path. This is the right shape by
 the module's own documented rule, but it has not been benchmarked here; it
 should be measured before upstreaming rather than assumed.
 
@@ -299,33 +310,36 @@ byte-identity result.
 
 ## What it buys
 
-`cargo run --release --features arrow --example advanced_page_writer`, 2 000 000
-rows per dataset, 250 000 rows per row group, identical `WriterProperties` for
-both writers. "Baseline" is plain `ArrowWriter`. Every file is read back and
-checked for exact row equality.
+The full measured comparison lives in `BAKEOFF.md`: five datasets, two
+compression codecs, four writers, every file read back and checked for exact row
+equality, and every number regenerated by
+`cargo run --release --features "arrow snap zstd" --example bakeoff`. Option A
+in that report is this API.
 
-| dataset | adaptive | baseline | bytes | time | landed on |
-| --- | --- | --- | --- | --- | --- |
-| low-cardinality strings | 1.5 MiB | 1.5 MiB | +0.1% | 1.16x | `RLE_DICTIONARY` x122 |
-| high-cardinality int64 timestamps | 2.9 MiB | 17.3 MiB | **-83.2%** | 0.39x | `DELTA_BINARY_PACKED` x122 |
-| f64 values | 15.6 MiB | 17.3 MiB | -10.2% | 0.43x | `PLAIN` x114, `RLE_DICTIONARY` x8 |
-| strings changing character mid-file | 17.0 MiB | 27.6 MiB | **-38.4%** | 1.35x | `RLE_DICTIONARY` x64, `DELTA_BYTE_ARRAY` x58 |
+The `advanced_page_writer` example runs one of those datasets on its own, at
+2 000 000 rows, 250 000 rows per row group and identical `WriterProperties` for
+both writers:
 
-Read this as four different things going right rather than as a benchmark:
+| dataset | adaptive | baseline | bytes | landed on |
+| --- | --- | --- | --- | --- |
+| strings changing character mid-file | 17.0 MiB | 29.3 MiB | **-41.9%** | `RLE_DICTIONARY` x64, `DELTA_BYTE_ARRAY` x58 |
 
-* The low-cardinality column is the control. The default writer's choice is
-  already correct, the adaptive writer races four pages, agrees, and settles —
-  and the +0.1% is the residue of racing before settling. Costing 0.1% to
-  confirm a decision is the price of the mechanism.
+That is the dataset chosen for the example because it is the one that cannot be
+expressed at all without the page grain: it needs two different encodings
+*within one file*, chosen at the point the data changes, and the writer finds
+the switch on its own. The other three show three other things going right, and
+are in the bakeoff:
+
+* Low-cardinality strings are the control. The default writer's choice is
+  already correct, the adaptive writer races, agrees, and settles — and the
+  fraction of a percent it gives up is the residue of racing before settling.
+  Costing 0.1% to confirm a decision is the price of the mechanism.
 * The timestamp column is where a default is simply wrong for the data: the
-  dictionary overflows, the writer falls back to `PLAIN`, and delta would have
-  been 6x smaller. It is also *faster*, because racing four pages is much
-  cheaper than plain-encoding 15 MiB it did not need to write.
-* The f64 column never races at all — it is the adapt-per-page column, deciding
-  from the previous sealed page's compression ratio — and still finds 10%.
-* The last column is the one that cannot be expressed at all without the page
-  grain: it needs two different encodings *within one file*, chosen at the point
-  the data changes, and it finds the switch on its own.
+  dictionary overflows, the writer falls back to `PLAIN`, and delta is far
+  smaller. It is also *faster*, because racing a few pages is much cheaper than
+  plain-encoding megabytes it did not need to write.
+* The f64 column has nothing to find beyond leaving the dictionary, and the
+  point is that it stops paying to look.
 
 ## Where the boundary may still be drawn wrong
 
@@ -373,54 +387,59 @@ Measured with `git diff --stat` against the branch point (`2567a32`).
 
 | | files | added | removed |
 | --- | --- | --- | --- |
-| **Library total** | 5 | 2 071 | 79 |
-| — new `page_grain` module, excluding its tests | 1 | 1 020 | 0 |
+| **Library total** | 5 | 1 977 | 78 |
+| — new `page_grain` module, excluding its tests | 1 | 978 | 0 |
 | — `page_grain` tests | 1 | 470 | 0 |
-| — refactor of existing files | 4 | 581 | 79 |
-| **Example (harness)** | 1 | 691 | 0 |
+| — refactor of existing files | 4 | 529 | 78 |
+| **Example (harness)** | 1 | 508 | 0 |
 | Cargo wiring | 1 | 5 | 0 |
 | This document | 1 | 402 | 0 |
 
-Refactor of existing files, broken down: `column/writer/mod.rs` +309/-57 (the
-assemble/commit split, deferred flush, the new accessors),
-`column/writer/encoder.rs` +164 (`DynDictionary`, `ValueAccumulators`, six trait
-methods with defaults, the `DictEncoder` impls),
-`arrow_writer/byte_array.rs` +74/-1 (the same hooks for the byte-array encoder),
+Refactor of existing files, broken down: `column/writer/mod.rs` +306/-56 (the
+assemble/commit split, `PageBoundaryAction`, the new accessors),
+`column/writer/encoder.rs` +133 (`DynDictionary`, `ValueAccumulators`, five
+trait methods with defaults, the `DictEncoder` impl),
+`arrow_writer/byte_array.rs` +56/-1 (the same hooks for the byte-array encoder),
 `arrow_writer/mod.rs` +34/-21 (`write_levels` extracted so page-grain and
-`ArrowColumnWriter` share one write path), `dict_encoder.rs` +9
-(`clear_pending`).
+`ArrowColumnWriter` share one write path).
 
-The ratio worth reading is that ~1 000 of the ~2 100 library lines are one new
+The ratio worth reading is that ~1 000 of the ~2 000 library lines are one new
 module and none of the existing hot code was rewritten — the largest single
 change to an existing file is a mechanical split of one function into two.
 
-Of the example's 691 lines, roughly 250 are deterministic data generation,
+Of the example's 508 lines, roughly 300 are deterministic data generation,
 baseline comparison, round-trip verification and printing. The actual encoding
 policy — race-then-settle, dictionary watching with honest cost accounting,
-cross-row-group learning, adapt-per-page, and the winner-picking rule — is about
-190 lines. That is the number to read as "what a harness costs".
+cross-row-group learning, and the winner-picking rule — is about 190 lines. That
+is the number to read as "what a harness costs".
 
 ### Public items added
 
 All under `parquet::arrow::arrow_writer::page_grain`:
 
-- `ColumnChunkBuilder`, with `new`, `new_with_page_store`, `descr`,
-  `pages_appended`, `dictionary`, `cursor`, `encode_page`, `append`, `close`
-- `LeafCursor`, with `is_empty`, `levels_remaining`, `values_remaining`
+- `ColumnChunkBuilder`, with `new`, `new_with_page_store`, `dictionary`,
+  `cursor`, `encode_page`, `append`, `close`
+- `LeafCursor`, with `is_empty`, `levels_remaining`
 - `Candidate` (`Dictionary`, `Pinned(Encoding)`)
-- `EncodedPage`, with `encoding`, `num_values`, `num_rows`, `null_count`,
-  `compressed_len`, `uncompressed_len`, `min_bytes`, `max_bytes`,
-  `variable_length_bytes`, `is_dictionary_indices`
+- `EncodedPage`, with `encoding`, `num_values`, `num_rows`, `compressed_len`,
+  `uncompressed_len`, `is_dictionary_indices`
 - `DictionaryView`, with `entries`, `encoded_bytes`, `values_written`
 
-Crate-internal additions: `PreparedDataPage`, `DynDictionary`,
-`ValueAccumulators`, and on `GenericColumnWriter` the methods
+That is 23 public items. An earlier revision exposed 30; the seven removed
+(`descr`, `pages_appended`, `values_remaining`, `null_count`, `min_bytes`,
+`max_bytes`, `variable_length_bytes`) had no consumer in the library, its tests
+or any harness, and dropping the last four also removed two `Vec<u8>` copies per
+assembled candidate page.
+
+Crate-internal additions: `PreparedDataPage`, `PageBoundaryAction`,
+`DynDictionary`, `ValueAccumulators`, and on `GenericColumnWriter` the methods
 `new_with_encoder`, `assemble_data_page`, `commit_data_page`,
-`write_dictionary_page_data`, `write_batch_inner`, `set_defer_page_flush`,
-`page_boundary_reached`, `encoder_mut`. On `ColumnValueEncoder`:
-`try_new_page_candidate`, `pin_encoding`, `take_dictionary`,
-`install_dictionary`, `take_value_accumulators`, `install_value_accumulators` —
-all with defaults, so the public trait is not a breaking change.
+`write_dictionary_page_data`, `write_batch_inner`, `set_page_boundary_action`,
+`page_boundary_reached`, `encoder_mut`. On `ColumnValueEncoder`: `pin_encoding`,
+`take_dictionary`, `install_dictionary`, `take_value_accumulators`,
+`install_value_accumulators` — all with defaults, so Option A on its own is not
+a breaking change to the public trait. (Option B's
+`fall_back_from_dictionary` has no default, so the merged branch is.)
 
 ### Harder than the sketch implied
 
@@ -436,7 +455,7 @@ and `write` look symmetric. They are not: `fill` must stop at its budget and
 `write` must ignore its own budget entirely and consume everything. Running both
 in the same deferred mode produced candidates that silently encoded *fewer* rows
 than the span, which showed up as a `debug_assert` and would otherwise have been
-a wrong file. That is the `stop_at_page_boundary` flag.
+a wrong file. That is `PageBoundaryAction::Stop` versus `Continue`.
 
 **Byte-identity is a much sharper test than it sounds.** Two attempts produced
 files with identical column-chunk sizes, identical offsets and identical

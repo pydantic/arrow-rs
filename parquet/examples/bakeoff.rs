@@ -2045,7 +2045,6 @@ fn write_report(table: &str) -> Result<()> {
     // whatever the working directory of the run.
     let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let harness_a = count_lines(&crate_dir.join("examples/advanced_page_writer.rs"));
-    let harness_b = count_lines(&crate_dir.join("examples/advanced_racing_writer.rs"));
     let bakeoff = count_lines(&crate_dir.join("examples/bakeoff.rs"));
 
     let body = format!(
@@ -2205,32 +2204,41 @@ Library cost, from each option's design document.
 
 | | Option A (page-grain) | Option B (merged bespoke APIs) |
 | --- | ---: | ---: |
-| Library production lines added | ~1 601 | 374 |
+| Library production lines added | 1 507 | 374 |
 | Library test lines added | 470 | 623 |
-| Library lines removed or rewritten | 79 | 109 |
+| Library lines removed or rewritten | 78 | 109 |
 | Files touched in the library | 5 | 6 |
 
-Option A's figure is its 2 071 added library lines less its 470 lines of module
-tests; ~1 020 of those are one new self-contained module (`page_grain`), and the
+Option A's figure is its 1 977 added library lines less its 470 lines of module
+tests; 978 of those are one new self-contained module (`page_grain`), and the
 largest change to an existing file is a mechanical split of `write_data_page`
 into `assemble_data_page` and `commit_data_page`. Option B adds no new module:
 its 374 lines are spread over the properties type, the column writer's
 dictionary fallback, and the encoders.
 
+These are the figures after the simplification pass described in
+`PAGE_API_DESIGN.md`. Option A entered that pass at 1 601 production lines and
+30 public items in `page_grain`, and leaves it at 1 507 and 23; Option B was
+untouched, since it is a faithful port of apache/arrow-rs#10775 and #10777.
+Every byte count in this report is identical before and after.
+
 Harness cost, counted from the files in this repository:
 
 | Harness | Lines |
 | --- | ---: |
-| `examples/advanced_page_writer.rs` (Option A) | {harness_a} |
-| `examples/advanced_racing_writer.rs` (Option B) | {harness_b} |
-| `examples/bakeoff.rs` (both, plus baseline, datasets and reporting) | {bakeoff} |
+| `examples/advanced_page_writer.rs` (minimal page-grain harness) | {harness_a} |
+| `examples/bakeoff.rs` (all four writers, datasets and reporting) | {bakeoff} |
 
-`PAGE_API_DESIGN.md` puts Option A's actual policy logic at about 190 of its 691
-example lines, with the rest being data generation, verification and printing.
-`MERGED_API_DESIGN.md` does not separate the two for Option B and reports the
-whole 837 lines as consumer cost; the corresponding policy core in
-`advanced_racing_writer.rs` is the candidate type, the leaf state and the race
-loop.
+The two standalone policy harnesses that used to sit beside `bakeoff.rs`
+(`advanced_page_writer.rs` at 712 lines and `advanced_racing_writer.rs` at 837)
+each carried their own copy of the datasets and of a policy engine that also
+lives in `bakeoff.rs`, and the duplication had already drifted once.
+`advanced_racing_writer.rs` is gone: Option B's consumer surface is the single
+method `create_column_writers_with_properties`, exercised here and covered by a
+unit test. `advanced_page_writer.rs` was cut back to the one job no other file
+does, showing how to write a page-grain harness; its policy core is about 190
+of its {harness_a} lines, the rest being one dataset, verification and
+printing.
 
 {interpretation}
 "#,

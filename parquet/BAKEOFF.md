@@ -109,55 +109,55 @@ into an option's result would overstate or understate that option.
 dataset                            compression  writer                     bytes     size       median s  vanilla base  vs vanilla  vs branch base  time vs branch
 ---------------------------------  -----------  -------------------------  --------  ---------  --------  ------------  ----------  --------------  --------------
 low-cardinality strings            none         vanilla main (reference)   1536969   1.47 MiB   -         1536969       +0.00%      +0.00%          -
-low-cardinality strings            none         baseline (branch default)  1536969   1.47 MiB   0.076     1536969       +0.00%      +0.00%          1.00x
-low-cardinality strings            none         option A (page-grain)      1541448   1.47 MiB   0.090     1536969       +0.29%      +0.29%          1.18x
-low-cardinality strings            none         option B (K writers)       1536969   1.47 MiB   0.220     1536969       +0.00%      +0.00%          2.90x
-low-cardinality strings            none         option C (hybrid)          1538087   1.47 MiB   0.087     1536969       +0.07%      +0.07%          1.14x
+low-cardinality strings            none         baseline (branch default)  1536969   1.47 MiB   0.060     1536969       +0.00%      +0.00%          1.00x
+low-cardinality strings            none         option A (page-grain)      1541448   1.47 MiB   0.072     1536969       +0.29%      +0.29%          1.21x
+low-cardinality strings            none         option B (K writers)       1536969   1.47 MiB   0.178     1536969       +0.00%      +0.00%          2.99x
+low-cardinality strings            none         option C (hybrid)          1538087   1.47 MiB   0.070     1536969       +0.07%      +0.07%          1.17x
 low-cardinality strings            zstd         vanilla main (reference)   1520065   1.45 MiB   -         1520065       +0.00%      +0.00%          -
-low-cardinality strings            zstd         baseline (branch default)  1520065   1.45 MiB   0.077     1520065       +0.00%      +0.00%          1.00x
-low-cardinality strings            zstd         option A (page-grain)      1525144   1.45 MiB   0.112     1520065       +0.33%      +0.33%          1.46x
-low-cardinality strings            zstd         option B (K writers)       1520065   1.45 MiB   0.271     1520065       +0.00%      +0.00%          3.53x
-low-cardinality strings            zstd         option C (hybrid)          1521333   1.45 MiB   0.107     1520065       +0.08%      +0.08%          1.40x
+low-cardinality strings            zstd         baseline (branch default)  1520065   1.45 MiB   0.063     1520065       +0.00%      +0.00%          1.00x
+low-cardinality strings            zstd         option A (page-grain)      1525144   1.45 MiB   0.095     1520065       +0.33%      +0.33%          1.51x
+low-cardinality strings            zstd         option B (K writers)       1520065   1.45 MiB   0.205     1520065       +0.00%      +0.00%          3.26x
+low-cardinality strings            zstd         option C (hybrid)          1521333   1.45 MiB   0.087     1520065       +0.08%      +0.08%          1.38x
 high-cardinality int64 timestamps  none         vanilla main (reference)   20052805  19.12 MiB  -         20052805      +0.00%      +0.00%          -
-high-cardinality int64 timestamps  none         baseline (branch default)  20052805  19.12 MiB  0.126     20052805      +0.00%      +0.00%          1.00x
-high-cardinality int64 timestamps  none         option A (page-grain)      3055851   2.91 MiB   0.033     20052805      -84.76%     -84.76%         0.26x
-high-cardinality int64 timestamps  none         option B (K writers)       3052129   2.91 MiB   0.061     20052805      -84.78%     -84.78%         0.49x
-high-cardinality int64 timestamps  none         option C (hybrid)          3053063   2.91 MiB   0.030     20052805      -84.77%     -84.77%         0.24x
+high-cardinality int64 timestamps  none         baseline (branch default)  20052805  19.12 MiB  0.095     20052805      +0.00%      +0.00%          1.00x
+high-cardinality int64 timestamps  none         option A (page-grain)      3055851   2.91 MiB   0.028     20052805      -84.76%     -84.76%         0.30x
+high-cardinality int64 timestamps  none         option B (K writers)       3052129   2.91 MiB   0.054     20052805      -84.78%     -84.78%         0.57x
+high-cardinality int64 timestamps  none         option C (hybrid)          3053063   2.91 MiB   0.026     20052805      -84.77%     -84.77%         0.27x
 high-cardinality int64 timestamps  zstd         vanilla main (reference)   8154384   7.78 MiB   -         8154384       +0.00%      +0.00%          -
-high-cardinality int64 timestamps  zstd         baseline (branch default)  8154384   7.78 MiB   0.188     8154384       +0.00%      +0.00%          1.00x
-high-cardinality int64 timestamps  zstd         option A (page-grain)      3057451   2.92 MiB   0.055     8154384       -62.51%     -62.51%         0.29x
-high-cardinality int64 timestamps  zstd         option B (K writers)       3053129   2.91 MiB   0.099     8154384       -62.56%     -62.56%         0.52x
-high-cardinality int64 timestamps  zstd         option C (hybrid)          3054213   2.91 MiB   0.045     8154384       -62.55%     -62.55%         0.24x
+high-cardinality int64 timestamps  zstd         baseline (branch default)  8154384   7.78 MiB   0.166     8154384       +0.00%      +0.00%          1.00x
+high-cardinality int64 timestamps  zstd         option A (page-grain)      3057451   2.92 MiB   0.047     8154384       -62.51%     -62.51%         0.29x
+high-cardinality int64 timestamps  zstd         option B (K writers)       3053129   2.91 MiB   0.089     8154384       -62.56%     -62.56%         0.54x
+high-cardinality int64 timestamps  zstd         option C (hybrid)          3054213   2.91 MiB   0.039     8154384       -62.55%     -62.55%         0.24x
 f64 measurements                   none         vanilla main (reference)   20056464  19.13 MiB  -         20056464      +0.00%      +0.00%          -
-f64 measurements                   none         baseline (branch default)  20056464  19.13 MiB  0.144     20056464      +0.00%      +0.00%          1.00x
-f64 measurements                   none         option A (page-grain)      16011997  15.27 MiB  0.027     20056464      -20.17%     -20.17%         0.19x
-f64 measurements                   none         option B (K writers)       16008601  15.27 MiB  0.033     20056464      -20.18%     -20.18%         0.23x
-f64 measurements                   none         option C (hybrid)          16011997  15.27 MiB  0.027     20056464      -20.17%     -20.17%         0.18x
+f64 measurements                   none         baseline (branch default)  20056464  19.13 MiB  0.100     20056464      +0.00%      +0.00%          1.00x
+f64 measurements                   none         option A (page-grain)      16011997  15.27 MiB  0.025     20056464      -20.17%     -20.17%         0.25x
+f64 measurements                   none         option B (K writers)       16008601  15.27 MiB  0.027     20056464      -20.18%     -20.18%         0.27x
+f64 measurements                   none         option C (hybrid)          16011997  15.27 MiB  0.019     20056464      -20.17%     -20.17%         0.19x
 f64 measurements                   zstd         vanilla main (reference)   18937240  18.06 MiB  -         18937240      +0.00%      +0.00%          -
-f64 measurements                   zstd         baseline (branch default)  18937240  18.06 MiB  0.186     18937240      +0.00%      +0.00%          1.00x
-f64 measurements                   zstd         option A (page-grain)      15055550  14.36 MiB  0.067     18937240      -20.50%     -20.50%         0.36x
-f64 measurements                   zstd         option B (K writers)       15051897  14.35 MiB  0.112     18937240      -20.52%     -20.52%         0.60x
-f64 measurements                   zstd         option C (hybrid)          15055550  14.36 MiB  0.061     18937240      -20.50%     -20.50%         0.33x
+f64 measurements                   zstd         baseline (branch default)  18937240  18.06 MiB  0.137     18937240      +0.00%      +0.00%          1.00x
+f64 measurements                   zstd         option A (page-grain)      15055550  14.36 MiB  0.063     18937240      -20.50%     -20.50%         0.46x
+f64 measurements                   zstd         option B (K writers)       15051897  14.35 MiB  0.086     18937240      -20.52%     -20.52%         0.62x
+f64 measurements                   zstd         option C (hybrid)          15055550  14.36 MiB  0.053     18937240      -20.50%     -20.50%         0.39x
 shifting strings                   none         vanilla main (reference)   29367978  28.01 MiB  -         29367978      +0.00%      -13.06%         -
-shifting strings                   none         baseline (branch default)  33778798  32.21 MiB  0.118     29367978      +15.02%     +0.00%          1.00x
-shifting strings                   none         option A (page-grain)      18402571  17.55 MiB  0.120     29367978      -37.34%     -45.52%         1.02x
-shifting strings                   none         option B (K writers)       24051914  22.94 MiB  0.247     29367978      -18.10%     -28.80%         2.09x
-shifting strings                   none         option C (hybrid)          19462064  18.56 MiB  0.102     29367978      -33.73%     -42.38%         0.86x
+shifting strings                   none         baseline (branch default)  33778798  32.21 MiB  0.090     29367978      +15.02%     +0.00%          1.00x
+shifting strings                   none         option A (page-grain)      18402571  17.55 MiB  0.094     29367978      -37.34%     -45.52%         1.05x
+shifting strings                   none         option B (K writers)       24051914  22.94 MiB  0.192     29367978      -18.10%     -28.80%         2.15x
+shifting strings                   none         option C (hybrid)          19462064  18.56 MiB  0.081     29367978      -33.73%     -42.38%         0.90x
 shifting strings                   zstd         vanilla main (reference)   10028648  9.56 MiB   -         10028648      +0.00%      -10.31%         -
-shifting strings                   zstd         baseline (branch default)  11181834  10.66 MiB  0.201     10028648      +11.50%     +0.00%          1.00x
-shifting strings                   zstd         option A (page-grain)      9556747   9.11 MiB   0.196     10028648      -4.71%      -14.53%         0.98x
-shifting strings                   zstd         option B (K writers)       9249872   8.82 MiB   0.490     10028648      -7.77%      -17.28%         2.44x
-shifting strings                   zstd         option C (hybrid)          9326743   8.89 MiB   0.171     10028648      -7.00%      -16.59%         0.85x
+shifting strings                   zstd         baseline (branch default)  11181834  10.66 MiB  0.159     10028648      +11.50%     +0.00%          1.00x
+shifting strings                   zstd         option A (page-grain)      9556747   9.11 MiB   0.157     10028648      -4.71%      -14.53%         0.99x
+shifting strings                   zstd         option B (K writers)       9249872   8.82 MiB   0.377     10028648      -7.77%      -17.28%         2.38x
+shifting strings                   zstd         option C (hybrid)          9326743   8.89 MiB   0.142     10028648      -7.00%      -16.59%         0.89x
 records-like mixed schema          none         vanilla main (reference)   79708639  76.02 MiB  -         79708639      +0.00%      -3.57%          -
-records-like mixed schema          none         baseline (branch default)  82658499  78.83 MiB  0.612     79708639      +3.70%      +0.00%          1.00x
-records-like mixed schema          none         option A (page-grain)      39727327  37.89 MiB  0.334     79708639      -50.16%     -51.94%         0.55x
-records-like mixed schema          none         option B (K writers)       49599377  47.30 MiB  0.761     79708639      -37.77%     -39.99%         1.24x
-records-like mixed schema          none         option C (hybrid)          41818014  39.88 MiB  0.288     79708639      -47.54%     -49.41%         0.47x
+records-like mixed schema          none         baseline (branch default)  82658499  78.83 MiB  0.422     79708639      +3.70%      +0.00%          1.00x
+records-like mixed schema          none         option A (page-grain)      39727327  37.89 MiB  0.272     79708639      -50.16%     -51.94%         0.65x
+records-like mixed schema          none         option B (K writers)       49599377  47.30 MiB  0.604     79708639      -37.77%     -39.99%         1.43x
+records-like mixed schema          none         option C (hybrid)          41818014  39.88 MiB  0.236     79708639      -47.54%     -49.41%         0.56x
 records-like mixed schema          zstd         vanilla main (reference)   39049927  37.24 MiB  -         39049927      +0.00%      -1.49%          -
-records-like mixed schema          zstd         baseline (branch default)  39639949  37.80 MiB  0.756     39049927      +1.51%      +0.00%          1.00x
-records-like mixed schema          zstd         option A (page-grain)      29318340  27.96 MiB  0.522     39049927      -24.92%     -26.04%         0.69x
-records-like mixed schema          zstd         option B (K writers)       28964375  27.62 MiB  1.218     39049927      -25.83%     -26.93%         1.61x
-records-like mixed schema          zstd         option C (hybrid)          29026477  27.68 MiB  0.447     39049927      -25.67%     -26.77%         0.59x
+records-like mixed schema          zstd         baseline (branch default)  39639949  37.80 MiB  0.521     39049927      +1.51%      +0.00%          1.00x
+records-like mixed schema          zstd         option A (page-grain)      29318340  27.96 MiB  0.418     39049927      -24.92%     -26.04%         0.80x
+records-like mixed schema          zstd         option B (K writers)       28964375  27.62 MiB  0.925     39049927      -25.83%     -26.93%         1.78x
+records-like mixed schema          zstd         option C (hybrid)          29026477  27.68 MiB  0.374     39049927      -25.67%     -26.77%         0.72x
 ```
 
 ## What separates the two baselines
@@ -206,32 +206,41 @@ Library cost, from each option's design document.
 
 | | Option A (page-grain) | Option B (merged bespoke APIs) |
 | --- | ---: | ---: |
-| Library production lines added | ~1 601 | 374 |
+| Library production lines added | 1 507 | 374 |
 | Library test lines added | 470 | 623 |
-| Library lines removed or rewritten | 79 | 109 |
+| Library lines removed or rewritten | 78 | 109 |
 | Files touched in the library | 5 | 6 |
 
-Option A's figure is its 2 071 added library lines less its 470 lines of module
-tests; ~1 020 of those are one new self-contained module (`page_grain`), and the
+Option A's figure is its 1 977 added library lines less its 470 lines of module
+tests; 978 of those are one new self-contained module (`page_grain`), and the
 largest change to an existing file is a mechanical split of `write_data_page`
 into `assemble_data_page` and `commit_data_page`. Option B adds no new module:
 its 374 lines are spread over the properties type, the column writer's
 dictionary fallback, and the encoders.
 
+These are the figures after the simplification pass described in
+`PAGE_API_DESIGN.md`. Option A entered that pass at 1 601 production lines and
+30 public items in `page_grain`, and leaves it at 1 507 and 23; Option B was
+untouched, since it is a faithful port of apache/arrow-rs#10775 and #10777.
+Every byte count in this report is identical before and after.
+
 Harness cost, counted from the files in this repository:
 
 | Harness | Lines |
 | --- | ---: |
-| `examples/advanced_page_writer.rs` (Option A) | 712 |
-| `examples/advanced_racing_writer.rs` (Option B) | 837 |
-| `examples/bakeoff.rs` (both, plus baseline, datasets and reporting) | 2473 |
+| `examples/advanced_page_writer.rs` (minimal page-grain harness) | 508 |
+| `examples/bakeoff.rs` (all four writers, datasets and reporting) | 2481 |
 
-`PAGE_API_DESIGN.md` puts Option A's actual policy logic at about 190 of its 691
-example lines, with the rest being data generation, verification and printing.
-`MERGED_API_DESIGN.md` does not separate the two for Option B and reports the
-whole 837 lines as consumer cost; the corresponding policy core in
-`advanced_racing_writer.rs` is the candidate type, the leaf state and the race
-loop.
+The two standalone policy harnesses that used to sit beside `bakeoff.rs`
+(`advanced_page_writer.rs` at 712 lines and `advanced_racing_writer.rs` at 837)
+each carried their own copy of the datasets and of a policy engine that also
+lives in `bakeoff.rs`, and the duplication had already drifted once.
+`advanced_racing_writer.rs` is gone: Option B's consumer surface is the single
+method `create_column_writers_with_properties`, exercised here and covered by a
+unit test. `advanced_page_writer.rs` was cut back to the one job no other file
+does, showing how to write a page-grain harness; its policy core is about 190
+of its 508 lines, the rest being one dataset, verification and
+printing.
 
 ## Interpretation
 

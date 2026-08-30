@@ -21,7 +21,7 @@ Four commits:
 | `67f282c` | `ArrowRowGroupWriterFactory::create_column_writers_with_properties` |
 | `d7e5758` | Port of apache/arrow-rs#10777, re-encode buffered values on dictionary fallback |
 | `ce4a031` | Port of apache/arrow-rs#10775, the `DictionaryFallback` policy |
-| `e9082e4` | `parquet/examples/advanced_racing_writer.rs` |
+| `e9082e4` | `parquet/examples/advanced_racing_writer.rs` (since removed, see below) |
 
 ### Public items added
 
@@ -141,16 +141,26 @@ module` plus `parquet/tests/`):
 | `arrow/arrow_writer/mod.rs` | 25 | 416 |
 | `tests/arrow_writer/layout.rs` | 0 | 38 |
 | **Library total** | **374** | **623** |
-| `examples/advanced_racing_writer.rs` | 837 | n/a |
 | `Cargo.toml` | 5 | n/a |
 
 109 library lines were deleted or rewritten, almost all of them the
 `should_dict_fallback` / `dict_fallback` / `flush_dict_page` bodies and the
-layout-test expectations the #10777 fix invalidates.
+layout-test expectations the #10777 fix invalidates. The library figures above
+are unchanged by the branch's later simplification pass, which touched only
+Option A: these three commits are faithful ports and are meant to stay that way.
 
-The ratio is the headline result for the bakeoff: **374 production lines in the
-library buy the capability; 837 lines in the example are what a consumer still
-writes for itself.**
+`examples/advanced_racing_writer.rs`, 837 lines, was the standalone harness for
+this option. It has since been deleted. It duplicated its datasets and its
+policy engine with `examples/bakeoff.rs`, whose Option B arm is the measured
+version of the same thing, and the duplication had already drifted once.
+Option B's consumer surface is a single method, exercised by the bakeoff and
+covered by the `create_column_writers_with_properties_matches_file_props` unit
+test.
+
+The ratio is still the headline result for the bakeoff: **374 production lines
+in the library buy the capability; 837 lines of harness are what a consumer
+still writes for itself.** That 837 is the measured size of the deleted example
+and is the number to read as Option B's consumer cost.
 
 ### What the example still has to implement itself
 
@@ -216,11 +226,13 @@ what the numbers below start to answer.
 
 ## Measurements
 
-`cargo run --release --example advanced_racing_writer`, 2,000,000 rows per
-dataset across 20 row groups of 100,000, SNAPPY, dictionary candidates using a
-64 KiB dictionary page size limit. The baseline is a stock `ArrowWriter` with
-default properties at the same row group size. Every file is read back and
-compared for exact row equality.
+Measured with `cargo run --release --example advanced_racing_writer` before
+that example was removed: 2,000,000 rows per dataset across 20 row groups of
+100,000, SNAPPY, dictionary candidates using a 64 KiB dictionary page size
+limit. The baseline is a stock `ArrowWriter` with default properties at the same
+row group size. Every file was read back and compared for exact row equality.
+The reproducible version of these numbers, at both SNAPPY and zstd and against
+the same datasets, is Option B in `BAKEOFF.md`.
 
 | Dataset | Baseline | Raced | Smaller by | Baseline time | Raced time |
 | --- | ---: | ---: | ---: | ---: | ---: |
