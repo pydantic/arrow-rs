@@ -569,11 +569,6 @@ impl<T: ParquetValueType> PreparedDataPage<T> {
     pub(crate) fn metrics_num_rows(&self) -> u32 {
         self.metrics.num_buffered_rows
     }
-
-    /// Number of nulls in the page.
-    pub(crate) fn metrics_null_count(&self) -> u64 {
-        self.metrics.num_page_nulls
-    }
 }
 
 impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {

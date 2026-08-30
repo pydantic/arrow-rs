@@ -172,7 +172,6 @@ pub struct LeafCursor {
     /// Entries of `non_null_indices` consumed so far.
     value_offset: usize,
     total_levels: usize,
-    total_values: usize,
     max_def_level: i16,
     /// Levels to hand the pacer per pacing step; see `ColumnChunkBuilder::pace`.
     window: usize,
@@ -187,11 +186,6 @@ impl LeafCursor {
     /// Levels (values plus nulls plus repeats) still to encode.
     pub fn levels_remaining(&self) -> usize {
         self.total_levels - self.level_offset
-    }
-
-    /// Non-null values still to encode.
-    pub fn values_remaining(&self) -> usize {
-        self.total_values - self.value_offset
     }
 
     /// Cut the next pacing window: at most `window` levels, extended forwards to
@@ -295,12 +289,8 @@ pub struct EncodedPage {
     encoding: Encoding,
     num_values: u32,
     num_rows: u32,
-    null_count: u64,
     compressed_len: usize,
     uncompressed_len: usize,
-    min_bytes: Option<Vec<u8>>,
-    max_bytes: Option<Vec<u8>>,
-    variable_length_bytes: Option<i64>,
 }
 
 impl std::fmt::Debug for EncodedPage {
@@ -309,7 +299,6 @@ impl std::fmt::Debug for EncodedPage {
             .field("encoding", &self.encoding)
             .field("num_values", &self.num_values)
             .field("num_rows", &self.num_rows)
-            .field("null_count", &self.null_count)
             .field("compressed_len", &self.compressed_len)
             .field("uncompressed_len", &self.uncompressed_len)
             .finish_non_exhaustive()
@@ -332,11 +321,6 @@ impl EncodedPage {
         self.num_rows
     }
 
-    /// Number of nulls in the page.
-    pub fn null_count(&self) -> u64 {
-        self.null_count
-    }
-
     /// Compressed size of the page body in bytes, excluding the page header.
     ///
     /// This is the number to compare candidates on: the page has actually been
@@ -348,22 +332,6 @@ impl EncodedPage {
     /// Uncompressed size of the page body in bytes, excluding the page header.
     pub fn uncompressed_len(&self) -> usize {
         self.uncompressed_len
-    }
-
-    /// This page's minimum value, in parquet's byte representation, if page
-    /// statistics are enabled and the page is not all-null.
-    pub fn min_bytes(&self) -> Option<&[u8]> {
-        self.min_bytes.as_deref()
-    }
-
-    /// This page's maximum value; see [`Self::min_bytes`].
-    pub fn max_bytes(&self) -> Option<&[u8]> {
-        self.max_bytes.as_deref()
-    }
-
-    /// Total unencoded byte-array bytes in this page, when tracked.
-    pub fn variable_length_bytes(&self) -> Option<i64> {
-        self.variable_length_bytes
     }
 
     /// Whether this page encodes indices into the chunk's dictionary.
@@ -505,16 +473,6 @@ impl ColumnChunkBuilder {
         })
     }
 
-    /// The column this chunk is for.
-    pub fn descr(&self) -> &ColumnDescPtr {
-        &self.descr
-    }
-
-    /// Number of pages appended so far.
-    pub fn pages_appended(&self) -> usize {
-        self.pages_appended
-    }
-
     /// The chunk's dictionary state, or `None` if the chunk has no dictionary
     /// (either it was never enabled, or a non-dictionary page has been appended
     /// and it has been dropped).
@@ -548,7 +506,6 @@ impl ColumnChunkBuilder {
             );
         LeafCursor {
             total_levels,
-            total_values: levels.non_null_indices().len(),
             levels,
             level_offset: 0,
             value_offset: 0,
@@ -983,31 +940,16 @@ impl EncodedPage {
     fn new(prepared: PreparedPage) -> Self {
         macro_rules! describe {
             ($p:expr) => {{
-                let stats = $p.index_statistics.as_ref();
                 (
                     $p.encoding(),
                     $p.metrics_num_values(),
                     $p.metrics_num_rows(),
-                    $p.metrics_null_count(),
                     $p.compressed_len(),
                     $p.uncompressed_len(),
-                    stats.and_then(|s| s.min_bytes_opt().map(|b| b.to_vec())),
-                    stats.and_then(|s| s.max_bytes_opt().map(|b| b.to_vec())),
-                    $p.variable_length_bytes,
                 )
             }};
         }
-        let (
-            encoding,
-            num_values,
-            num_rows,
-            null_count,
-            compressed_len,
-            uncompressed_len,
-            min_bytes,
-            max_bytes,
-            variable_length_bytes,
-        ) = match &prepared {
+        let (encoding, num_values, num_rows, compressed_len, uncompressed_len) = match &prepared {
             PreparedPage::Bool(p) => describe!(p),
             PreparedPage::Int32(p) => describe!(p),
             PreparedPage::Int64(p) => describe!(p),
@@ -1022,12 +964,8 @@ impl EncodedPage {
             encoding,
             num_values,
             num_rows,
-            null_count,
             compressed_len,
             uncompressed_len,
-            min_bytes,
-            max_bytes,
-            variable_length_bytes,
         }
     }
 }
