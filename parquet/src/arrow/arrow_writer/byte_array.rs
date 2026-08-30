@@ -715,14 +715,12 @@ impl ColumnValueEncoder for ByteArrayEncoder {
     fn take_value_accumulators(&mut self) -> ValueAccumulators {
         ValueAccumulators {
             bloom_filter: self.bloom_filter.take(),
-            bloom_filter_target_fpp: self.bloom_filter_target_fpp,
             geo_stats_accumulator: self.geo_stats_accumulator.take(),
         }
     }
 
     fn install_value_accumulators(&mut self, accumulators: ValueAccumulators) {
         self.bloom_filter = accumulators.bloom_filter;
-        self.bloom_filter_target_fpp = accumulators.bloom_filter_target_fpp;
         self.geo_stats_accumulator = accumulators.geo_stats_accumulator;
     }
 }

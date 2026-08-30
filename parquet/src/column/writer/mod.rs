@@ -541,7 +541,6 @@ pub(crate) struct PreparedDataPage<T: ParquetValueType> {
     pub(crate) variable_length_bytes: Option<i64>,
     pub(crate) min_value: Option<T>,
     pub(crate) max_value: Option<T>,
-    pub(crate) nan_count: Option<u64>,
 }
 
 impl<T: ParquetValueType> PreparedDataPage<T> {
@@ -1705,7 +1704,6 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             variable_length_bytes: values_data.variable_length_bytes,
             min_value: values_data.min_value,
             max_value: values_data.max_value,
-            nan_count: values_data.nan_count,
         })
     }
 
@@ -1726,12 +1724,13 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             variable_length_bytes,
             min_value,
             max_value,
-            nan_count,
         } = page;
 
         self.column_metrics.num_column_nulls += metrics.num_page_nulls;
 
-        if let Some(nan_count) = nan_count {
+        // `assemble_data_page` stored the page's NaN count into its metrics, so
+        // the page carries it exactly once.
+        if let Some(nan_count) = metrics.num_page_nans {
             *self.column_metrics.num_column_nans.get_or_insert(0) += nan_count;
         }
 
