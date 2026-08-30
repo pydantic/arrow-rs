@@ -2229,6 +2229,17 @@ Synthetic, both compressions:
 
 ### Interpretation
 
+Byte counts here are deterministic: every arm is asserted to produce identical
+output across its three runs, and the whole synthetic suite was measured twice
+with byte-identical results. Wall clock is less clean. Another process on this
+machine began a large build partway through the ClickBench measurements, so the
+times for the three `hits` files and for the floor runs carry unknown
+contention. Within a case the arms are measured in order and the two tier 0
+arms are measured last, so contention that appears mid-case penalises them
+relative to the baseline and to Option C: the time advantage reported for tier 0
+is a lower bound, not a flattering one. The TPC-H and synthetic cells were
+measured on an otherwise idle machine.
+
 **On the production-relevant cells the probe arm is not a compromise, it is the
 better answer.** On the five public files under ZSTD, tier 0 beats Option C on
 four and trails it by 0.10 points on the fifth, and it does so while running at
