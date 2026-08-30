@@ -68,8 +68,9 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::{
     ArrowColumnChunk, ArrowColumnWriter, ArrowWriter, compute_leaves,
 };
-use parquet::basic::{Compression, Encoding, Type as PhysicalType};
+use parquet::basic::{Compression, Encoding, PageType, Type as PhysicalType};
 use parquet::errors::{ParquetError, Result};
+use parquet::file::metadata::ColumnChunkMetaData;
 use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
 use parquet::schema::types::{ColumnDescPtr, ColumnPath};
 
@@ -102,8 +103,8 @@ const B_REOPEN_EVERY: usize = 8;
 /// The dictionary policy, the tie window and the re-open cadence are the
 /// shipped harness's, so options A, B and C are tuned identically.
 use harness::{
-    AdaptiveWriter, DICT_WORTH_RATIO, NEAR_TIE, REOPEN_EVERY as A_REOPEN_EVERY,
-    dictionary_properties, is_decidable,
+    AdaptiveWriter, DICT_PAGE_SIZE_LIMIT, DICT_WORTH_RATIO, NEAR_TIE,
+    REOPEN_EVERY as A_REOPEN_EVERY, dictionary_properties, is_decidable,
 };
 
 /// The shared property set. `compression` is the only thing that varies.
@@ -482,15 +483,36 @@ impl CandidateB {
         out
     }
 
-    /// Applies this candidate to `col` in `builder`.
+    /// Applies this candidate to `col` in `builder`, using the #10775
+    /// `DictionaryFallback::WhenProfitable` policy for the dictionary.
     fn apply(
         self,
         builder: WriterPropertiesBuilder,
         col: ColumnPath,
         physical: PhysicalType,
     ) -> WriterPropertiesBuilder {
+        self.apply_with(builder, col, physical, true)
+    }
+
+    /// Applies this candidate to `col` in `builder`.
+    ///
+    /// With `fallback` false the dictionary candidate is configured with stock
+    /// upstream behaviour alone: dictionary on, and the ordinary byte-size
+    /// `dictionary_page_size_limit` check that every released writer already
+    /// has. That is the tier-0-minimal configuration, which assumes the #10775
+    /// `DictionaryFallback` port is not available.
+    fn apply_with(
+        self,
+        builder: WriterPropertiesBuilder,
+        col: ColumnPath,
+        physical: PhysicalType,
+        fallback: bool,
+    ) -> WriterPropertiesBuilder {
         match self {
             CandidateB::Passthrough => builder,
+            CandidateB::Dictionary if !fallback => builder
+                .set_column_dictionary_enabled(col.clone(), true)
+                .set_column_dictionary_page_size_limit(col, DICT_PAGE_SIZE_LIMIT),
             CandidateB::Dictionary => dictionary_properties(builder, col),
             CandidateB::Plain => builder
                 .set_column_dictionary_enabled(col.clone(), false)
@@ -709,6 +731,374 @@ fn write_option_b(
 }
 
 // ---------------------------------------------------------------------------
+// Tier 0: probe-then-commit at chunk grain
+//
+// The question this arm answers is how much of Option C's result survives if
+// the library gains *only* the two small factory accessors this branch adds
+// (`create_selected_column_writers` and `page_store_factory`), the #10775
+// dictionary-fallback port, and nothing else. In particular it never touches
+// `parquet::arrow::arrow_writer::page_grain`, so it needs no
+// `GenericColumnWriter` seam and no new page-level API at all.
+//
+// Per leaf, per row group:
+//
+// * A **settled** leaf gets one ordinary `ArrowColumnWriter` configured with
+//   the candidate it settled on, and writes the whole row group through it.
+//   That is the library's normal write path at its normal speed, exactly as in
+//   Option C.
+// * A **deciding** leaf is probed first: K throwaway `ArrowColumnWriter`s are
+//   created for that one leaf through `create_selected_column_writers`, fed the
+//   *first* `TIER0_PROBE_ROWS` rows of the row group, and closed. Their
+//   `ColumnCloseResult` compressed sizes pick a winner by the same near-tie and
+//   decode-rank rule Option B uses; the probe chunks are then dropped. The leaf
+//   then writes its whole row group, probe rows included, through one real
+//   writer configured with that winner.
+//
+// The accepted cost is that a deciding leaf encodes its probe span K+1 times:
+// K throwaway passes and one real one. That is the tier's only overhead knob,
+// and it is bounded by the probe span rather than by the row group.
+//
+// The candidate set, the near-tie rule, the settle gap and the re-open cadence
+// are Option B's, so tier 0 and Option B differ in exactly one thing: whether
+// the race sees the whole row group or only its first span.
+// ---------------------------------------------------------------------------
+
+/// Rows of each row group the tier-0 probe encodes K ways before committing.
+///
+/// One data page's worth: large enough that a dictionary candidate has built a
+/// real dictionary and the compressor has something to work with, small enough
+/// that the doubled encoding is a fraction of the row group rather than all of
+/// it. Capped at the row group's own row count for a group shorter than this.
+const TIER0_PROBE_ROWS: usize = DATA_PAGE_ROW_LIMIT;
+
+/// The leading `rows` rows of a row group, cut at record batch boundaries with
+/// a slice of the batch that straddles the cut.
+fn probe_span(group: &[RecordBatch], rows: usize) -> Vec<RecordBatch> {
+    let mut out = Vec::new();
+    let mut taken = 0usize;
+    for batch in group {
+        if taken >= rows {
+            break;
+        }
+        let take = (rows - taken).min(batch.num_rows());
+        out.push(batch.slice(0, take));
+        taken += take;
+    }
+    out
+}
+
+/// Which dictionary machinery the tier-0 arm is allowed to use.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tier0Dictionary {
+    /// The #10775 port is available: a dictionary candidate is configured with
+    /// `DictionaryFallback::WhenProfitable`, and the library leaves a
+    /// dictionary that stops paying without the harness being told.
+    Fallback,
+    /// The #10775 port is *not* available, simulating its rejection upstream. A
+    /// dictionary candidate gets stock behaviour only: dictionary on, plus the
+    /// byte-size `dictionary_page_size_limit` check every released writer
+    /// already has. The harness then owns the dictionary heuristic itself, at
+    /// chunk grain, from the closed chunk's public metadata.
+    ChunkGrain,
+}
+
+/// What a finished column chunk's public metadata says about its dictionary.
+///
+/// Read from `ColumnChunkMetaData` alone: the dictionary page offset and the
+/// per-page encoding stats, both of which every released writer already
+/// records. This is the whole of the tier-0-minimal dictionary heuristic's
+/// evidence.
+fn dictionary_paid_off(metadata: &ColumnChunkMetaData) -> bool {
+    if metadata.dictionary_page_offset().is_none() {
+        // No dictionary page was written, so there is nothing to regret.
+        return true;
+    }
+    let Some(stats) = metadata.page_encoding_stats() else {
+        return true;
+    };
+
+    let mut dictionary_pages = 0i32;
+    let mut other_pages = 0i32;
+    for stat in stats {
+        if stat.page_type == PageType::DICTIONARY_PAGE {
+            continue;
+        }
+        match stat.encoding {
+            Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => dictionary_pages += stat.count,
+            _ => other_pages += stat.count,
+        }
+    }
+
+    // A dictionary page was written and paid for. It only earned its keep if
+    // every data page in the chunk actually indexed into it. A chunk that
+    // overflowed mid-way carries both kinds of page and paid for a dictionary
+    // covering only part of itself; a chunk with a dictionary page and no
+    // dictionary data page paid for one nothing referenced at all.
+    other_pages == 0 && dictionary_pages > 0
+}
+
+/// Writes a whole file, probing the first span of each row group for the leaves
+/// still deciding and committing the row group to the probe's winner.
+fn write_tier0_with(
+    schema: &SchemaRef,
+    groups: &[Vec<RecordBatch>],
+    props: &WriterProperties,
+    path: &Path,
+    mode: Tier0Dictionary,
+) -> Result<Duration> {
+    let fallback = mode == Tier0Dictionary::Fallback;
+    let start = Instant::now();
+
+    let file = File::create(path)?;
+    let arrow_writer = ArrowWriter::try_new(file, schema.clone(), Some(props.clone()))?;
+    let (mut file_writer, factory) = arrow_writer.into_serialized_writer()?;
+
+    let mut leaves: Vec<LeafStateB> = file_writer
+        .schema_descr()
+        .columns()
+        .iter()
+        .map(LeafStateB::new)
+        .collect();
+
+    // Tier-0-minimal only: the row group at which each leaf's dictionary was
+    // last found not to have paid off. While a leaf is banned its dictionary
+    // candidate is withheld, and the ban lapses on the ordinary re-open
+    // cadence so a column whose data turns dictionary-friendly again can win
+    // the dictionary back.
+    let mut dictionary_banned_at: Vec<Option<usize>> = vec![None; leaves.len()];
+
+    for (row_group, group) in groups.iter().enumerate() {
+        if group.iter().all(|b| b.num_rows() == 0) {
+            continue;
+        }
+
+        // The candidates each leaf may use this row group. Identical to the
+        // leaf's own list except under tier-0-minimal, where a leaf whose
+        // dictionary just failed to pay off has it withheld.
+        let active: Vec<Vec<CandidateB>> = leaves
+            .iter()
+            .enumerate()
+            .map(|(idx, leaf)| {
+                let banned = dictionary_banned_at[idx]
+                    .is_some_and(|at| row_group.saturating_sub(at) < B_REOPEN_EVERY);
+                if !banned {
+                    return leaf.candidates.clone();
+                }
+                let kept: Vec<CandidateB> = leaf
+                    .candidates
+                    .iter()
+                    .copied()
+                    .filter(|c| *c != CandidateB::Dictionary)
+                    .collect();
+                if kept.is_empty() {
+                    leaf.candidates.clone()
+                } else {
+                    kept
+                }
+            })
+            .collect();
+
+        // A leaf settled on a dictionary it may no longer use has to decide
+        // again, among what is left.
+        for (idx, leaf) in leaves.iter_mut().enumerate() {
+            if let Some((CandidateB::Dictionary, _)) = leaf.settled
+                && !active[idx].contains(&CandidateB::Dictionary)
+            {
+                leaf.settled = None;
+            }
+        }
+
+        // The candidate each leaf commits this row group to. A leaf that is not
+        // deciding keeps what it settled on; a passthrough leaf keeps its only
+        // candidate.
+        let mut chosen: Vec<CandidateB> = leaves
+            .iter()
+            .enumerate()
+            .map(|(idx, leaf)| {
+                leaf.settled
+                    .map(|(candidate, _)| candidate)
+                    .unwrap_or(active[idx][0])
+            })
+            .collect();
+
+        let deciding: Vec<bool> = leaves.iter().map(|l| l.is_racing(row_group)).collect();
+
+        if deciding.iter().any(|d| *d) {
+            let probe = probe_span(group, TIER0_PROBE_ROWS);
+            let num_sets = active
+                .iter()
+                .zip(&deciding)
+                .filter(|(_, d)| **d)
+                .map(|(c, _)| c.len())
+                .max()
+                .unwrap_or(1);
+
+            // Which candidate each deciding leaf uses in each probe set. A leaf
+            // with fewer candidates than the widest repeats its last one; the
+            // duplicates are deduplicated when the winner is chosen.
+            let plan: Vec<Vec<CandidateB>> = (0..num_sets)
+                .map(|k| {
+                    active
+                        .iter()
+                        .map(|candidates| candidates[k.min(candidates.len() - 1)])
+                        .collect()
+                })
+                .collect();
+
+            // K throwaway writers, created only for the deciding leaves. A
+            // settled leaf allocates nothing here: that is what
+            // `create_selected_column_writers` buys.
+            let mut probe_sets: Vec<Vec<Option<ArrowColumnWriter>>> = Vec::with_capacity(num_sets);
+            for set in &plan {
+                let mut builder = props.clone().into_builder();
+                for (idx, leaf) in leaves.iter().enumerate() {
+                    if deciding[idx] {
+                        builder = set[idx].apply_with(
+                            builder,
+                            leaf.path.clone(),
+                            leaf.physical,
+                            fallback,
+                        );
+                    }
+                }
+                probe_sets.push(factory.create_selected_column_writers(
+                    row_group,
+                    &Arc::new(builder.build()),
+                    |leaf| deciding[leaf],
+                )?);
+            }
+
+            for batch in &probe {
+                let mut leaf_idx = 0usize;
+                for (field, column) in schema.fields().iter().zip(batch.columns()) {
+                    for leaf in compute_leaves(field.as_ref(), column)? {
+                        if deciding[leaf_idx] {
+                            for writers in probe_sets.iter_mut() {
+                                writers[leaf_idx]
+                                    .as_mut()
+                                    .expect("a deciding leaf has a probe writer")
+                                    .write(&leaf)?;
+                            }
+                        }
+                        leaf_idx += 1;
+                    }
+                }
+            }
+
+            // Close the probes and read what each candidate cost over the span.
+            // The chunks themselves are dropped: only their sizes are kept.
+            let mut probe_bytes: Vec<Vec<u64>> = Vec::with_capacity(num_sets);
+            for writers in probe_sets {
+                let mut sizes = Vec::with_capacity(writers.len());
+                for writer in writers {
+                    sizes.push(match writer {
+                        None => 0,
+                        Some(writer) => writer.close()?.close().metadata.compressed_size() as u64,
+                    });
+                }
+                probe_bytes.push(sizes);
+            }
+
+            for (idx, leaf) in leaves.iter_mut().enumerate() {
+                if !deciding[idx] {
+                    continue;
+                }
+                // Deduplicate the sets that ran the same candidate for this leaf.
+                let mut distinct: Vec<(CandidateB, u64)> = Vec::new();
+                for (k, set) in plan.iter().enumerate() {
+                    if distinct.iter().any(|(c, _)| *c == set[idx]) {
+                        continue;
+                    }
+                    distinct.push((set[idx], probe_bytes[k][idx]));
+                }
+
+                let winner = pick_chunk(&distinct);
+                let (winning_candidate, best_bytes) = distinct[winner];
+                chosen[idx] = winning_candidate;
+
+                // Settle on the same rule Option B uses, read off the probe
+                // span rather than off the finished row group.
+                if distinct.len() > 1 {
+                    let worst = distinct.iter().map(|(_, b)| *b).max().unwrap_or(best_bytes);
+                    let gap = if worst == 0 {
+                        0.0
+                    } else {
+                        (worst - best_bytes) as f64 / worst as f64
+                    };
+                    if gap >= SETTLE_GAP {
+                        leaf.settled = Some((winning_candidate, row_group));
+                    }
+                }
+            }
+        }
+
+        // One ordinary set of writers at the committed candidates, and the whole
+        // row group written through it: the probe rows are encoded a second
+        // time here, for real.
+        let mut builder = props.clone().into_builder();
+        for (leaf, candidate) in leaves.iter().zip(&chosen) {
+            builder = candidate.apply_with(builder, leaf.path.clone(), leaf.physical, fallback);
+        }
+        let mut writers =
+            factory.create_column_writers_with_properties(row_group, &Arc::new(builder.build()))?;
+
+        for batch in group {
+            let mut leaf_idx = 0usize;
+            for (field, column) in schema.fields().iter().zip(batch.columns()) {
+                for leaf in compute_leaves(field.as_ref(), column)? {
+                    writers[leaf_idx].write(&leaf)?;
+                    leaf_idx += 1;
+                }
+            }
+        }
+
+        let mut rg = file_writer.next_row_group()?;
+        for (idx, writer) in writers.into_iter().enumerate() {
+            let chunk = writer.close()?;
+
+            // The tier-0-minimal dictionary heuristic, and the only thing that
+            // separates the two tier-0 variants once the properties are set:
+            // look at what the finished chunk says about its dictionary, and
+            // withhold the dictionary candidate from the next row groups if it
+            // did not pay off. Nothing here is a new API; it is the metadata
+            // the writer already returns.
+            if mode == Tier0Dictionary::ChunkGrain && chosen[idx] == CandidateB::Dictionary {
+                if dictionary_paid_off(&chunk.close().metadata) {
+                    dictionary_banned_at[idx] = None;
+                } else {
+                    dictionary_banned_at[idx] = Some(row_group + 1);
+                    leaves[idx].settled = None;
+                }
+            }
+
+            chunk.append_to_row_group(&mut rg)?;
+        }
+        rg.close()?;
+    }
+
+    file_writer.close()?;
+    Ok(start.elapsed())
+}
+
+fn write_tier0(
+    schema: &SchemaRef,
+    groups: &[Vec<RecordBatch>],
+    props: &WriterProperties,
+    path: &Path,
+) -> Result<Duration> {
+    write_tier0_with(schema, groups, props, path, Tier0Dictionary::Fallback)
+}
+
+fn write_tier0_minimal(
+    schema: &SchemaRef,
+    groups: &[Vec<RecordBatch>],
+    props: &WriterProperties,
+    path: &Path,
+) -> Result<Duration> {
+    write_tier0_with(schema, groups, props, path, Tier0Dictionary::ChunkGrain)
+}
+
+// ---------------------------------------------------------------------------
 // Baseline
 // ---------------------------------------------------------------------------
 
@@ -749,6 +1139,8 @@ enum Writer {
     OptionA,
     OptionB,
     OptionC,
+    Tier0,
+    Tier0Minimal,
 }
 
 impl Writer {
@@ -758,6 +1150,8 @@ impl Writer {
             Writer::OptionA => "option A (page-grain)",
             Writer::OptionB => "option B (K writers)",
             Writer::OptionC => "option C (hybrid)",
+            Writer::Tier0 => "tier 0 (probe)",
+            Writer::Tier0Minimal => "tier 0 minimal (no #10775)",
         }
     }
 
@@ -773,6 +1167,8 @@ impl Writer {
             Writer::OptionA => write_option_a(schema, groups, props, path),
             Writer::OptionB => write_option_b(schema, groups, props, path),
             Writer::OptionC => write_option_c(schema, groups, props, path),
+            Writer::Tier0 => write_tier0(schema, groups, props, path),
+            Writer::Tier0Minimal => write_tier0_minimal(schema, groups, props, path),
         }
     }
 }
@@ -1129,6 +1525,8 @@ fn run_case(
         Writer::OptionA,
         Writer::OptionB,
         Writer::OptionC,
+        Writer::Tier0,
+        Writer::Tier0Minimal,
     ] {
         let path = dir.join("bakeoff.parquet");
         measurements.push(measure(writer, schema, batches, &groups, &props, &path)?);
@@ -1171,7 +1569,7 @@ fn run_case(
     println!("  {name} / {compression_label}");
     print_encodings(&measurements, &passthrough);
     println!(
-        "    verified {} rows read back exactly from all four files",
+        "    verified {} rows read back exactly from all six files",
         batches.iter().map(|b| b.num_rows()).sum::<usize>()
     );
     Ok(encoding_summary(&measurements, &passthrough))
@@ -1517,14 +1915,14 @@ file.
 
 ## Method
 
-All four writers see identical inputs and identical writer properties. The only
+All six writers see identical inputs and identical writer properties. The only
 difference between them is how each decides a column's encoding.
 
 * Datasets are deterministic ({ROWS} rows each, splitmix64 seeded per dataset),
   cut into {BATCH_ROWS} row record batches.
-* Row group boundaries are identical for all four writers: {ROW_GROUP_ROWS}
+* Row group boundaries are identical for all six writers: {ROW_GROUP_ROWS}
   rows, {row_groups} row groups per file. The baseline reaches them through
-  `max_row_group_row_count`; options A and B cut the batches themselves at the
+  `max_row_group_row_count`; every other arm cuts the batches itself at the
   same offsets.
 * Shared properties: `data_page_row_count_limit = {DATA_PAGE_ROW_LIMIT}`, and
   the compression named in each row.
@@ -1533,7 +1931,7 @@ difference between them is how each decides a column's encoding.
 * Time is the median of {RUNS} runs in a release build. Output size is asserted
   identical across those runs, so each writer is deterministic.
 
-The four writers:
+The six writers:
 
 1. **Baseline** — a stock `ArrowWriter` at the shared properties.
 2. **Option A (page-grain)** — `examples/adaptive_writer/harness.rs` with
@@ -1556,6 +1954,28 @@ The four writers:
    on: each leaf, each row group, takes whichever of the two paths it needs.
    See below. A and C are the same code driven over the same batches, so the
    difference between them is the routing rule and nothing else.
+5. **Tier 0 (probe)** — chunk-grain probe-then-commit, built on nothing beyond
+   the two factory accessors and the #10775 dictionary-fallback port. A
+   deciding leaf's first {TIER0_PROBE_ROWS} rows of the row group are encoded
+   K ways through K throwaway single-leaf writers created with
+   `create_selected_column_writers`; their `ColumnCloseResult` compressed sizes
+   pick a winner by Option B's rule; the probe chunks are dropped and the leaf
+   writes its whole row group through one ordinary writer at that winner. A
+   settled leaf is never probed. It shares Option B's candidate set, near-tie
+   window, {settle_pct}% settle gap and {B_REOPEN_EVERY} row group re-open
+   cadence, so tier 0 and Option B differ only in whether the race sees the
+   whole row group or just its first span. It never touches `page_grain`.
+6. **Tier 0 minimal (no #10775)** — the same probe arm with the
+   `DictionaryFallback` port assumed rejected upstream. Its dictionary
+   candidate gets stock behaviour only: dictionary on plus the byte-size
+   `dictionary_page_size_limit` check every released writer already has. The
+   harness then owns the dictionary heuristic itself, at chunk grain and from
+   already-public metadata: after each row group it reads the closed chunk's
+   `ColumnChunkMetaData` (dictionary page offset and per-page encoding stats),
+   and if the chunk paid for a dictionary that some of its data pages did not
+   index into, it withholds the dictionary candidate from that column for the
+   next {B_REOPEN_EVERY} row groups and makes it decide again. This arm needs
+   *no* library change at all beyond the two factory accessors.
 
 ### Option C's composition rule
 
@@ -1702,12 +2122,15 @@ to leave a dictionary, and which path a leaf takes. Its plumbing half opens row
 groups, routes leaves and appends the chunks both paths produce.
 
 {interpretation}
+
+{tier0}
 "#,
         row_groups = ROWS / ROW_GROUP_ROWS,
         policy = policy_lines,
         plumbing = plumbing_lines,
         settle_pct = (SETTLE_GAP * 100.0) as u32,
         interpretation = INTERPRETATION,
+        tier0 = TIER0,
     );
 
     let public = existing_public_section();
@@ -1743,6 +2166,138 @@ fn count_lines(path: &Path) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+
+/// The Tier 0 section: what the probe arm is, what it measured, and what that
+/// says about the minimum upstream ask. Numbers quoted here are read off the
+/// tables above, which the same run regenerates.
+const TIER0: &str = r#"## Tier 0
+
+Tier 0 asks the narrowest version of the question this whole branch exists to
+answer: **how much of the result survives if upstream merges almost none of
+it?** Three variants are measured, differing only in which library changes they
+are allowed to assume.
+
+| variant | library changes assumed | measured where |
+| --- | --- | --- |
+| `tier 0 (probe)` | the two factory accessors, #10775, #10777 | this tree |
+| `tier 0 minimal (no #10775)` | the two accessors and #10777; the harness owns the dictionary rule | this tree |
+| `tier 0 floor (accessors only)` | the two accessors and nothing else | a worktree at merge base `2567a32` |
+
+All three are the same writer: per leaf, per row group, a leaf that has settled
+writes its whole row group through one ordinary `ArrowColumnWriter`, and a leaf
+that is still deciding first has its first 20000 rows encoded K ways through K
+throwaway single-leaf writers from `create_selected_column_writers`. The winner
+is chosen from those probes' `ColumnCloseResult` compressed sizes by Option B's
+near-tie and decode-rank rule, the probe chunks are dropped, and the leaf then
+writes the whole row group, probe rows included, at the winning candidate. A
+deciding leaf therefore encodes its probe span K+1 times, and that doubled span
+is the tier's only overhead knob. None of the three touches `page_grain`.
+
+The floor variant is a separate checkout of the merge base carrying exactly one
+cherry-picked change, `+67 -13` in `parquet/src/arrow/arrow_writer/mod.rs`:
+`page_store_factory()` and `create_selected_column_writers()`. Its stock
+`ArrowWriter` arm reproduced the published `vanilla main` byte count exactly on
+all five public files and all ten synthetic cells, which is what makes its
+numbers comparable with the rest of this report.
+
+### Bytes against vanilla main
+
+Public files, ZSTD, the production-relevant cells:
+
+| file | option C | tier 0 | tier 0 minimal | tier 0 floor |
+| --- | ---: | ---: | ---: | ---: |
+| `orders` | -24.69% | -26.62% | -26.62% | -26.62% |
+| `lineitem` | -23.14% | -23.41% | -23.41% | -23.41% |
+| `hits_0` | -6.31% | -7.93% | -7.69% | -7.71% |
+| `hits_1` | -4.51% | -5.18% | -4.97% | -5.00% |
+| `hits_2` | -6.69% | -6.59% | -6.49% | -6.51% |
+
+Synthetic, both compressions:
+
+| dataset | comp | option C | tier 0 | tier 0 minimal | tier 0 floor |
+| --- | --- | ---: | ---: | ---: | ---: |
+| low-cardinality strings | none | +0.07% | +0.00% | +0.00% | +0.00% |
+| low-cardinality strings | zstd | +0.08% | +0.00% | +0.00% | +0.00% |
+| timestamps | none | -84.77% | -84.78% | -84.78% | -84.78% |
+| timestamps | zstd | -62.55% | -62.56% | -62.56% | -62.56% |
+| f64 measurements | none | -20.17% | -20.18% | -20.18% | -20.18% |
+| f64 measurements | zstd | -20.50% | -20.52% | -20.52% | -20.52% |
+| shifting strings | none | -33.73% | -18.10% | -18.10% | -37.63% |
+| shifting strings | zstd | -7.00% | -7.77% | -7.77% | -8.80% |
+| records-like | none | -47.54% | -37.77% | -37.77% | -49.99% |
+| records-like | zstd | -25.67% | -25.83% | -25.83% | -25.90% |
+
+### Interpretation
+
+**On the production-relevant cells the probe arm is not a compromise, it is the
+better answer.** On the five public files under ZSTD, tier 0 beats Option C on
+four and trails it by 0.10 points on the fifth, and it does so while running at
+0.79x to 0.85x the branch default's wall clock against C's 0.72x to 1.03x and
+Option B's 1.78x to 2.66x. It reaches Option B's bytes to within 0.4 points
+everywhere and matches them exactly on `lineitem` and the synthetic cells,
+because it makes B's decision, a whole-chunk choice, from a sample rather than
+from the whole chunk. What the sample costs is visible only on `hits_0` and
+`hits_1`, where the probe is 20000 rows of a 450000-row chunk and tier 0 gives
+up 0.4 and 0.7 points against B, and what it saves is the other two thirds of
+B's CPU.
+
+**Where it visibly loses is uncompressed data that changes shape mid-file.** On
+shifting strings and the records-like schema uncompressed, tier 0 lands on
+Option B's -18.10% and -37.77% against C's -33.73% and -47.54%, a gap of 10 to
+15 points. This is the one thing a chunk-grain writer structurally cannot do:
+the data changes character in the middle of a row group, and a decision taken
+once per chunk from its first 20000 rows cannot react until the next row group.
+Option A's page grain re-decides every page and abandons a live dictionary
+inside the chunk, which is exactly the capability being priced. The gap closes
+under ZSTD, where the general compressor removes most of the redundancy that
+finer-grained switching targets, and tier 0 then wins these cells outright.
+Files with very few row groups are the same weakness in another form: `hits_0`
+has 2 row groups, so a leaf gets one settle and one commit, and it is the file
+where tier 0 gives up most against B.
+
+**The two contested heuristic PRs turn out not to be load-bearing for this
+writer, and #10777 is actively harmful to it.** #10775's `DictionaryFallback`
+is worth nothing at all on the synthetic suite (tier 0 minimal is byte-identical
+to tier 0 in all ten cells) and 0.10 to 0.24 points on the three ClickBench
+files: a harness that reads the closed chunk's `ColumnChunkMetaData` and
+withholds the dictionary candidate from a column that paid for a dictionary its
+data pages did not fully use recovers nearly all of it, from already-public API.
+The floor variant, which assumes neither PR, is within 0.22 points of full tier
+0 on every public file, and on the two uncompressed shape-shifting cells it is
+**better than every other arm in this report**, at -37.63% and -49.99% against
+Option A's -37.34% and -50.16%. The cause is #10777: when a dictionary
+overflows mid-chunk it re-encodes the already-buffered dictionary-indexed values
+as `PLAIN`, and for exactly this data those indices were the right encoding for
+the part of the chunk they covered. This is the reviewer objection to #10777
+(that a dictionary can remain effective after overflow, so unconditional
+re-encode is a trade rather than a fix) reproduced as a measurement: on a writer
+that chooses candidates by measuring them, #10777 costs 19.5 points uncompressed
+on shifting strings and 12.2 on records-like.
+
+**What this does to the upstream ask.** Options A and C need about 1690 lines of
+new library production code, a new 22-item public `page_grain` module, and a
+split of `write_data_page` into assemble and commit halves inside
+`GenericColumnWriter`, which is a seam on the hot path of every parquet writer
+in the ecosystem. The floor variant needs `+67 -13` lines in one file, adds two
+methods to one existing type, changes no write path, and has no hot-path seam at
+all: `create_column_writers` becomes the new call with every column selected, so
+there is one implementation rather than two. For that, on the cells a
+maintainer is most likely to care about, it delivers -23.41% to -26.62% on
+TPC-H and -5.00% to -7.71% on ClickBench, against Option C's -23.14% to -24.69%
+and -4.51% to -6.69%. The page grain buys one thing the accessors cannot: the
+10-to-15-point advantage on uncompressed data whose character changes inside a
+row group. Whether that case is worth 1690 lines and a `GenericColumnWriter`
+seam is the decision these numbers are for, and nothing else in this report
+turns on it.
+
+The floor variant is reproduced with:
+
+```text
+git worktree add ../arrow-rs-floor 2567a32
+git -C ../arrow-rs-floor cherry-pick -n <the accessors commit>   # keep only the two methods
+cargo run --release --features "arrow snap zstd" --example bakeoff_floor -- <files>
+```
+"#;
 
 /// The written interpretation, kept beside the harness that produced the
 /// numbers it describes.

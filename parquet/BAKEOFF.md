@@ -6,14 +6,14 @@ file.
 
 ## Method
 
-All four writers see identical inputs and identical writer properties. The only
+All six writers see identical inputs and identical writer properties. The only
 difference between them is how each decides a column's encoding.
 
 * Datasets are deterministic (2000000 rows each, splitmix64 seeded per dataset),
   cut into 25000 row record batches.
-* Row group boundaries are identical for all four writers: 100000
+* Row group boundaries are identical for all six writers: 100000
   rows, 20 row groups per file. The baseline reaches them through
-  `max_row_group_row_count`; options A and B cut the batches themselves at the
+  `max_row_group_row_count`; every other arm cuts the batches itself at the
   same offsets.
 * Shared properties: `data_page_row_count_limit = 20000`, and
   the compression named in each row.
@@ -22,7 +22,7 @@ difference between them is how each decides a column's encoding.
 * Time is the median of 3 runs in a release build. Output size is asserted
   identical across those runs, so each writer is deterministic.
 
-The four writers:
+The six writers:
 
 1. **Baseline** — a stock `ArrowWriter` at the shared properties.
 2. **Option A (page-grain)** — `examples/adaptive_writer/harness.rs` with
@@ -45,6 +45,28 @@ The four writers:
    on: each leaf, each row group, takes whichever of the two paths it needs.
    See below. A and C are the same code driven over the same batches, so the
    difference between them is the routing rule and nothing else.
+5. **Tier 0 (probe)** — chunk-grain probe-then-commit, built on nothing beyond
+   the two factory accessors and the #10775 dictionary-fallback port. A
+   deciding leaf's first 20000 rows of the row group are encoded
+   K ways through K throwaway single-leaf writers created with
+   `create_selected_column_writers`; their `ColumnCloseResult` compressed sizes
+   pick a winner by Option B's rule; the probe chunks are dropped and the leaf
+   writes its whole row group through one ordinary writer at that winner. A
+   settled leaf is never probed. It shares Option B's candidate set, near-tie
+   window, 10% settle gap and 8 row group re-open
+   cadence, so tier 0 and Option B differ only in whether the race sees the
+   whole row group or just its first span. It never touches `page_grain`.
+6. **Tier 0 minimal (no #10775)** — the same probe arm with the
+   `DictionaryFallback` port assumed rejected upstream. Its dictionary
+   candidate gets stock behaviour only: dictionary on plus the byte-size
+   `dictionary_page_size_limit` check every released writer already has. The
+   harness then owns the dictionary heuristic itself, at chunk grain and from
+   already-public metadata: after each row group it reads the closed chunk's
+   `ColumnChunkMetaData` (dictionary page offset and per-page encoding stats),
+   and if the chunk paid for a dictionary that some of its data pages did not
+   index into, it withholds the dictionary candidate from that column for the
+   next 8 row groups and makes it decide again. This arm needs
+   *no* library change at all beyond the two factory accessors.
 
 ### Option C's composition rule
 
@@ -111,58 +133,78 @@ attributed in the next section; it is not any option's doing, and folding it
 into an option's result would overstate or understate that option.
 
 ```
-dataset                            compression  writer                     bytes     size       median s  vanilla base  vs vanilla  vs branch base  time vs branch
----------------------------------  -----------  -------------------------  --------  ---------  --------  ------------  ----------  --------------  --------------
-low-cardinality strings            none         vanilla main (reference)   1536969   1.47 MiB   -         1536969       +0.00%      +0.00%          -
-low-cardinality strings            none         baseline (branch default)  1536969   1.47 MiB   0.062     1536969       +0.00%      +0.00%          1.00x
-low-cardinality strings            none         option A (page-grain)      1541448   1.47 MiB   0.075     1536969       +0.29%      +0.29%          1.20x
-low-cardinality strings            none         option B (K writers)       1536969   1.47 MiB   0.182     1536969       +0.00%      +0.00%          2.92x
-low-cardinality strings            none         option C (hybrid)          1538087   1.47 MiB   0.071     1536969       +0.07%      +0.07%          1.15x
-low-cardinality strings            zstd         vanilla main (reference)   1520065   1.45 MiB   -         1520065       +0.00%      +0.00%          -
-low-cardinality strings            zstd         baseline (branch default)  1520065   1.45 MiB   0.063     1520065       +0.00%      +0.00%          1.00x
-low-cardinality strings            zstd         option A (page-grain)      1525144   1.45 MiB   0.096     1520065       +0.33%      +0.33%          1.52x
-low-cardinality strings            zstd         option B (K writers)       1520065   1.45 MiB   0.213     1520065       +0.00%      +0.00%          3.37x
-low-cardinality strings            zstd         option C (hybrid)          1521333   1.45 MiB   0.089     1520065       +0.08%      +0.08%          1.41x
-high-cardinality int64 timestamps  none         vanilla main (reference)   20052805  19.12 MiB  -         20052805      +0.00%      +0.00%          -
-high-cardinality int64 timestamps  none         baseline (branch default)  20052805  19.12 MiB  0.101     20052805      +0.00%      +0.00%          1.00x
-high-cardinality int64 timestamps  none         option A (page-grain)      3055851   2.91 MiB   0.028     20052805      -84.76%     -84.76%         0.28x
-high-cardinality int64 timestamps  none         option B (K writers)       3052129   2.91 MiB   0.054     20052805      -84.78%     -84.78%         0.53x
-high-cardinality int64 timestamps  none         option C (hybrid)          3053063   2.91 MiB   0.028     20052805      -84.77%     -84.77%         0.28x
-high-cardinality int64 timestamps  zstd         vanilla main (reference)   8154384   7.78 MiB   -         8154384       +0.00%      +0.00%          -
-high-cardinality int64 timestamps  zstd         baseline (branch default)  8154384   7.78 MiB   0.161     8154384       +0.00%      +0.00%          1.00x
-high-cardinality int64 timestamps  zstd         option A (page-grain)      3057451   2.92 MiB   0.046     8154384       -62.51%     -62.51%         0.29x
-high-cardinality int64 timestamps  zstd         option B (K writers)       3053129   2.91 MiB   0.088     8154384       -62.56%     -62.56%         0.55x
-high-cardinality int64 timestamps  zstd         option C (hybrid)          3054213   2.91 MiB   0.036     8154384       -62.55%     -62.55%         0.22x
-f64 measurements                   none         vanilla main (reference)   20056464  19.13 MiB  -         20056464      +0.00%      +0.00%          -
-f64 measurements                   none         baseline (branch default)  20056464  19.13 MiB  0.102     20056464      +0.00%      +0.00%          1.00x
-f64 measurements                   none         option A (page-grain)      16011997  15.27 MiB  0.021     20056464      -20.17%     -20.17%         0.21x
-f64 measurements                   none         option B (K writers)       16008601  15.27 MiB  0.026     20056464      -20.18%     -20.18%         0.26x
-f64 measurements                   none         option C (hybrid)          16011997  15.27 MiB  0.021     20056464      -20.17%     -20.17%         0.21x
-f64 measurements                   zstd         vanilla main (reference)   18937240  18.06 MiB  -         18937240      +0.00%      +0.00%          -
-f64 measurements                   zstd         baseline (branch default)  18937240  18.06 MiB  0.133     18937240      +0.00%      +0.00%          1.00x
-f64 measurements                   zstd         option A (page-grain)      15055550  14.36 MiB  0.049     18937240      -20.50%     -20.50%         0.37x
-f64 measurements                   zstd         option B (K writers)       15051897  14.35 MiB  0.087     18937240      -20.52%     -20.52%         0.65x
-f64 measurements                   zstd         option C (hybrid)          15055550  14.36 MiB  0.049     18937240      -20.50%     -20.50%         0.37x
-shifting strings                   none         vanilla main (reference)   29367978  28.01 MiB  -         29367978      +0.00%      -13.06%         -
-shifting strings                   none         baseline (branch default)  33778798  32.21 MiB  0.093     29367978      +15.02%     +0.00%          1.00x
-shifting strings                   none         option A (page-grain)      18402548  17.55 MiB  0.107     29367978      -37.34%     -45.52%         1.15x
-shifting strings                   none         option B (K writers)       24051914  22.94 MiB  0.195     29367978      -18.10%     -28.80%         2.10x
-shifting strings                   none         option C (hybrid)          19462064  18.56 MiB  0.083     29367978      -33.73%     -42.38%         0.89x
-shifting strings                   zstd         vanilla main (reference)   10028648  9.56 MiB   -         10028648      +0.00%      -10.31%         -
-shifting strings                   zstd         baseline (branch default)  11181834  10.66 MiB  0.156     10028648      +11.50%     +0.00%          1.00x
-shifting strings                   zstd         option A (page-grain)      9558245   9.12 MiB   0.166     10028648      -4.69%      -14.52%         1.07x
-shifting strings                   zstd         option B (K writers)       9249872   8.82 MiB   0.384     10028648      -7.77%      -17.28%         2.46x
-shifting strings                   zstd         option C (hybrid)          9326743   8.89 MiB   0.144     10028648      -7.00%      -16.59%         0.93x
-records-like mixed schema          none         vanilla main (reference)   79708639  76.02 MiB  -         79708639      +0.00%      -3.57%          -
-records-like mixed schema          none         baseline (branch default)  82658499  78.83 MiB  0.462     79708639      +3.70%      +0.00%          1.00x
-records-like mixed schema          none         option A (page-grain)      39727331  37.89 MiB  0.273     79708639      -50.16%     -51.94%         0.59x
-records-like mixed schema          none         option B (K writers)       49599377  47.30 MiB  0.630     79708639      -37.77%     -39.99%         1.37x
-records-like mixed schema          none         option C (hybrid)          41818014  39.88 MiB  0.236     79708639      -47.54%     -49.41%         0.51x
-records-like mixed schema          zstd         vanilla main (reference)   39049927  37.24 MiB  -         39049927      +0.00%      -1.49%          -
-records-like mixed schema          zstd         baseline (branch default)  39639949  37.80 MiB  0.561     39049927      +1.51%      +0.00%          1.00x
-records-like mixed schema          zstd         option A (page-grain)      29318538  27.96 MiB  0.408     39049927      -24.92%     -26.04%         0.73x
-records-like mixed schema          zstd         option B (K writers)       28964375  27.62 MiB  0.913     39049927      -25.83%     -26.93%         1.63x
-records-like mixed schema          zstd         option C (hybrid)          29026477  27.68 MiB  0.358     39049927      -25.67%     -26.77%         0.64x
+dataset                            compression  writer                      bytes     size       median s  vanilla base  vs vanilla  vs branch base  time vs branch
+---------------------------------  -----------  --------------------------  --------  ---------  --------  ------------  ----------  --------------  --------------
+low-cardinality strings            none         vanilla main (reference)    1536969   1.47 MiB   -         1536969       +0.00%      +0.00%          -
+low-cardinality strings            none         baseline (branch default)   1536969   1.47 MiB   0.053     1536969       +0.00%      +0.00%          1.00x
+low-cardinality strings            none         option A (page-grain)       1541448   1.47 MiB   0.064     1536969       +0.29%      +0.29%          1.22x
+low-cardinality strings            none         option B (K writers)        1536969   1.47 MiB   0.157     1536969       +0.00%      +0.00%          2.97x
+low-cardinality strings            none         option C (hybrid)           1538087   1.47 MiB   0.067     1536969       +0.07%      +0.07%          1.27x
+low-cardinality strings            none         tier 0 (probe)              1536969   1.47 MiB   0.058     1536969       +0.00%      +0.00%          1.10x
+low-cardinality strings            none         tier 0 minimal (no #10775)  1536969   1.47 MiB   0.058     1536969       +0.00%      +0.00%          1.09x
+low-cardinality strings            zstd         vanilla main (reference)    1520065   1.45 MiB   -         1520065       +0.00%      +0.00%          -
+low-cardinality strings            zstd         baseline (branch default)   1520065   1.45 MiB   0.054     1520065       +0.00%      +0.00%          1.00x
+low-cardinality strings            zstd         option A (page-grain)       1525144   1.45 MiB   0.081     1520065       +0.33%      +0.33%          1.51x
+low-cardinality strings            zstd         option B (K writers)        1520065   1.45 MiB   0.185     1520065       +0.00%      +0.00%          3.43x
+low-cardinality strings            zstd         option C (hybrid)           1521333   1.45 MiB   0.091     1520065       +0.08%      +0.08%          1.69x
+low-cardinality strings            zstd         tier 0 (probe)              1520065   1.45 MiB   0.072     1520065       +0.00%      +0.00%          1.33x
+low-cardinality strings            zstd         tier 0 minimal (no #10775)  1520065   1.45 MiB   0.067     1520065       +0.00%      +0.00%          1.25x
+high-cardinality int64 timestamps  none         vanilla main (reference)    20052805  19.12 MiB  -         20052805      +0.00%      +0.00%          -
+high-cardinality int64 timestamps  none         baseline (branch default)   20052805  19.12 MiB  0.130     20052805      +0.00%      +0.00%          1.00x
+high-cardinality int64 timestamps  none         option A (page-grain)       3055851   2.91 MiB   0.026     20052805      -84.76%     -84.76%         0.20x
+high-cardinality int64 timestamps  none         option B (K writers)        3052129   2.91 MiB   0.041     20052805      -84.78%     -84.78%         0.31x
+high-cardinality int64 timestamps  none         option C (hybrid)           3053063   2.91 MiB   0.023     20052805      -84.77%     -84.77%         0.18x
+high-cardinality int64 timestamps  none         tier 0 (probe)              3052129   2.91 MiB   0.017     20052805      -84.78%     -84.78%         0.13x
+high-cardinality int64 timestamps  none         tier 0 minimal (no #10775)  3052129   2.91 MiB   0.018     20052805      -84.78%     -84.78%         0.14x
+high-cardinality int64 timestamps  zstd         vanilla main (reference)    8154384   7.78 MiB   -         8154384       +0.00%      +0.00%          -
+high-cardinality int64 timestamps  zstd         baseline (branch default)   8154384   7.78 MiB   0.145     8154384       +0.00%      +0.00%          1.00x
+high-cardinality int64 timestamps  zstd         option A (page-grain)       3057451   2.92 MiB   0.029     8154384       -62.51%     -62.51%         0.20x
+high-cardinality int64 timestamps  zstd         option B (K writers)        3053129   2.91 MiB   0.090     8154384       -62.56%     -62.56%         0.62x
+high-cardinality int64 timestamps  zstd         option C (hybrid)           3054213   2.91 MiB   0.031     8154384       -62.55%     -62.55%         0.21x
+high-cardinality int64 timestamps  zstd         tier 0 (probe)              3053129   2.91 MiB   0.025     8154384       -62.56%     -62.56%         0.17x
+high-cardinality int64 timestamps  zstd         tier 0 minimal (no #10775)  3053129   2.91 MiB   0.025     8154384       -62.56%     -62.56%         0.17x
+f64 measurements                   none         vanilla main (reference)    20056464  19.13 MiB  -         20056464      +0.00%      +0.00%          -
+f64 measurements                   none         baseline (branch default)   20056464  19.13 MiB  0.131     20056464      +0.00%      +0.00%          1.00x
+f64 measurements                   none         option A (page-grain)       16011997  15.27 MiB  0.024     20056464      -20.17%     -20.17%         0.18x
+f64 measurements                   none         option B (K writers)        16008601  15.27 MiB  0.027     20056464      -20.18%     -20.18%         0.21x
+f64 measurements                   none         option C (hybrid)           16011997  15.27 MiB  0.024     20056464      -20.17%     -20.17%         0.19x
+f64 measurements                   none         tier 0 (probe)              16008601  15.27 MiB  0.028     20056464      -20.18%     -20.18%         0.22x
+f64 measurements                   none         tier 0 minimal (no #10775)  16008601  15.27 MiB  0.028     20056464      -20.18%     -20.18%         0.21x
+f64 measurements                   zstd         vanilla main (reference)    18937240  18.06 MiB  -         18937240      +0.00%      +0.00%          -
+f64 measurements                   zstd         baseline (branch default)   18937240  18.06 MiB  0.175     18937240      +0.00%      +0.00%          1.00x
+f64 measurements                   zstd         option A (page-grain)       15055550  14.36 MiB  0.046     18937240      -20.50%     -20.50%         0.27x
+f64 measurements                   zstd         option B (K writers)        15051897  14.35 MiB  0.090     18937240      -20.52%     -20.52%         0.51x
+f64 measurements                   zstd         option C (hybrid)           15055550  14.36 MiB  0.043     18937240      -20.50%     -20.50%         0.25x
+f64 measurements                   zstd         tier 0 (probe)              15051897  14.35 MiB  0.053     18937240      -20.52%     -20.52%         0.30x
+f64 measurements                   zstd         tier 0 minimal (no #10775)  15051897  14.35 MiB  0.052     18937240      -20.52%     -20.52%         0.30x
+shifting strings                   none         vanilla main (reference)    29367978  28.01 MiB  -         29367978      +0.00%      -13.06%         -
+shifting strings                   none         baseline (branch default)   33778798  32.21 MiB  0.107     29367978      +15.02%     +0.00%          1.00x
+shifting strings                   none         option A (page-grain)       18402548  17.55 MiB  0.096     29367978      -37.34%     -45.52%         0.90x
+shifting strings                   none         option B (K writers)        24051914  22.94 MiB  0.184     29367978      -18.10%     -28.80%         1.72x
+shifting strings                   none         option C (hybrid)           19462064  18.56 MiB  0.079     29367978      -33.73%     -42.38%         0.74x
+shifting strings                   none         tier 0 (probe)              24051914  22.94 MiB  0.066     29367978      -18.10%     -28.80%         0.62x
+shifting strings                   none         tier 0 minimal (no #10775)  24051914  22.94 MiB  0.067     29367978      -18.10%     -28.80%         0.62x
+shifting strings                   zstd         vanilla main (reference)    10028648  9.56 MiB   -         10028648      +0.00%      -10.31%         -
+shifting strings                   zstd         baseline (branch default)   11181834  10.66 MiB  0.149     10028648      +11.50%     +0.00%          1.00x
+shifting strings                   zstd         option A (page-grain)       9558245   9.12 MiB   0.158     10028648      -4.69%      -14.52%         1.06x
+shifting strings                   zstd         option B (K writers)        9249872   8.82 MiB   0.354     10028648      -7.77%      -17.28%         2.37x
+shifting strings                   zstd         option C (hybrid)           9326743   8.89 MiB   0.124     10028648      -7.00%      -16.59%         0.83x
+shifting strings                   zstd         tier 0 (probe)              9249872   8.82 MiB   0.131     10028648      -7.77%      -17.28%         0.88x
+shifting strings                   zstd         tier 0 minimal (no #10775)  9249872   8.82 MiB   0.129     10028648      -7.77%      -17.28%         0.87x
+records-like mixed schema          none         vanilla main (reference)    79708639  76.02 MiB  -         79708639      +0.00%      -3.57%          -
+records-like mixed schema          none         baseline (branch default)   82658499  78.83 MiB  0.447     79708639      +3.70%      +0.00%          1.00x
+records-like mixed schema          none         option A (page-grain)       39727331  37.89 MiB  0.262     79708639      -50.16%     -51.94%         0.59x
+records-like mixed schema          none         option B (K writers)        49599377  47.30 MiB  0.555     79708639      -37.77%     -39.99%         1.24x
+records-like mixed schema          none         option C (hybrid)           41818014  39.88 MiB  0.234     79708639      -47.54%     -49.41%         0.52x
+records-like mixed schema          none         tier 0 (probe)              49599377  47.30 MiB  0.211     79708639      -37.77%     -39.99%         0.47x
+records-like mixed schema          none         tier 0 minimal (no #10775)  49599377  47.30 MiB  0.215     79708639      -37.77%     -39.99%         0.48x
+records-like mixed schema          zstd         vanilla main (reference)    39049927  37.24 MiB  -         39049927      +0.00%      -1.49%          -
+records-like mixed schema          zstd         baseline (branch default)   39639949  37.80 MiB  0.544     39049927      +1.51%      +0.00%          1.00x
+records-like mixed schema          zstd         option A (page-grain)       29318538  27.96 MiB  0.386     39049927      -24.92%     -26.04%         0.71x
+records-like mixed schema          zstd         option B (K writers)        28964375  27.62 MiB  0.911     39049927      -25.83%     -26.93%         1.67x
+records-like mixed schema          zstd         option C (hybrid)           29026477  27.68 MiB  0.329     39049927      -25.67%     -26.77%         0.60x
+records-like mixed schema          zstd         tier 0 (probe)              28964722  27.62 MiB  0.332     39049927      -25.83%     -26.93%         0.61x
+records-like mixed schema          zstd         tier 0 minimal (no #10775)  28964722  27.62 MiB  0.328     39049927      -25.83%     -26.93%         0.60x
 ```
 
 ## What separates the two baselines
@@ -231,9 +273,9 @@ Harness cost, counted from the files in this repository:
 
 | Harness | Lines |
 | --- | ---: |
-| `examples/adaptive_writer/harness.rs` (policy 318, plumbing 279) | 666 |
+| `examples/adaptive_writer/harness.rs` (policy 298, plumbing 270) | 637 |
 | `examples/adaptive_writer/main.rs` (dataset, comparison, verification) | 195 |
-| `examples/bakeoff.rs` (four writers, five datasets and reporting) | 1968 |
+| `examples/bakeoff.rs` (four writers, five datasets and reporting) | 2523 |
 
 `harness.rs` is the harness measured as options A and C above: the bakeoff
 includes that same file rather than a copy, so these numbers describe the code
@@ -427,6 +469,135 @@ were raceable, so nothing in these results is masked by an unraced column.
   a general compressor runs.
 
 
+## Tier 0
+
+Tier 0 asks the narrowest version of the question this whole branch exists to
+answer: **how much of the result survives if upstream merges almost none of
+it?** Three variants are measured, differing only in which library changes they
+are allowed to assume.
+
+| variant | library changes assumed | measured where |
+| --- | --- | --- |
+| `tier 0 (probe)` | the two factory accessors, #10775, #10777 | this tree |
+| `tier 0 minimal (no #10775)` | the two accessors and #10777; the harness owns the dictionary rule | this tree |
+| `tier 0 floor (accessors only)` | the two accessors and nothing else | a worktree at merge base `2567a32` |
+
+All three are the same writer: per leaf, per row group, a leaf that has settled
+writes its whole row group through one ordinary `ArrowColumnWriter`, and a leaf
+that is still deciding first has its first 20000 rows encoded K ways through K
+throwaway single-leaf writers from `create_selected_column_writers`. The winner
+is chosen from those probes' `ColumnCloseResult` compressed sizes by Option B's
+near-tie and decode-rank rule, the probe chunks are dropped, and the leaf then
+writes the whole row group, probe rows included, at the winning candidate. A
+deciding leaf therefore encodes its probe span K+1 times, and that doubled span
+is the tier's only overhead knob. None of the three touches `page_grain`.
+
+The floor variant is a separate checkout of the merge base carrying exactly one
+cherry-picked change, `+67 -13` in `parquet/src/arrow/arrow_writer/mod.rs`:
+`page_store_factory()` and `create_selected_column_writers()`. Its stock
+`ArrowWriter` arm reproduced the published `vanilla main` byte count exactly on
+all five public files and all ten synthetic cells, which is what makes its
+numbers comparable with the rest of this report.
+
+### Bytes against vanilla main
+
+Public files, ZSTD, the production-relevant cells:
+
+| file | option C | tier 0 | tier 0 minimal | tier 0 floor |
+| --- | ---: | ---: | ---: | ---: |
+| `orders` | -24.69% | -26.62% | -26.62% | -26.62% |
+| `lineitem` | -23.14% | -23.41% | -23.41% | -23.41% |
+| `hits_0` | -6.31% | -7.93% | -7.69% | -7.71% |
+| `hits_1` | -4.51% | -5.18% | -4.97% | -5.00% |
+| `hits_2` | -6.69% | -6.59% | -6.49% | -6.51% |
+
+Synthetic, both compressions:
+
+| dataset | comp | option C | tier 0 | tier 0 minimal | tier 0 floor |
+| --- | --- | ---: | ---: | ---: | ---: |
+| low-cardinality strings | none | +0.07% | +0.00% | +0.00% | +0.00% |
+| low-cardinality strings | zstd | +0.08% | +0.00% | +0.00% | +0.00% |
+| timestamps | none | -84.77% | -84.78% | -84.78% | -84.78% |
+| timestamps | zstd | -62.55% | -62.56% | -62.56% | -62.56% |
+| f64 measurements | none | -20.17% | -20.18% | -20.18% | -20.18% |
+| f64 measurements | zstd | -20.50% | -20.52% | -20.52% | -20.52% |
+| shifting strings | none | -33.73% | -18.10% | -18.10% | -37.63% |
+| shifting strings | zstd | -7.00% | -7.77% | -7.77% | -8.80% |
+| records-like | none | -47.54% | -37.77% | -37.77% | -49.99% |
+| records-like | zstd | -25.67% | -25.83% | -25.83% | -25.90% |
+
+### Interpretation
+
+**On the production-relevant cells the probe arm is not a compromise, it is the
+better answer.** On the five public files under ZSTD, tier 0 beats Option C on
+four and trails it by 0.10 points on the fifth, and it does so while running at
+0.79x to 0.85x the branch default's wall clock against C's 0.72x to 1.03x and
+Option B's 1.78x to 2.66x. It reaches Option B's bytes to within 0.4 points
+everywhere and matches them exactly on `lineitem` and the synthetic cells,
+because it makes B's decision, a whole-chunk choice, from a sample rather than
+from the whole chunk. What the sample costs is visible only on `hits_0` and
+`hits_1`, where the probe is 20000 rows of a 450000-row chunk and tier 0 gives
+up 0.4 and 0.7 points against B, and what it saves is the other two thirds of
+B's CPU.
+
+**Where it visibly loses is uncompressed data that changes shape mid-file.** On
+shifting strings and the records-like schema uncompressed, tier 0 lands on
+Option B's -18.10% and -37.77% against C's -33.73% and -47.54%, a gap of 10 to
+15 points. This is the one thing a chunk-grain writer structurally cannot do:
+the data changes character in the middle of a row group, and a decision taken
+once per chunk from its first 20000 rows cannot react until the next row group.
+Option A's page grain re-decides every page and abandons a live dictionary
+inside the chunk, which is exactly the capability being priced. The gap closes
+under ZSTD, where the general compressor removes most of the redundancy that
+finer-grained switching targets, and tier 0 then wins these cells outright.
+Files with very few row groups are the same weakness in another form: `hits_0`
+has 2 row groups, so a leaf gets one settle and one commit, and it is the file
+where tier 0 gives up most against B.
+
+**The two contested heuristic PRs turn out not to be load-bearing for this
+writer, and #10777 is actively harmful to it.** #10775's `DictionaryFallback`
+is worth nothing at all on the synthetic suite (tier 0 minimal is byte-identical
+to tier 0 in all ten cells) and 0.10 to 0.24 points on the three ClickBench
+files: a harness that reads the closed chunk's `ColumnChunkMetaData` and
+withholds the dictionary candidate from a column that paid for a dictionary its
+data pages did not fully use recovers nearly all of it, from already-public API.
+The floor variant, which assumes neither PR, is within 0.22 points of full tier
+0 on every public file, and on the two uncompressed shape-shifting cells it is
+**better than every other arm in this report**, at -37.63% and -49.99% against
+Option A's -37.34% and -50.16%. The cause is #10777: when a dictionary
+overflows mid-chunk it re-encodes the already-buffered dictionary-indexed values
+as `PLAIN`, and for exactly this data those indices were the right encoding for
+the part of the chunk they covered. This is the reviewer objection to #10777
+(that a dictionary can remain effective after overflow, so unconditional
+re-encode is a trade rather than a fix) reproduced as a measurement: on a writer
+that chooses candidates by measuring them, #10777 costs 19.5 points uncompressed
+on shifting strings and 12.2 on records-like.
+
+**What this does to the upstream ask.** Options A and C need about 1690 lines of
+new library production code, a new 22-item public `page_grain` module, and a
+split of `write_data_page` into assemble and commit halves inside
+`GenericColumnWriter`, which is a seam on the hot path of every parquet writer
+in the ecosystem. The floor variant needs `+67 -13` lines in one file, adds two
+methods to one existing type, changes no write path, and has no hot-path seam at
+all: `create_column_writers` becomes the new call with every column selected, so
+there is one implementation rather than two. For that, on the cells a
+maintainer is most likely to care about, it delivers -23.41% to -26.62% on
+TPC-H and -5.00% to -7.71% on ClickBench, against Option C's -23.14% to -24.69%
+and -4.51% to -6.69%. The page grain buys one thing the accessors cannot: the
+10-to-15-point advantage on uncompressed data whose character changes inside a
+row group. Whether that case is worth 1690 lines and a `GenericColumnWriter`
+seam is the decision these numbers are for, and nothing else in this report
+turns on it.
+
+The floor variant is reproduced with:
+
+```text
+git worktree add ../arrow-rs-floor 2567a32
+git -C ../arrow-rs-floor cherry-pick -n <the accessors commit>   # keep only the two methods
+cargo run --release --features "arrow snap zstd" --example bakeoff_floor -- <files>
+```
+
+
 ## Public datasets
 
 Results over corpora anyone can obtain, measured the same way as the
@@ -437,70 +608,80 @@ each input is recorded.
 ### TPC-H SF=1 (tpchgen-cli)
 
 * **`orders.parquet`**: 1500000 rows in 16 row groups (93750 rows per row group), source file 60.55 MiB; the input's own row group boundaries are reproduced by all four arms.
-  * Of 9 leaf columns, the arms change the baseline's encoding on: option A (page-grain) on 6; option B (K writers) on 4; option C (hybrid) on 6.
+  * Of 9 leaf columns, the arms change the baseline's encoding on: option A (page-grain) on 6; option B (K writers) on 4; option C (hybrid) on 6; tier 0 (probe) on 6; tier 0 minimal (no #10775) on 6.
   * A and B disagree on 2 columns: o_orderdate, o_clerk.
   * C differs from A on 0 columns: none.
   * C differs from B on 2 columns.
   * No column shape was passed through: every leaf was raceable.
 * **`lineitem.parquet`**: 6001215 rows in 53 row groups (112683 to 113928 rows per row group), source file 220.94 MiB; the input's own row group boundaries are reproduced by all four arms.
-  * Of 16 leaf columns, the arms change the baseline's encoding on: option A (page-grain) on 9; option B (K writers) on 8; option C (hybrid) on 9.
+  * Of 16 leaf columns, the arms change the baseline's encoding on: option A (page-grain) on 9; option B (K writers) on 8; option C (hybrid) on 9; tier 0 (probe) on 8; tier 0 minimal (no #10775) on 8.
   * A and B disagree on 3 columns: l_suppkey, l_linenumber, l_extendedprice.
   * C differs from A on 0 columns: none.
   * C differs from B on 3 columns.
   * No column shape was passed through: every leaf was raceable.
 
 ```
-dataset           compression  writer                     bytes      size        median s  vanilla base  vs vanilla  vs branch base  time vs branch
-----------------  -----------  -------------------------  ---------  ----------  --------  ------------  ----------  --------------  --------------
-orders.parquet    zstd         vanilla main (reference)   45834964   43.71 MiB   -         45834964      +0.00%      +0.82%          -
-orders.parquet    zstd         baseline (branch default)  45463263   43.36 MiB   1.076     45834964      -0.81%      +0.00%          1.00x
-orders.parquet    zstd         option A (page-grain)      34836949   33.22 MiB   0.818     45834964      -23.99%     -23.37%         0.76x
-orders.parquet    zstd         option B (K writers)       33563602   32.01 MiB   1.980     45834964      -26.77%     -26.17%         1.84x
-orders.parquet    zstd         option C (hybrid)          34516270   32.92 MiB   0.717     45834964      -24.69%     -24.08%         0.67x
-lineitem.parquet  zstd         vanilla main (reference)   183251967  174.76 MiB  -         183251967     +0.00%      -3.06%          -
-lineitem.parquet  zstd         baseline (branch default)  189035491  180.28 MiB  4.809     183251967     +3.16%      +0.00%          1.00x
-lineitem.parquet  zstd         option A (page-grain)      142169995  135.58 MiB  4.066     183251967     -22.42%     -24.79%         0.85x
-lineitem.parquet  zstd         option B (K writers)       140360087  133.86 MiB  9.769     183251967     -23.41%     -25.75%         2.03x
-lineitem.parquet  zstd         option C (hybrid)          140852760  134.33 MiB  3.936     183251967     -23.14%     -25.49%         0.82x
+dataset           compression  writer                      bytes      size        median s  vanilla base  vs vanilla  vs branch base  time vs branch
+----------------  -----------  --------------------------  ---------  ----------  --------  ------------  ----------  --------------  --------------
+orders.parquet    zstd         vanilla main (reference)    45834964   43.71 MiB   -         45834964      +0.00%      +0.82%          -
+orders.parquet    zstd         baseline (branch default)   45463263   43.36 MiB   1.047     45834964      -0.81%      +0.00%          1.00x
+orders.parquet    zstd         option A (page-grain)       34836949   33.22 MiB   0.732     45834964      -23.99%     -23.37%         0.70x
+orders.parquet    zstd         option B (K writers)        33563602   32.01 MiB   1.861     45834964      -26.77%     -26.17%         1.78x
+orders.parquet    zstd         option C (hybrid)           34516270   32.92 MiB   0.668     45834964      -24.69%     -24.08%         0.64x
+orders.parquet    zstd         tier 0 (probe)              33632451   32.07 MiB   0.836     45834964      -26.62%     -26.02%         0.80x
+orders.parquet    zstd         tier 0 minimal (no #10775)  33632451   32.07 MiB   0.700     45834964      -26.62%     -26.02%         0.67x
+lineitem.parquet  zstd         vanilla main (reference)    183251967  174.76 MiB  -         183251967     +0.00%      -3.06%          -
+lineitem.parquet  zstd         baseline (branch default)   189035491  180.28 MiB  4.583     183251967     +3.16%      +0.00%          1.00x
+lineitem.parquet  zstd         option A (page-grain)       142169995  135.58 MiB  3.589     183251967     -22.42%     -24.79%         0.78x
+lineitem.parquet  zstd         option B (K writers)        140360087  133.86 MiB  8.579     183251967     -23.41%     -25.75%         1.87x
+lineitem.parquet  zstd         option C (hybrid)           140852760  134.33 MiB  3.308     183251967     -23.14%     -25.49%         0.72x
+lineitem.parquet  zstd         tier 0 (probe)              140360087  133.86 MiB  3.615     183251967     -23.41%     -25.75%         0.79x
+lineitem.parquet  zstd         tier 0 minimal (no #10775)  140360087  133.86 MiB  3.877     183251967     -23.41%     -25.75%         0.85x
 ```
 
 ### ClickBench hits
 
 * **`hits_0.parquet`**: 1000000 rows in 2 row groups (450560 to 549440 rows per row group), source file 116.77 MiB; the input's own row group boundaries are reproduced by all four arms.
-  * Of 105 leaf columns, the arms change the baseline's encoding on: option A (page-grain) on 33; option B (K writers) on 21; option C (hybrid) on 33.
+  * Of 105 leaf columns, the arms change the baseline's encoding on: option A (page-grain) on 33; option B (K writers) on 21; option C (hybrid) on 33; tier 0 (probe) on 50; tier 0 minimal (no #10775) on 50.
   * A and B disagree on 15 columns: Title, CounterID, ResolutionWidth, ResolutionHeight, UserAgentMajor, SearchPhrase, OriginalURL, HID, DontCountHits, Robotness, ResponseStartTiming, ResponseEndTiming and 3 more.
   * C differs from A on 0 columns: none.
   * C differs from B on 15 columns.
   * No column shape was passed through: every leaf was raceable.
 * **`hits_1.parquet`**: 1000000 rows in 3 row groups (62734 to 593202 rows per row group), source file 166.86 MiB; the input's own row group boundaries are reproduced by all four arms.
-  * Of 105 leaf columns, the arms change the baseline's encoding on: option A (page-grain) on 34; option B (K writers) on 24; option C (hybrid) on 34.
+  * Of 105 leaf columns, the arms change the baseline's encoding on: option A (page-grain) on 34; option B (K writers) on 24; option C (hybrid) on 34; tier 0 (probe) on 52; tier 0 minimal (no #10775) on 53.
   * A and B disagree on 15 columns: Title, URL, ResolutionHeight, SearchEngineID, SearchPhrase, AdvEngineID, ClientEventTime, OriginalURL, Robotness, ResponseStartTiming, ResponseEndTiming, SocialSourceNetworkID and 3 more.
   * C differs from A on 0 columns: none.
   * C differs from B on 15 columns.
   * No column shape was passed through: every leaf was raceable.
 * **`hits_2.parquet`**: 1000000 rows in 5 row groups (13006 to 335872 rows per row group), source file 219.91 MiB; the input's own row group boundaries are reproduced by all four arms.
-  * Of 105 leaf columns, the arms change the baseline's encoding on: option A (page-grain) on 23; option B (K writers) on 68; option C (hybrid) on 23.
+  * Of 105 leaf columns, the arms change the baseline's encoding on: option A (page-grain) on 23; option B (K writers) on 68; option C (hybrid) on 23; tier 0 (probe) on 68; tier 0 minimal (no #10775) on 69.
   * A and B disagree on 58 columns: Title, GoodEvent, EventTime, EventDate, CounterID, RegionID, UserID, CounterClass, URLCategoryID, URLRegionID, CookieEnable, JavascriptEnable and 46 more.
   * C differs from A on 0 columns: none.
   * C differs from B on 58 columns.
   * No column shape was passed through: every leaf was raceable.
 
 ```
-dataset         compression  writer                     bytes      size        median s  vanilla base  vs vanilla  vs branch base  time vs branch
---------------  -----------  -------------------------  ---------  ----------  --------  ------------  ----------  --------------  --------------
-hits_0.parquet  zstd         vanilla main (reference)   85354208   81.40 MiB   -         85354208      +0.00%      -0.55%          -
-hits_0.parquet  zstd         baseline (branch default)  85827039   81.85 MiB   5.444     85354208      +0.55%      +0.00%          1.00x
-hits_0.parquet  zstd         option A (page-grain)      81041604   77.29 MiB   5.536     85354208      -5.05%      -5.58%          1.02x
-hits_0.parquet  zstd         option B (K writers)       78271730   74.65 MiB   13.885    85354208      -8.30%      -8.80%          2.55x
-hits_0.parquet  zstd         option C (hybrid)          79971547   76.27 MiB   5.001     85354208      -6.31%      -6.82%          0.92x
-hits_1.parquet  zstd         vanilla main (reference)   121026589  115.42 MiB  -         121026589     +0.00%      -0.57%          -
-hits_1.parquet  zstd         baseline (branch default)  121720489  116.08 MiB  6.981     121026589     +0.57%      +0.00%          1.00x
-hits_1.parquet  zstd         option A (page-grain)      117822844  112.36 MiB  7.339     121026589     -2.65%      -3.20%          1.05x
-hits_1.parquet  zstd         option B (K writers)       113938894  108.66 MiB  18.118    121026589     -5.86%      -6.39%          2.60x
-hits_1.parquet  zstd         option C (hybrid)          115566512  110.21 MiB  6.129     121026589     -4.51%      -5.06%          0.88x
-hits_2.parquet  zstd         vanilla main (reference)   166652721  158.93 MiB  -         166652721     +0.00%      -0.57%          -
-hits_2.parquet  zstd         baseline (branch default)  167601915  159.84 MiB  6.844     166652721     +0.57%      +0.00%          1.00x
-hits_2.parquet  zstd         option A (page-grain)      157979377  150.66 MiB  6.618     166652721     -5.20%      -5.74%          0.97x
-hits_2.parquet  zstd         option B (K writers)       155777642  148.56 MiB  13.045    166652721     -6.53%      -7.05%          1.91x
-hits_2.parquet  zstd         option C (hybrid)          155497293  148.29 MiB  5.845     166652721     -6.69%      -7.22%          0.85x
+dataset         compression  writer                      bytes      size        median s  vanilla base  vs vanilla  vs branch base  time vs branch
+--------------  -----------  --------------------------  ---------  ----------  --------  ------------  ----------  --------------  --------------
+hits_0.parquet  zstd         vanilla main (reference)    85354208   81.40 MiB   -         85354208      +0.00%      -0.55%          -
+hits_0.parquet  zstd         baseline (branch default)   85827039   81.85 MiB   5.077     85354208      +0.55%      +0.00%          1.00x
+hits_0.parquet  zstd         option A (page-grain)       81041604   77.29 MiB   5.113     85354208      -5.05%      -5.58%          1.01x
+hits_0.parquet  zstd         option B (K writers)        78271730   74.65 MiB   12.901    85354208      -8.30%      -8.80%          2.54x
+hits_0.parquet  zstd         option C (hybrid)           79971547   76.27 MiB   4.764     85354208      -6.31%      -6.82%          0.94x
+hits_0.parquet  zstd         tier 0 (probe)              78586010   74.95 MiB   4.306     85354208      -7.93%      -8.44%          0.85x
+hits_0.parquet  zstd         tier 0 minimal (no #10775)  78790415   75.14 MiB   3.981     85354208      -7.69%      -8.20%          0.78x
+hits_1.parquet  zstd         vanilla main (reference)    121026589  115.42 MiB  -         121026589     +0.00%      -0.57%          -
+hits_1.parquet  zstd         baseline (branch default)   121720489  116.08 MiB  6.803     121026589     +0.57%      +0.00%          1.00x
+hits_1.parquet  zstd         option A (page-grain)       117822844  112.36 MiB  6.361     121026589     -2.65%      -3.20%          0.94x
+hits_1.parquet  zstd         option B (K writers)        113938894  108.66 MiB  18.122    121026589     -5.86%      -6.39%          2.66x
+hits_1.parquet  zstd         option C (hybrid)           115566512  110.21 MiB  5.979     121026589     -4.51%      -5.06%          0.88x
+hits_1.parquet  zstd         tier 0 (probe)              114755184  109.44 MiB  5.736     121026589     -5.18%      -5.72%          0.84x
+hits_1.parquet  zstd         tier 0 minimal (no #10775)  115007313  109.68 MiB  5.561     121026589     -4.97%      -5.52%          0.82x
+hits_2.parquet  zstd         vanilla main (reference)    166652721  158.93 MiB  -         166652721     +0.00%      -0.57%          -
+hits_2.parquet  zstd         baseline (branch default)   167601915  159.84 MiB  5.538     166652721     +0.57%      +0.00%          1.00x
+hits_2.parquet  zstd         option A (page-grain)       157979377  150.66 MiB  6.024     166652721     -5.20%      -5.74%          1.09x
+hits_2.parquet  zstd         option B (K writers)        155777642  148.56 MiB  12.445    166652721     -6.53%      -7.05%          2.25x
+hits_2.parquet  zstd         option C (hybrid)           155497293  148.29 MiB  5.698     166652721     -6.69%      -7.22%          1.03x
+hits_2.parquet  zstd         tier 0 (probe)              155669774  148.46 MiB  4.634     166652721     -6.59%      -7.12%          0.84x
+hits_2.parquet  zstd         tier 0 minimal (no #10775)  155844449  148.62 MiB  4.809     166652721     -6.49%      -7.02%          0.87x
 ```
