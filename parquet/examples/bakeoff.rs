@@ -60,20 +60,14 @@ use std::time::{Duration, Instant};
 use arrow_array::{ArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
+use parquet::arrow::ArrowSchemaConverter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::arrow_writer::page_grain::{
-    Candidate, ColumnChunkBuilder, EncodedPage, LeafCursor,
-};
 use parquet::arrow::arrow_writer::{
-    ArrowColumnChunk, ArrowColumnWriter, ArrowLeafColumn, ArrowWriter, compute_leaves,
+    ArrowColumnChunk, ArrowColumnWriter, ArrowWriter, compute_leaves,
 };
-use parquet::arrow::{ArrowSchemaConverter, add_encoded_arrow_schema_to_metadata};
 use parquet::basic::{Compression, Encoding, Type as PhysicalType};
 use parquet::errors::{ParquetError, Result};
-use parquet::file::properties::{
-    DictionaryFallback, WriterProperties, WriterPropertiesBuilder, WriterPropertiesPtr,
-};
-use parquet::file::writer::SerializedFileWriter;
+use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
 use parquet::schema::types::{ColumnDescPtr, ColumnPath};
 
 // ---------------------------------------------------------------------------
@@ -82,6 +76,9 @@ use parquet::schema::types::{ColumnDescPtr, ColumnPath};
 // Every knob here is applied identically to all four writers. Nothing below
 // may set a property that is not also set for the other two.
 // ---------------------------------------------------------------------------
+
+#[path = "adaptive_writer/harness.rs"]
+mod harness;
 
 /// Rows per synthetic dataset.
 const ROWS: usize = 2_000_000;
@@ -94,24 +91,17 @@ const DATA_PAGE_ROW_LIMIT: usize = 20_000;
 /// Timed runs per (dataset, compression, writer). The median is reported.
 const RUNS: usize = 3;
 
-/// Dictionary page size limit for the racing candidates, deliberately below the
-/// 1 MiB default so that a 100k row chunk can actually reach it and exercise
-/// the fallback policy.
-const DICT_PAGE_SIZE_LIMIT: usize = 64 * 1024;
-/// `worth_ratio` for [`DictionaryFallback::WhenProfitable`].
-const DICT_WORTH_RATIO: f64 = 0.25;
-/// Absolute cap on a retained dictionary page.
-const DICT_MAX_PAGE_SIZE: usize = 8 * 1024 * 1024;
-
-/// Two candidates within this fraction of each other are treated as tied, and
-/// the tie is broken on decode cost rather than on bytes.
-const NEAR_TIE: f64 = 0.02;
 /// Option B settles a leaf when best and worst differ by at least this much.
 const SETTLE_GAP: f64 = 0.10;
 /// Option B re-races a settled leaf every this many row groups.
 const B_REOPEN_EVERY: usize = 8;
-/// Option A re-opens its race every this many row groups.
-const A_REOPEN_EVERY: usize = 4;
+
+/// The dictionary policy, the tie window and the re-open cadence are the
+/// shipped harness's, so options A, B and C are tuned identically.
+use harness::{
+    AdaptiveWriter, DICT_WORTH_RATIO, NEAR_TIE, REOPEN_EVERY as A_REOPEN_EVERY,
+    dictionary_properties, is_decidable,
+};
 
 /// The shared property set. `compression` is the only thing that varies.
 fn shared_properties(compression: Compression) -> WriterPropertiesBuilder {
@@ -368,450 +358,66 @@ fn split_into_row_groups(batches: &[RecordBatch], sizes: &[usize]) -> Vec<Vec<Re
 // columns of the table stay comparable.
 // ---------------------------------------------------------------------------
 
-/// Whether this leaf is worth racing.
-///
-/// Repeated leaves and the types with no useful alternative encoding
-/// (`BOOLEAN`, `FIXED_LEN_BYTE_ARRAY`, `INT96`) are passed through on one
-/// candidate rather than failing the file.
-fn is_raceable(descr: &ColumnDescPtr) -> bool {
-    if descr.max_rep_level() > 0 {
-        return false;
-    }
-    matches!(
-        descr.physical_type(),
-        PhysicalType::INT32 | PhysicalType::INT64 | PhysicalType::BYTE_ARRAY | PhysicalType::DOUBLE
-    )
-}
-
 // ---------------------------------------------------------------------------
-// Option A: the page-grain adaptive harness
+// Options A and C: the adaptive writer
+//
+// Both arms are `examples/adaptive_writer/harness.rs`, the harness this branch
+// ships, driven over the same batches and the same row group boundaries as
+// every other arm. They differ in one field:
+//
+// * **Option C** is the harness as it ships: a leaf takes the page-grain path
+//   while it is still deciding, and an ordinary column writer once it has
+//   settled.
+// * **Option A** sets `always_page_grain`, so every decidable leaf stays on the
+//   page-grain path for the whole file. That is the pure page-grain arm, kept
+//   to price what the routing rule saves and costs.
 // ---------------------------------------------------------------------------
 
-/// How an Option A column is currently being written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Settled {
-    /// Still racing; no choice has been made for this chunk yet.
-    Racing,
-    /// Settled on the chunk's dictionary.
-    Dictionary,
-    /// Settled on a fixed encoding.
-    Fixed(Encoding),
-}
-
-/// Ranks encodings by how cheap they are to decode, lowest first. Used to break
-/// near-ties in favour of the reader.
-fn decode_cost(encoding: Encoding) -> u8 {
-    match encoding {
-        Encoding::PLAIN => 0,
-        Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => 1,
-        Encoding::DELTA_BINARY_PACKED | Encoding::DELTA_LENGTH_BYTE_ARRAY => 2,
-        Encoding::DELTA_BYTE_ARRAY => 3,
-        _ => 4,
+/// Writes a whole file with the adaptive writer.
+fn write_adaptive(
+    schema: &SchemaRef,
+    groups: &[Vec<RecordBatch>],
+    props: &WriterProperties,
+    path: &Path,
+    always_page_grain: bool,
+) -> Result<Duration> {
+    let start = Instant::now();
+    let mut writer = AdaptiveWriter::try_new(File::create(path)?, schema.clone(), props.clone())?;
+    for policy in &mut writer.policies {
+        policy.always_page_grain = always_page_grain;
     }
-}
 
-/// Whether an encoding indexes into the column chunk's dictionary.
-fn is_dictionary_indices(encoding: Encoding) -> bool {
-    matches!(
-        encoding,
-        Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
-    )
-}
-
-/// The true cost of a page: its own compressed bytes plus whatever it added to
-/// the chunk's dictionary, which is paid later in the dictionary page.
-fn page_cost(page: &EncodedPage) -> usize {
-    page.compressed_len() + page.dictionary_growth()
-}
-
-/// Cheapest page wins, but a cheaper-to-decode page within `NEAR_TIE` of the
-/// cheapest is preferred.
-fn pick_page(pages: &[EncodedPage]) -> usize {
-    let cost = |p: &EncodedPage| page_cost(p);
-    let smallest = pages.iter().map(cost).min().unwrap_or(0);
-    let budget = (smallest as f64 * (1.0 + NEAR_TIE)) as usize;
-    pages
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| cost(p) <= budget)
-        .min_by_key(|(_, p)| (decode_cost(p.encoding()), cost(p)))
-        .map(|(i, _)| i)
-        .unwrap_or(0)
-}
-
-/// What one sealed page measured, kept to feed the next decision.
-struct PageReport {
-    encoding: Encoding,
-    compressed: usize,
-    uncompressed: usize,
-    is_dictionary: bool,
-}
-
-/// Per-leaf state that outlives a single row group: this is where Option A's
-/// cross-row-group learning lives.
-struct LeafPolicyA {
-    /// Choice carried forward from the previous row group.
-    learned: Settled,
-    /// Race candidates for this leaf's physical type.
-    challengers: Vec<Encoding>,
-    /// After this leaf has settled, re-decide each page from the previous
-    /// sealed page's numbers instead of pinning the settled choice outright.
-    /// This refines a settled leaf; it does not replace the race.
-    adapt_per_page: bool,
-    /// One candidate, always: this leaf's type or shape has no useful race.
-    passthrough: bool,
-    /// Dictionary page size limit for this leaf, used to leave a dictionary
-    /// that a passthrough column would otherwise grow without bound.
-    dictionary_limit: usize,
-    row_groups: usize,
-    raced_pages: usize,
-    total_pages: usize,
-}
-
-impl LeafPolicyA {
-    fn new(descr: &ColumnDescPtr, props: &WriterProperties) -> Self {
-        let path = descr.path().clone();
-        let raceable = is_raceable(descr);
-        let challengers = match descr.physical_type() {
-            PhysicalType::BYTE_ARRAY => vec![Encoding::PLAIN, Encoding::DELTA_BYTE_ARRAY],
-            PhysicalType::INT32 | PhysicalType::INT64 => {
-                vec![Encoding::PLAIN, Encoding::DELTA_BINARY_PACKED]
-            }
-            _ => vec![Encoding::PLAIN],
-        };
-        Self {
-            dictionary_limit: props.column_dictionary_page_size_limit(&path),
-            learned: Settled::Racing,
-            challengers,
-            // Floats race like every other type (the dictionary against
-            // PLAIN), and then keep adapting per page once they have settled:
-            // a float column's answer can drift with the data even when the
-            // set of candidates worth racing does not.
-            adapt_per_page: raceable && descr.physical_type() == PhysicalType::DOUBLE,
-            passthrough: !raceable,
-            row_groups: 0,
-            raced_pages: 0,
-            total_pages: 0,
+    for group in groups {
+        for batch in group {
+            writer.write(batch)?;
         }
+        // Ends the row group; a no-op if the group contributed no rows.
+        writer.flush()?;
     }
-
-    /// Decide what to offer for the next page.
-    fn plan(
-        &self,
-        chunk: &ColumnChunkBuilder,
-        state: Settled,
-        last: Option<&PageReport>,
-    ) -> Vec<Candidate> {
-        let dictionary = chunk.dictionary();
-        let has_dictionary = dictionary.is_some();
-
-        if self.passthrough {
-            // Single-candidate passthrough. The library does not fall back off
-            // a dictionary on its own at this grain, so leave it once it has
-            // outgrown the configured dictionary page size limit.
-            let within_limit = dictionary
-                .map(|d| d.encoded_bytes() <= self.dictionary_limit)
-                .unwrap_or(false);
-            return if within_limit {
-                vec![Candidate::Dictionary]
-            } else {
-                vec![Candidate::Encoding(Encoding::PLAIN)]
-            };
-        }
-
-        match state {
-            Settled::Racing => {
-                let mut candidates = Vec::new();
-                // The dictionary paces when it is available: pacing with it
-                // keeps its budget accounting honest.
-                if has_dictionary {
-                    candidates.push(Candidate::Dictionary);
-                }
-                for encoding in &self.challengers {
-                    candidates.push(Candidate::Encoding(*encoding));
-                }
-                candidates
-            }
-            Settled::Dictionary if has_dictionary => {
-                if self.adapt_per_page {
-                    vec![self.adapt(state, last, has_dictionary)]
-                } else {
-                    vec![Candidate::Dictionary]
-                }
-            }
-            // The dictionary was abandoned since we settled on it: race the
-            // fallbacks now and land on whichever wins at this moment.
-            Settled::Dictionary => self
-                .challengers
-                .iter()
-                .map(|e| Candidate::Encoding(*e))
-                .collect(),
-            Settled::Fixed(encoding) => {
-                if self.adapt_per_page {
-                    vec![self.adapt(state, last, has_dictionary)]
-                } else {
-                    vec![Candidate::Encoding(encoding)]
-                }
-            }
-        }
-    }
-
-    /// One candidate, chosen from the previous sealed page's measured numbers.
-    ///
-    /// Used only after a leaf has settled. A page that barely compressed is
-    /// evidence the current encoding has stopped helping, and the dictionary
-    /// can only be left, never rejoined.
-    fn adapt(&self, state: Settled, last: Option<&PageReport>, has_dictionary: bool) -> Candidate {
-        match last {
-            // Cold start: the first page of a chunk has no previous page to
-            // learn from, so it continues from what this leaf settled on. It
-            // must not default to the dictionary, or every settled chunk would
-            // open with a dictionary page it then abandons.
-            None => match state {
-                Settled::Dictionary if has_dictionary => Candidate::Dictionary,
-                Settled::Fixed(encoding) => Candidate::Encoding(encoding),
-                _ if has_dictionary => Candidate::Dictionary,
-                _ => Candidate::Encoding(self.challengers[0]),
-            },
-            Some(prev) => {
-                let ratio = prev.compressed as f64 / prev.uncompressed.max(1) as f64;
-                if prev.encoding == Encoding::RLE_DICTIONARY && ratio > 0.9 && has_dictionary {
-                    Candidate::Encoding(self.challengers[0])
-                } else if prev.is_dictionary && has_dictionary {
-                    Candidate::Dictionary
-                } else {
-                    Candidate::Encoding(prev.encoding)
-                }
-            }
-        }
-    }
-
-    /// Whether the race re-opens for the row group about to be written.
-    fn race_reopens(&self) -> bool {
-        self.row_groups.is_multiple_of(A_REOPEN_EVERY)
-    }
-
-    /// Whether this leaf still needs the page-grain path for the row group
-    /// about to be written, which is Option C's routing rule.
-    ///
-    /// A leaf needs it while it is actively deciding: it has never settled, its
-    /// race is re-opening this row group, or it adapts per page and so is never
-    /// finished deciding. Everything else, including every passthrough leaf and
-    /// every leaf resting on a settled choice, can take the ordinary column
-    /// writer path and the full library fast path with it.
-    fn needs_page_grain(&self) -> bool {
-        if self.passthrough {
-            return false;
-        }
-        self.adapt_per_page || self.race_reopens() || matches!(self.learned, Settled::Racing)
-    }
-
-    /// The standard-writer candidate matching this leaf's settled choice, used
-    /// when Option C routes it away from the page-grain path.
-    fn settled_candidate(&self, physical: PhysicalType) -> CandidateB {
-        if self.passthrough {
-            return CandidateB::Passthrough;
-        }
-        match self.learned {
-            Settled::Dictionary => CandidateB::Dictionary,
-            Settled::Fixed(Encoding::PLAIN) => CandidateB::Plain,
-            Settled::Fixed(_) if CandidateB::delta_encoding(physical).is_some() => {
-                CandidateB::Delta
-            }
-            // A settled non-PLAIN encoding with no delta form, or a leaf that
-            // never settled, is written as the file's properties would.
-            _ => CandidateB::Passthrough,
-        }
-    }
-
-    /// Should the dictionary be abandoned now? Once enough values have gone
-    /// through it, distinct entries above a quarter of the values written means
-    /// it has stopped deduplicating anything.
-    ///
-    /// `values_through_dictionary` is the harness's own count, summed from the
-    /// pages the dictionary candidate encoded: the library reports what the
-    /// dictionary holds, not how much traffic a policy has sent through it.
-    fn dictionary_is_still_paying(chunk: &ColumnChunkBuilder, values: u64) -> bool {
-        match chunk.dictionary() {
-            None => false,
-            Some(d) => values < 50_000 || (d.entries() as u64) * 4 < values,
-        }
-    }
+    writer.close()?;
+    Ok(start.elapsed())
 }
 
-/// One column chunk being written through the page-grain API.
-///
-/// Resumable across the record batches of a row group, so a caller can
-/// interleave it with leaves written by ordinary column writers. Option A uses
-/// one of these for every leaf; Option C uses one only for the leaves that are
-/// still making a decision.
-struct ChunkRacer {
-    chunk: ColumnChunkBuilder,
-    state: Settled,
-    last: Option<PageReport>,
-    races_left: usize,
-    /// Values this chunk has routed through the dictionary, summed from the
-    /// pages the dictionary candidate encoded.
-    values_through_dictionary: u64,
-}
-
-impl ChunkRacer {
-    fn new(policy: &LeafPolicyA, descr: ColumnDescPtr, props: WriterPropertiesPtr) -> Result<Self> {
-        // Cross-row-group learning: start from what the previous row group
-        // settled on, unless it is time to re-open the race.
-        let state = if policy.race_reopens() {
-            Settled::Racing
-        } else {
-            policy.learned
-        };
-        Ok(Self {
-            chunk: ColumnChunkBuilder::new(descr, props)?,
-            state,
-            last: None,
-            races_left: 2,
-            values_through_dictionary: 0,
-        })
-    }
-
-    /// Encodes one leaf's worth of values, a page at a time.
-    fn feed(&mut self, policy: &mut LeafPolicyA, leaf: &ArrowLeafColumn) -> Result<()> {
-        let mut cursor: LeafCursor = self.chunk.cursor(leaf);
-        while !cursor.is_empty() {
-            // Dictionary watching: drop out of the dictionary the moment it
-            // stops paying, and let the next race pick the landing encoding.
-            if matches!(self.state, Settled::Dictionary)
-                && !LeafPolicyA::dictionary_is_still_paying(
-                    &self.chunk,
-                    self.values_through_dictionary,
-                )
-            {
-                self.state = Settled::Racing;
-                self.races_left = 1;
-            }
-
-            let candidates = policy.plan(&self.chunk, self.state, self.last.as_ref());
-
-            let (first, alternatives) = candidates.split_first().expect("a candidate");
-            let pages = self
-                .chunk
-                .encode_page_alternatives(&mut cursor, *first, alternatives)?;
-
-            policy.total_pages += 1;
-            if pages.len() > 1 {
-                policy.raced_pages += 1;
-            }
-            if *first == Candidate::Dictionary {
-                self.values_through_dictionary += u64::from(pages[0].num_values());
-            }
-
-            let winner = pick_page(&pages);
-            let page = pages.into_iter().nth(winner).unwrap();
-
-            self.last = Some(PageReport {
-                encoding: page.encoding(),
-                compressed: page.compressed_len(),
-                uncompressed: page.uncompressed_len(),
-                is_dictionary: is_dictionary_indices(page.encoding()),
-            });
-
-            // Settle: once enough raced pages agree, stop paying for the race.
-            if matches!(self.state, Settled::Racing) && !policy.passthrough {
-                self.races_left = self.races_left.saturating_sub(1);
-                if self.races_left == 0 {
-                    self.state = if is_dictionary_indices(page.encoding()) {
-                        Settled::Dictionary
-                    } else {
-                        Settled::Fixed(page.encoding())
-                    };
-                }
-            }
-
-            self.chunk.append(page)?;
-        }
-        Ok(())
-    }
-
-    /// Closes the chunk and records what this row group learned.
-    fn finish(self, policy: &mut LeafPolicyA) -> Result<ArrowColumnChunk> {
-        policy.row_groups += 1;
-        if !policy.passthrough {
-            policy.learned = self.state;
-        }
-        self.chunk.close()
-    }
-}
-
-/// Writes one column chunk under `policy`.
-fn write_chunk_a(
-    policy: &mut LeafPolicyA,
-    descr: ColumnDescPtr,
-    props: WriterPropertiesPtr,
-    leaves: &[ArrowLeafColumn],
-) -> Result<ArrowColumnChunk> {
-    let mut racer = ChunkRacer::new(policy, descr, props)?;
-    for leaf in leaves {
-        racer.feed(policy, leaf)?;
-    }
-    racer.finish(policy)
-}
-
-/// Writes a whole file through the page-grain API.
 fn write_option_a(
     schema: &SchemaRef,
     groups: &[Vec<RecordBatch>],
     props: &WriterProperties,
     path: &Path,
 ) -> Result<Duration> {
-    let parquet_schema = ArrowSchemaConverter::new()
-        .with_coerce_types(props.coerce_types())
-        .convert(schema)?;
+    write_adaptive(schema, groups, props, path, true)
+}
 
-    let mut props = props.clone();
-    add_encoded_arrow_schema_to_metadata(schema, &mut props);
-    let props = Arc::new(props);
-
-    let mut policies: Vec<LeafPolicyA> = parquet_schema
-        .columns()
-        .iter()
-        .map(|descr| LeafPolicyA::new(descr, &props))
-        .collect();
-
-    let start = Instant::now();
-    let file = File::create(path)?;
-    let mut writer =
-        SerializedFileWriter::new(file, parquet_schema.root_schema_ptr(), props.clone())?;
-
-    for group in groups {
-        // Flatten each batch into leaves, in schema descriptor order, and
-        // collect them per leaf. This is generic over nesting: a field that
-        // expands into several leaves simply contributes several entries.
-        let mut per_leaf: Vec<Vec<ArrowLeafColumn>> = (0..parquet_schema.num_columns())
-            .map(|_| Vec::new())
-            .collect();
-        for batch in group {
-            let mut leaf_idx = 0usize;
-            for (field, column) in schema.fields().iter().zip(batch.columns()) {
-                for leaf in compute_leaves(field.as_ref(), column)? {
-                    per_leaf[leaf_idx].push(leaf);
-                    leaf_idx += 1;
-                }
-            }
-        }
-
-        let mut row_group = writer.next_row_group()?;
-        for (idx, policy) in policies.iter_mut().enumerate() {
-            let descr = parquet_schema.columns()[idx].clone();
-            let chunk = write_chunk_a(policy, descr, props.clone(), &per_leaf[idx])?;
-            chunk.append_to_row_group(&mut row_group)?;
-        }
-        row_group.close()?;
-    }
-    writer.close()?;
-    Ok(start.elapsed())
+fn write_option_c(
+    schema: &SchemaRef,
+    groups: &[Vec<RecordBatch>],
+    props: &WriterProperties,
+    path: &Path,
+) -> Result<Duration> {
+    write_adaptive(schema, groups, props, path, false)
 }
 
 /// The leaves both harnesses pass through on a single candidate rather than
-/// racing, for reporting. Both use [`is_raceable`], so the list is shared.
+/// racing, for reporting. Both use `is_decidable`, so the list is shared.
 fn passthrough_leaves(schema: &SchemaRef, props: &WriterProperties) -> Result<Vec<String>> {
     let parquet_schema = ArrowSchemaConverter::new()
         .with_coerce_types(props.coerce_types())
@@ -819,7 +425,7 @@ fn passthrough_leaves(schema: &SchemaRef, props: &WriterProperties) -> Result<Ve
     Ok(parquet_schema
         .columns()
         .iter()
-        .filter(|d| !is_raceable(d))
+        .filter(|d| !is_decidable(d))
         .map(|d| d.path().string())
         .collect())
 }
@@ -863,7 +469,7 @@ impl CandidateB {
 
     /// Candidates worth racing for `descr`.
     fn for_leaf(descr: &ColumnDescPtr) -> Vec<CandidateB> {
-        if !is_raceable(descr) {
+        if !is_decidable(descr) {
             return vec![CandidateB::Passthrough];
         }
         let mut out = vec![CandidateB::Dictionary, CandidateB::Plain];
@@ -882,16 +488,7 @@ impl CandidateB {
     ) -> WriterPropertiesBuilder {
         match self {
             CandidateB::Passthrough => builder,
-            CandidateB::Dictionary => builder
-                .set_column_dictionary_enabled(col.clone(), true)
-                .set_column_dictionary_page_size_limit(col.clone(), DICT_PAGE_SIZE_LIMIT)
-                .set_column_dictionary_fallback(
-                    col,
-                    DictionaryFallback::WhenProfitable {
-                        worth_ratio: DICT_WORTH_RATIO,
-                        max_dictionary_page_size: DICT_MAX_PAGE_SIZE,
-                    },
-                ),
+            CandidateB::Dictionary => dictionary_properties(builder, col),
             CandidateB::Plain => builder
                 .set_column_dictionary_enabled(col.clone(), false)
                 .set_column_encoding(col, Encoding::PLAIN),
@@ -1100,147 +697,6 @@ fn write_option_b(
             winner
                 .expect("every leaf selects a winning chunk")
                 .append_to_row_group(&mut rg)?;
-        }
-        rg.close()?;
-    }
-
-    file_writer.close()?;
-    Ok(start.elapsed())
-}
-
-// ---------------------------------------------------------------------------
-// Option C: the hybrid
-//
-// Composition rule, per leaf per row group:
-//
-// * A leaf that is **actively deciding** (never settled, its race re-opens this
-//   row group, or it adapts per page) is written with the **page-grain
-//   builder**, racing candidates a page at a time with the dictionary-growth
-//   charge, exactly as Option A does.
-// * Every other leaf, which is every **settled** leaf and every leaf with
-//   **nothing to race**, is written with an ordinary `ArrowColumnWriter` from
-//   `create_column_writers_with_properties`, configured with the candidate that
-//   leaf settled on. That is Option B's path and the library's full fast path.
-// * Wherever a dictionary runs on that standard path, it runs under
-//   `DictionaryFallback::WhenProfitable`, so a settled dictionary leaf still
-//   leaves its dictionary when it stops paying without needing the page grain
-//   to watch it.
-//
-// Both paths produce an `ArrowColumnChunk`, so the two kinds of chunk are
-// appended to one `SerializedRowGroupWriter` in leaf order.
-// ---------------------------------------------------------------------------
-
-/// Writes a whole file, routing each leaf to the page-grain builder or to an
-/// ordinary column writer according to whether it is still deciding.
-fn write_option_c(
-    schema: &SchemaRef,
-    groups: &[Vec<RecordBatch>],
-    props: &WriterProperties,
-    path: &Path,
-) -> Result<Duration> {
-    let start = Instant::now();
-
-    let file = File::create(path)?;
-    let arrow_writer = ArrowWriter::try_new(file, schema.clone(), Some(props.clone()))?;
-    let (mut file_writer, factory) = arrow_writer.into_serialized_writer()?;
-
-    let descrs: Vec<ColumnDescPtr> = file_writer.schema_descr().columns().to_vec();
-    let mut policies: Vec<LeafPolicyA> = descrs
-        .iter()
-        .map(|descr| LeafPolicyA::new(descr, props))
-        .collect();
-
-    // The page-grain builders need the arrow schema in the file metadata just
-    // as Option A does; the `ArrowWriter` already put it in the file writer's
-    // properties, so the page-grain props only add the dictionary policy.
-    let mut page_grain_builder = props.clone().into_builder();
-    for descr in &descrs {
-        page_grain_builder = CandidateB::Dictionary.apply(
-            page_grain_builder,
-            descr.path().clone(),
-            descr.physical_type(),
-        );
-    }
-    let page_grain_props: WriterPropertiesPtr = Arc::new(page_grain_builder.build());
-
-    for (row_group, group) in groups.iter().enumerate() {
-        // Route every leaf before the row group starts.
-        let routes: Vec<bool> = policies.iter().map(|p| p.needs_page_grain()).collect();
-
-        // One set of standard column writers, carrying each settled leaf's
-        // candidate. Leaves on the page-grain path are never written to, so
-        // their entries in this set are dropped unused at the end of the row
-        // group.
-        let mut builder = props.clone().into_builder();
-        for (idx, policy) in policies.iter().enumerate() {
-            if !routes[idx] {
-                let candidate = policy.settled_candidate(descrs[idx].physical_type());
-                builder = candidate.apply(
-                    builder,
-                    descrs[idx].path().clone(),
-                    descrs[idx].physical_type(),
-                );
-            }
-        }
-        let standard_props = Arc::new(builder.build());
-        // `Option` so a writer can be moved out and closed individually while
-        // the unused ones stay in place to be dropped.
-        let mut standard: Vec<Option<ArrowColumnWriter>> = factory
-            .create_column_writers_with_properties(row_group, &standard_props)?
-            .into_iter()
-            .map(Some)
-            .collect();
-
-        // One page-grain builder per racing leaf, and none for the rest.
-        let mut racers: Vec<Option<ChunkRacer>> = Vec::with_capacity(descrs.len());
-        for (idx, policy) in policies.iter().enumerate() {
-            racers.push(if routes[idx] {
-                Some(ChunkRacer::new(
-                    policy,
-                    descrs[idx].clone(),
-                    page_grain_props.clone(),
-                )?)
-            } else {
-                None
-            });
-        }
-
-        for batch in group {
-            let mut leaf_idx = 0usize;
-            for (field, column) in schema.fields().iter().zip(batch.columns()) {
-                for leaf in compute_leaves(field.as_ref(), column)? {
-                    match &mut racers[leaf_idx] {
-                        Some(racer) => racer.feed(&mut policies[leaf_idx], &leaf)?,
-                        None => standard[leaf_idx]
-                            .as_mut()
-                            .expect("standard writer present for a non-racing leaf")
-                            .write(&leaf)?,
-                    }
-                    leaf_idx += 1;
-                }
-            }
-        }
-
-        // Close both kinds of chunk and append them in leaf order.
-        let mut chunks: Vec<ArrowColumnChunk> = Vec::with_capacity(descrs.len());
-        for (idx, racer) in racers.into_iter().enumerate() {
-            match racer {
-                Some(racer) => chunks.push(racer.finish(&mut policies[idx])?),
-                None => {
-                    policies[idx].row_groups += 1;
-                    chunks.push(
-                        standard[idx]
-                            .take()
-                            .expect("standard writer present for a non-racing leaf")
-                            .close()?,
-                    );
-                }
-            }
-        }
-
-        let mut rg = file_writer.next_row_group()?;
-        for chunk in chunks {
-            chunk.append_to_row_group(&mut rg)?;
         }
         rg.close()?;
     }
