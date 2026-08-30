@@ -722,8 +722,11 @@ impl ColumnChunkBuilder {
         let prepared = assemble(writer)?;
         if candidate == Candidate::Dictionary {
             // Sealing flushed the indices, so the dictionary comes back with an
-            // empty pending buffer either way; the rollback is what makes an
-            // *unsealed* candidate safe, and is exercised by `drop_candidate`.
+            // empty pending buffer. Entries a *losing* dictionary candidate
+            // interned deliberately stay: every candidate for a span sees the
+            // same values, so such an entry is a value that genuinely occurs in
+            // the span, and a dictionary that is a superset of what its indices
+            // reference is valid. See `PAGE_API_DESIGN.md`.
             self.dictionary = take_dictionary(writer);
         }
         Ok(prepared)

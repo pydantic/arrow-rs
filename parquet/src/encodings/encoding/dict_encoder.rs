@@ -111,15 +111,6 @@ impl<T: DataType> DictEncoder<T> {
         }
     }
 
-    /// Discard the indices buffered for the in-progress page, keeping the
-    /// interned entries.
-    ///
-    /// Used when a page-grain candidate that was encoding indices is abandoned
-    /// before being sealed.
-    pub(crate) fn clear_pending(&mut self) {
-        self.indices.clear();
-    }
-
     /// Returns true if dictionary entries are sorted, false otherwise.
     pub fn is_sorted(&self) -> bool {
         // Sorting is not supported currently.

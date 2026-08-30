@@ -719,16 +719,6 @@ pub trait DynDictionary: std::any::Any {
     /// Encoded size of the dictionary page's entries, in bytes.
     fn dict_encoded_size(&self) -> usize;
 
-    /// Discard indices buffered for a page that was abandoned rather than
-    /// sealed.
-    ///
-    /// Entries interned by the abandoned page are deliberately *not* removed:
-    /// every candidate for a span sees the same values, so an entry a losing
-    /// candidate added is a value that genuinely occurs in that span. A
-    /// dictionary that is a superset of what its indices reference is valid;
-    /// see `PAGE_API_DESIGN.md`.
-    fn rollback_pending(&mut self);
-
     /// Consume the dictionary, producing its page.
     fn into_dictionary_page(self: Box<Self>) -> Result<DictionaryPage>;
 
@@ -743,10 +733,6 @@ impl<T: DataType> DynDictionary for DictEncoder<T> {
 
     fn dict_encoded_size(&self) -> usize {
         DictEncoder::dict_encoded_size(self)
-    }
-
-    fn rollback_pending(&mut self) {
-        DictEncoder::clear_pending(self);
     }
 
     fn into_dictionary_page(self: Box<Self>) -> Result<DictionaryPage> {

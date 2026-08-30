@@ -736,13 +736,6 @@ impl DynDictionary for DictEncoder {
         self.estimated_dict_page_size()
     }
 
-    fn rollback_pending(&mut self) {
-        // Entries stay interned (see `DynDictionary::rollback_pending`); only
-        // the abandoned page's indices and its byte tally are discarded.
-        self.indices.clear();
-        self.variable_length_bytes = 0;
-    }
-
     fn into_dictionary_page(self: Box<Self>) -> Result<DictionaryPage> {
         Ok((*self).flush_dict_page())
     }
