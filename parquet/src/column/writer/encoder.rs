@@ -730,7 +730,7 @@ impl<T: DataType> DynDictionary for DictEncoder<T> {
 /// lent to whichever page encoder is *pacing* — the one that advances the
 /// cursor — for exactly the span it consumes. Raced candidates for that same
 /// span have theirs taken away and dropped, so K candidates still produce
-/// exactly one insert per value. See `PAGE_API_DESIGN.md`.
+/// exactly one insert per value.
 #[derive(Default)]
 pub struct ValueAccumulators {
     pub bloom_filter: Option<Sbbf>,

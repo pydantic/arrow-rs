@@ -71,7 +71,7 @@ use parquet::schema::types::{ColumnDescPtr, ColumnPath};
 //
 // Everything from here to the plumbing section is a decision about data, and a
 // different writer would decide differently. The constants are the ones tuned
-// against the bakeoff datasets.
+// against ClickBench and TPC-H data.
 // ===========================================================================
 
 /// Dictionary page size limit for the columns this writer decides for,
@@ -183,20 +183,15 @@ pub struct LeafPolicy {
     adapt_per_page: bool,
     /// This leaf is written as the properties say, and decides nothing.
     passthrough: bool,
-    /// Dictionary page size limit for this leaf, from the properties.
-    dictionary_limit: usize,
     /// Route every leaf through the page grain, whatever it has settled on.
     /// The point of this writer is that it does not, but measuring the
     /// difference needs a way to ask for it.
     pub always_page_grain: bool,
     row_groups: usize,
-    /// Reporting only: pages encoded, and pages encoded more than one way.
-    pub total_pages: usize,
-    pub multi_pages: usize,
 }
 
 impl LeafPolicy {
-    pub fn new(descr: &ColumnDescPtr, props: &WriterProperties) -> Self {
+    pub fn new(descr: &ColumnDescPtr) -> Self {
         let decidable = is_decidable(descr);
         let alternatives = match descr.physical_type() {
             PhysicalType::BYTE_ARRAY => vec![Encoding::PLAIN, Encoding::DELTA_BYTE_ARRAY],
@@ -206,7 +201,6 @@ impl LeafPolicy {
             _ => vec![Encoding::PLAIN],
         };
         Self {
-            dictionary_limit: props.column_dictionary_page_size_limit(descr.path()),
             learned: Choice::Undecided,
             alternatives,
             // A float column has no second encoding worth switching to, so it
@@ -216,8 +210,6 @@ impl LeafPolicy {
             passthrough: !decidable,
             always_page_grain: false,
             row_groups: 0,
-            total_pages: 0,
-            multi_pages: 0,
         }
     }
 
@@ -251,21 +243,9 @@ impl LeafPolicy {
         choice: Choice,
         last: Option<&PageReport>,
     ) -> Vec<Candidate> {
-        let dictionary = chunk.dictionary();
-        let has_dictionary = dictionary.is_some();
-
-        if self.passthrough {
-            // One candidate, and no decision. Nothing leaves a dictionary on
-            // this path by itself, so leave it once it has outgrown the
-            // configured dictionary page size limit.
-            let within_limit =
-                dictionary.is_some_and(|d| d.encoded_bytes() <= self.dictionary_limit);
-            return if within_limit {
-                vec![Candidate::Dictionary]
-            } else {
-                vec![Candidate::Encoding(Encoding::PLAIN)]
-            };
-        }
+        // A passthrough leaf never reaches this: `needs_page_grain` keeps it
+        // on the ordinary path.
+        let has_dictionary = chunk.dictionary().is_some();
 
         match choice {
             Choice::Undecided => {
@@ -435,7 +415,7 @@ impl PageGrainChunk {
     }
 
     /// Encode one leaf's values, a page at a time.
-    fn write(&mut self, policy: &mut LeafPolicy, leaf: &ArrowLeafColumn) -> Result<()> {
+    fn write(&mut self, policy: &LeafPolicy, leaf: &ArrowLeafColumn) -> Result<()> {
         let mut cursor = self.chunk.cursor(leaf);
         while !cursor.is_empty() {
             // Leave the dictionary the moment it stops paying, and let the
@@ -453,10 +433,6 @@ impl PageGrainChunk {
                 .chunk
                 .encode_page_alternatives(&mut cursor, *first, alternatives)?;
 
-            policy.total_pages += 1;
-            if pages.len() > 1 {
-                policy.multi_pages += 1;
-            }
             if *first == Candidate::Dictionary {
                 self.dictionary_values += u64::from(pages[0].num_values());
             }
@@ -475,7 +451,7 @@ impl PageGrainChunk {
             });
 
             // Settle once enough consecutive pages have agreed.
-            if self.choice == Choice::Undecided && !policy.passthrough {
+            if self.choice == Choice::Undecided {
                 self.pages_to_settle = self.pages_to_settle.saturating_sub(1);
                 if self.pages_to_settle == 0 {
                     self.choice = if is_dictionary_indices(page.encoding()) {
@@ -493,9 +469,7 @@ impl PageGrainChunk {
 
     /// Close the chunk and record what this row group learned.
     fn close(self, policy: &mut LeafPolicy) -> Result<ArrowColumnChunk> {
-        if !policy.passthrough {
-            policy.learned = self.choice;
-        }
+        policy.learned = self.choice;
         self.chunk.close()
     }
 }
@@ -536,10 +510,7 @@ impl<W: Write + Send> AdaptiveWriter<W> {
                 .into_serialized_writer()?;
 
         let descrs: Vec<ColumnDescPtr> = file_writer.schema_descr().columns().to_vec();
-        let policies = descrs
-            .iter()
-            .map(|descr| LeafPolicy::new(descr, &props))
-            .collect();
+        let policies = descrs.iter().map(LeafPolicy::new).collect();
 
         let mut builder = file_writer.properties().as_ref().clone().into_builder();
         for descr in &descrs {
@@ -572,7 +543,7 @@ impl<W: Write + Send> AdaptiveWriter<W> {
         for (field, column) in self.schema.fields().iter().zip(batch.columns()) {
             for values in compute_leaves(field.as_ref(), column)? {
                 match &mut open.page_grain[leaf] {
-                    Some(chunk) => chunk.write(&mut self.policies[leaf], &values)?,
+                    Some(chunk) => chunk.write(&self.policies[leaf], &values)?,
                     None => open.standard[leaf]
                         .as_mut()
                         .expect("every leaf is on exactly one path")

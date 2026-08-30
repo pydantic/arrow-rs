@@ -108,12 +108,11 @@
 //!
 //! Bloom filters and geospatial statistics are fed by *values*, once per value,
 //! and belong to the chunk rather than to any page — so racing K candidate
-//! encodings of the same rows must not insert each value K times. See
-//! `parquet/PAGE_API_DESIGN.md` for the resolution; the short version is that
-//! the builder owns them and lends them only to the candidate that decides the
-//! page boundary, for exactly the rows it consumes, and that this happens at *pace* time rather
-//! than at append time because the values are in the chunk no matter which
-//! encoding wins.
+//! encodings of the same rows must not insert each value K times. The builder
+//! owns them and lends them only to the candidate that decides the page
+//! boundary, for exactly the rows it consumes. This happens at *pace* time
+//! rather than at append time because the values are in the chunk no matter
+//! which encoding wins.
 //!
 //! [`SerializedFileWriter::next_row_group`]: crate::file::writer::SerializedFileWriter::next_row_group
 //! [`WriterProperties::data_page_size_limit`]: crate::file::properties::WriterProperties::data_page_size_limit
@@ -189,30 +188,34 @@ impl LeafCursor {
         self.total_levels - self.level_offset
     }
 
-    /// Cut the next pacing window: at most `window` levels, extended forwards to
-    /// the next record boundary so a record is never handed to the encoder in
-    /// two pieces.
-    fn next_window(&self) -> CdcChunk {
-        let remaining = self.levels_remaining();
+    /// Cut the next pacing window, starting `levels_taken` levels past the
+    /// cursor: at most `window` levels, extended forwards to the next record
+    /// boundary so the window never ends inside a record. The window end is the
+    /// one place the page budget can trip that `write_batch_inner`'s own
+    /// record-aligned chunking does not protect, so it must be a record
+    /// boundary itself.
+    fn next_window(&self, levels_taken: usize, values_taken: usize) -> CdcChunk {
+        let level_offset = self.level_offset + levels_taken;
+        let remaining = self.total_levels - level_offset;
         let mut num_levels = self.window.min(remaining);
 
         // Extend to the next `rep == 0`. A record that starts inside the window
         // is carried whole; `write_batch_inner` will not split it either.
         if let LevelData::Materialized(rep) = self.levels.rep_level_data() {
-            while num_levels < remaining && rep[self.level_offset + num_levels] != 0 {
+            while num_levels < remaining && rep[level_offset + num_levels] != 0 {
                 num_levels += 1;
             }
         }
 
         let def = self.levels.def_level_data().as_ref();
         let num_values = def
-            .slice(self.level_offset, num_levels)
+            .slice(level_offset, num_levels)
             .value_count(num_levels, self.max_def_level);
 
         CdcChunk {
-            level_offset: self.level_offset,
+            level_offset,
             num_levels,
-            value_offset: self.value_offset,
+            value_offset: self.value_offset + values_taken,
             num_values,
         }
     }
@@ -399,7 +402,7 @@ pub struct ColumnChunkBuilder {
     /// dictionary-then-fallback within a chunk, never the reverse.
     dictionary_closed: bool,
     /// Value-fed chunk accumulators; see the module docs and
-    /// `PAGE_API_DESIGN.md`.
+    /// [`ValueAccumulators`].
     accumulators: ValueAccumulators,
     pages_appended: usize,
     pace_window: usize,
@@ -571,10 +574,19 @@ impl ColumnChunkBuilder {
                  boundary may add to it"
             ));
         }
-        if candidate == Candidate::Dictionary && self.dictionary.is_none() {
+        // `dictionary_closed` alone is not implied by `dictionary.is_none()`:
+        // after dictionary-then-fallback the dictionary object is still held so
+        // its page can be written at close, but no further indices page may
+        // reference it. Rejecting here, before any encoding, matters because
+        // encoding advances the cursor: a page rejected only at `append` would
+        // leave its rows consumed with no page to show for them.
+        if candidate == Candidate::Dictionary
+            && (self.dictionary.is_none() || self.dictionary_closed)
+        {
             return Err(general_err!(
-                "this column chunk has no dictionary: it was either disabled in the \
-                 writer properties or abandoned when a non-dictionary page was appended"
+                "this column chunk has no usable dictionary: it was disabled in the \
+                 writer properties, or a non-dictionary page has been appended and the \
+                 chunk can never return to dictionary encoding"
             ));
         }
 
@@ -625,22 +637,10 @@ impl ColumnChunkBuilder {
         let mut values_taken = 0usize;
         let result = (|| -> Result<()> {
             loop {
-                let mut window = cursor.next_window();
-                window.level_offset += levels_taken;
-                window.value_offset += values_taken;
-                window.num_levels = window
-                    .num_levels
-                    .min(cursor.levels_remaining() - levels_taken);
+                let window = cursor.next_window(levels_taken, values_taken);
                 if window.num_levels == 0 {
                     break;
                 }
-                // Recount the window's values from its shifted start.
-                window.num_values = cursor
-                    .levels
-                    .def_level_data()
-                    .as_ref()
-                    .slice(window.level_offset, window.num_levels)
-                    .value_count(window.num_levels, cursor.max_def_level);
 
                 let sliced = cursor.levels.slice_for_chunk(&window);
                 let (levels, values) = write_levels(&mut writer, &sliced)?;
@@ -730,7 +730,7 @@ impl ColumnChunkBuilder {
             // interned deliberately stay: every candidate for a span sees the
             // same values, so such an entry is a value that genuinely occurs in
             // the span, and a dictionary that is a superset of what its indices
-            // reference is valid. See `PAGE_API_DESIGN.md`.
+            // reference is valid.
             self.dictionary = take_dictionary(writer);
         }
         Ok(prepared)
@@ -1163,6 +1163,34 @@ mod tests {
         assert_eq!(ours, theirs);
     }
 
+    /// Nullable data: definition levels flow through the same seams, and the
+    /// output must still be byte-identical to `ArrowWriter`.
+    #[test]
+    fn single_candidate_nullable_is_byte_identical_to_arrow_writer() {
+        let values: Vec<Option<String>> = (0..40_000)
+            .map(|i| (i % 3 != 0).then(|| format!("v{}", i % 512)))
+            .collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let array: ArrayRef = Arc::new(StringArray::from(values));
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_statistics_enabled(EnabledStatistics::Page)
+                .set_data_page_row_count_limit(3_000)
+                .build(),
+        );
+
+        let ours = write_page_grain(
+            &schema,
+            std::slice::from_ref(&batch),
+            props.clone(),
+            |_| vec![Candidate::Dictionary],
+            |_| 0,
+        );
+        let theirs = write_arrow(&schema, std::slice::from_ref(&batch), props);
+        assert_eq!(ours, theirs, "page-grain output diverged from ArrowWriter");
+    }
+
     /// Racing candidates and picking the smallest must still round-trip
     /// exactly, and must actually pick more than one encoding across the file.
     #[test]
@@ -1268,7 +1296,96 @@ mod tests {
             .encode_page(&mut cursor, Candidate::Dictionary)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("no dictionary"), "{err}");
+        assert!(err.contains("dictionary"), "{err}");
+    }
+
+    /// The other half of dictionary-then-fallback: once indices pages exist the
+    /// dictionary object is retained (its page is owed at close), but asking to
+    /// encode with it again must fail at *encode* time, before the cursor moves.
+    #[test]
+    fn dictionary_after_owed_fallback_is_rejected_before_encoding() {
+        let values: Vec<String> = (0..6_000).map(|i| format!("v{}", i % 64)).collect();
+        let refs: Vec<&str> = values.iter().map(|s| s.as_str()).collect();
+        let (schema, batch) = string_batch(&refs);
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_data_page_row_count_limit(2_000)
+                .build(),
+        );
+
+        let parquet_schema = ArrowSchemaConverter::new().convert(&schema).unwrap();
+        let descr = parquet_schema.columns()[0].clone();
+        let mut chunk = ColumnChunkBuilder::new(descr, props).unwrap();
+        let leaf = compute_leaves(schema.field(0), batch.column(0))
+            .unwrap()
+            .remove(0);
+        let mut cursor = chunk.cursor(&leaf);
+
+        // An indices page first (the dictionary page is now owed), then a
+        // fallback page.
+        let page = chunk
+            .encode_page(&mut cursor, Candidate::Dictionary)
+            .unwrap();
+        assert!(page.is_dictionary_indices());
+        chunk.append(page).unwrap();
+        let page = chunk
+            .encode_page(&mut cursor, Candidate::Encoding(Encoding::PLAIN))
+            .unwrap();
+        chunk.append(page).unwrap();
+
+        // Asking for the dictionary again fails without consuming the cursor.
+        let before = cursor.levels_remaining();
+        let err = chunk
+            .encode_page(&mut cursor, Candidate::Dictionary)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dictionary"), "{err}");
+        assert_eq!(
+            cursor.levels_remaining(),
+            before,
+            "the failed encode must not move the cursor"
+        );
+
+        // The chunk is still usable and still owes (and writes) its dictionary page.
+        while !cursor.is_empty() {
+            let page = chunk
+                .encode_page(&mut cursor, Candidate::Encoding(Encoding::PLAIN))
+                .unwrap();
+            chunk.append(page).unwrap();
+        }
+        chunk.close().unwrap();
+    }
+
+    /// The two argument-shape rejections: an exhausted cursor, and
+    /// `Candidate::Dictionary` offered as an alternative.
+    #[test]
+    fn invalid_encode_arguments_are_rejected() {
+        let (schema, batch) = int_batch((0..100i64).collect());
+        let props = Arc::new(WriterProperties::builder().build());
+        let parquet_schema = ArrowSchemaConverter::new().convert(&schema).unwrap();
+        let descr = parquet_schema.columns()[0].clone();
+        let mut chunk = ColumnChunkBuilder::new(descr, props).unwrap();
+        let leaf = compute_leaves(schema.field(0), batch.column(0))
+            .unwrap()
+            .remove(0);
+        let mut cursor = chunk.cursor(&leaf);
+
+        let err = chunk
+            .encode_page_alternatives(&mut cursor, Candidate::Dictionary, &[Candidate::Dictionary])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("alternative"), "{err}");
+
+        let page = chunk
+            .encode_page(&mut cursor, Candidate::Dictionary)
+            .unwrap();
+        assert!(cursor.is_empty());
+        chunk.append(page).unwrap();
+        let err = chunk
+            .encode_page(&mut cursor, Candidate::Dictionary)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exhausted"), "{err}");
     }
 
     /// `dictionary_growth` is what makes candidates comparable: the indices
@@ -1497,6 +1614,68 @@ mod tests {
             |_| 0,
         );
         assert_eq!(ours2, theirs);
+    }
+
+    /// A repeated column whose records do not divide the pacing window evenly:
+    /// every page boundary must still land on a record boundary, including the
+    /// boundaries picked after the pacer has walked more than one window into
+    /// the leaf.
+    #[test]
+    fn variable_length_records_never_split_across_pages() {
+        use arrow_array::{Int32Array, ListArray};
+        use arrow_buffer::OffsetBuffer;
+
+        // One record of 4 values, then records of 3: record starts fall at
+        // 0, 4, 7, 10, ... so windows aligned to round numbers end mid-record.
+        let n = 2_000usize;
+        let lengths: Vec<usize> = (0..n).map(|i| if i == 0 { 4 } else { 3 }).collect();
+        let total: usize = lengths.iter().sum();
+        let values = Int32Array::from((0..total as i32).collect::<Vec<_>>());
+        let offsets = OffsetBuffer::from_lengths(lengths.iter().copied());
+        let field = Arc::new(Field::new("item", DataType::Int32, false));
+        let list = ListArray::new(field.clone(), offsets, Arc::new(values), None);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "l",
+            DataType::List(field),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list) as ArrayRef]).unwrap();
+
+        // A row budget that trips exactly at the end of the pacer's second
+        // window, which ends mid-record when window offsets are miscounted.
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_write_batch_size(100)
+                .set_data_page_row_count_limit(135)
+                .build(),
+        );
+
+        let mut level_boundaries = Vec::new();
+        let mut cumulative = 0u64;
+        let bytes = write_page_grain(
+            &schema,
+            std::slice::from_ref(&batch),
+            props,
+            |_| vec![Candidate::Dictionary],
+            |pages| {
+                cumulative += u64::from(pages[0].num_values());
+                level_boundaries.push(cumulative);
+                0
+            },
+        );
+
+        // Record starts sit at level 0 and 4 + 3k, so a page boundary is legal
+        // only at 4 + 3k (or the very end of the leaf).
+        for boundary in &level_boundaries {
+            assert!(
+                *boundary >= 4 && (*boundary - 4).is_multiple_of(3),
+                "page boundary at level {boundary} splits a record; boundaries: {level_boundaries:?}"
+            );
+        }
+        assert_eq!(*level_boundaries.last().unwrap() as usize, total);
+
+        let read = read_back(bytes);
+        assert_eq!(read.iter().map(|b| b.num_rows()).sum::<usize>(), n);
     }
 
     /// Index and chunk metadata are derived by the builder, so they must match
