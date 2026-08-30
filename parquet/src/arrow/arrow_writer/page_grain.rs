@@ -131,7 +131,9 @@ use crate::column::page_store::{InMemoryPageStoreFactory, PageStoreArgs, PageSto
 use crate::column::writer::encoder::{
     ColumnValueEncoder, DictionaryPage, DynDictionary, ValueAccumulators,
 };
-use crate::column::writer::{ColumnWriter, GenericColumnWriter, PreparedDataPage};
+use crate::column::writer::{
+    ColumnWriter, GenericColumnWriter, PageBoundaryAction, PreparedDataPage,
+};
 use crate::data_type::{
     BoolType, ByteArray, DoubleType, FixedLenByteArray, FixedLenByteArrayType, FloatType,
     Int32Type, Int64Type, Int96, Int96Type,
@@ -671,7 +673,14 @@ impl ColumnChunkBuilder {
         if let Candidate::Pinned(encoding) = candidate {
             pin_encoding(&mut writer, encoding, &self.descr)?;
         }
-        set_defer_page_flush(&mut writer, true, pacing);
+        set_page_boundary_action(
+            &mut writer,
+            if pacing {
+                PageBoundaryAction::Stop
+            } else {
+                PageBoundaryAction::Continue
+            },
+        );
         Ok(writer)
     }
 
@@ -787,8 +796,8 @@ macro_rules! dispatch_writer {
     };
 }
 
-fn set_defer_page_flush(writer: &mut ArrowColumnWriterImpl, defer: bool, stop_at_boundary: bool) {
-    dispatch_writer!(writer, w, w.set_defer_page_flush(defer, stop_at_boundary))
+fn set_page_boundary_action(writer: &mut ArrowColumnWriterImpl, action: PageBoundaryAction) {
+    dispatch_writer!(writer, w, w.set_page_boundary_action(action))
 }
 
 fn pin_encoding(

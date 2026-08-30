@@ -496,28 +496,32 @@ pub struct GenericColumnWriter<'a, E: ColumnValueEncoder> {
     /// (min, max)
     last_non_null_data_page_min_max: Option<(E::T, E::T)>,
 
-    /// When set, this writer never flushes a page or falls back from the
-    /// dictionary on its own: [`Self::write_batch_inner`] stops at the first
-    /// point where [`Self::should_add_data_page`] trips and reports how much it
-    /// consumed, leaving the flush decision to the caller.
+    /// What this writer does when the buffered values reach the page budget.
+    page_boundary_action: PageBoundaryAction,
+}
+
+/// What a [`GenericColumnWriter`] does when [`GenericColumnWriter::should_add_data_page`]
+/// trips mid-write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageBoundaryAction {
+    /// Flush the page, and fall back from the dictionary if that is due. The
+    /// default, and the only value the ordinary write path ever holds.
+    Flush,
+    /// Stop the write loop and report how many levels were consumed, without
+    /// flushing anything.
     ///
     /// This is what makes the page boundary an *output* of encoding rather than
-    /// an input: the same budget predicate the normal path uses is evaluated
-    /// against live encoder state, but instead of acting on it the writer hands
-    /// the split point back. Only the page-grain API
-    /// ([`crate::arrow::arrow_writer::page_grain`]) sets this; the default path
-    /// leaves it `false` and behaves exactly as before.
-    defer_page_flush: bool,
-
-    /// When set (only meaningful with [`Self::defer_page_flush`]), the write
-    /// loop *stops* at the first page boundary instead of merely declining to
-    /// act on it.
+    /// an input: the same budget predicate the default path acts on is evaluated
+    /// against live encoder state, but the split point is handed back instead.
+    /// Set by the page-grain API ([`crate::arrow::arrow_writer::page_grain`]) on
+    /// the candidate that *paces* a page.
+    Stop,
+    /// Keep encoding, and do not flush.
     ///
-    /// This is the difference between the candidate that paces a page and the
-    /// candidates that are handed the span it chose: the pacer stops where its
-    /// budget says, the others must encode the whole span so the resulting
-    /// pages describe the same rows.
-    stop_at_page_boundary: bool,
+    /// Set by the page-grain API on the candidates handed the span the pacer
+    /// chose: they must encode the whole of it, so that every page produced for
+    /// that span describes the same rows.
+    Continue,
 }
 
 /// A data page that has been fully assembled (levels encoded, values encoded,
@@ -648,16 +652,14 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             data_page_boundary_ascending: true,
             data_page_boundary_descending: true,
             last_non_null_data_page_min_max: None,
-            defer_page_flush: false,
-            stop_at_page_boundary: false,
+            page_boundary_action: PageBoundaryAction::Flush,
         }
     }
 
-    /// Put this writer into deferred-flush mode; see [`Self::defer_page_flush`]
-    /// and [`Self::stop_at_page_boundary`].
-    pub(crate) fn set_defer_page_flush(&mut self, defer: bool, stop_at_boundary: bool) {
-        self.defer_page_flush = defer;
-        self.stop_at_page_boundary = defer && stop_at_boundary;
+    /// Choose what this writer does at a page boundary; see
+    /// [`PageBoundaryAction`].
+    pub(crate) fn set_page_boundary_action(&mut self, action: PageBoundaryAction) {
+        self.page_boundary_action = action;
     }
 
     /// Whether the buffered values have reached the page budget.
@@ -828,7 +830,8 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
 
             // Deferred-flush mode: the page budget the normal path would have
             // acted on is instead reported back to the caller as a split point.
-            if self.stop_at_page_boundary && self.should_add_data_page() {
+            if self.page_boundary_action == PageBoundaryAction::Stop && self.should_add_data_page()
+            {
                 break;
             }
         }
@@ -1052,7 +1055,8 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             )?;
             values_consumed += written;
             sub_start = sub_end;
-            if self.stop_at_page_boundary && self.should_add_data_page() {
+            if self.page_boundary_action == PageBoundaryAction::Stop && self.should_add_data_page()
+            {
                 break;
             }
         }
@@ -1191,11 +1195,11 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
 
         self.page_metrics.num_buffered_values += num_levels as u32;
 
-        // Deferred-flush mode hands both decisions to the caller: the page split
-        // point is reported by `write_batch_inner`, and dictionary abandonment
-        // is the harness's to make via the shared dictionary object. A single
-        // predictable branch per mini-batch (not per value).
-        if self.defer_page_flush {
+        // Anything but `Flush` hands both decisions to the caller: the page
+        // split point is reported by `write_batch_inner`, and dictionary
+        // abandonment is the harness's to make via the shared dictionary object.
+        // A single predictable branch per mini-batch (not per value).
+        if self.page_boundary_action != PageBoundaryAction::Flush {
             return Ok(values_to_write);
         }
 
