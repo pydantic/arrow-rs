@@ -822,6 +822,11 @@ impl ParquetPushDecoder {
     /// [`ScanStage`], then by [`PlannedRange::first_row`]. For equal first
     /// rows, a dictionary page comes before the data pages it serves.
     ///
+    /// With [`FetchGranularity::Batch`] and a [`RowFilter`], the decoder runs
+    /// the predicates and decodes the output one window of rows at a time.
+    /// In a row group, ranges are then ordered by
+    /// [`PlannedRange::first_row`], then by [`ScanStage`].
+    ///
     /// If the decoder would return an error for a row group, for example
     /// because the row group index is not in the file, the plan ends before
     /// that row group. The decoder returns the error when it gets there.

@@ -28,6 +28,8 @@ use crate::arrow::arrow_reader::{ReadPlanBuilder, RowSelection};
 use crate::errors::ParquetError;
 use crate::file::metadata::page_index::RowGroupPageIndex;
 
+use super::FetchGranularity;
+use super::page_spans::{SelectedRows, SpanKind, column_page_spans};
 use super::reader_builder::{BudgetedReadPlan, ScanPlanConfig};
 use super::remaining::{NextRowGroup, RowGroupFrontier};
 
@@ -282,6 +284,12 @@ impl ScanPlan {
             ranges[stage_start..]
                 .sort_by_key(|p| (p.first_row, Reverse(p.last_row), p.range.start));
         }
+        // With batch granularity, the decoder runs the predicates and decodes
+        // the output one window of rows at a time, so it needs the ranges of
+        // all stages in row order.
+        if filtered && self.config.fetch_granularity == FetchGranularity::Batch {
+            ranges.sort_by_key(|p| (p.first_row, Reverse(p.last_row), p.stage, p.range.start));
+        }
         self.at_first_row_group = false;
         Ok(Some(ranges))
     }
@@ -333,134 +341,34 @@ impl RowGroupColumns<'_> {
         conditional: bool,
         out: &mut Vec<PlannedRange>,
     ) {
-        let entry = |range, first_row, last_row, kind| PlannedRange {
-            range,
-            first_row,
-            last_row,
-            row_group: self.row_group_idx,
-            column: column_idx,
-            kind,
-            stage,
-            conditional,
-        };
-        let row_group_rows =
-            self.first_row..self.first_row + self.rows.selected_before(self.row_count);
-
         let locations = self
             .page_index
             .and_then(|page_index| page_index.offset_index(column_idx))
-            .map(|offset_index| offset_index.page_locations())
-            .filter(|locations| !locations.is_empty());
-        let Some(locations) = locations else {
-            out.push(entry(
-                chunk,
-                row_group_rows.start,
-                row_group_rows.end,
-                PageKind::ColumnChunk,
-            ));
-            return;
-        };
-
-        // Without a selection the decoder reads every page. With one, it
-        // reads the pages `scan_ranges` returns, in page order.
-        let fetched = fetch_selection.map(|selection| selection.scan_ranges(locations));
-        let mut fetched = fetched.as_deref().map(|ranges| ranges.iter().peekable());
-
-        let dictionary_idx = out.len();
-        let first_data_offset = locations[0].offset as u64;
-        let has_dictionary = first_data_offset != chunk.start;
-        if has_dictionary {
-            out.push(entry(
-                chunk.start..first_data_offset,
-                row_group_rows.start,
-                row_group_rows.end,
-                PageKind::Dictionary,
-            ));
-        }
-
-        let mut data_rows: Option<Range<u64>> = None;
-        for (idx, location) in locations.iter().enumerate() {
-            let start = location.offset as u64;
-            if let Some(fetched) = fetched.as_mut()
-                && fetched.next_if(|range| range.start == start).is_none()
-            {
-                continue;
-            }
-            let raw_end = locations
-                .get(idx + 1)
-                .map(|next| next.first_row_index as usize)
-                .unwrap_or(self.row_count);
-            let first_row =
-                self.first_row + self.rows.selected_before(location.first_row_index as usize);
-            let last_row = self.first_row + self.rows.selected_before(raw_end);
-            out.push(entry(
-                start..start + location.compressed_page_size as u64,
-                first_row,
-                last_row,
-                PageKind::Data,
-            ));
-            data_rows = Some(match data_rows {
-                Some(rows) => rows.start.min(first_row)..rows.end.max(last_row),
-                None => first_row..last_row,
-            });
-        }
-
-        // The dictionary serves exactly the rows of the data pages read.
-        if let (true, Some(rows)) = (has_dictionary, data_rows) {
-            let dictionary = &mut out[dictionary_idx];
-            dictionary.first_row = rows.start;
-            dictionary.last_row = rows.end;
-        }
-    }
-}
-
-/// Counts the selected rows before a position in a row group.
-struct SelectedRows {
-    /// `(first raw row, selected rows before it, selected)` per selector.
-    /// `None` when every row is selected.
-    runs: Option<Vec<(usize, u64, bool)>>,
-}
-
-impl SelectedRows {
-    fn new(selection: Option<&RowSelection>, row_count: usize) -> Self {
-        let runs = selection.map(|selection| {
-            let mut runs = Vec::new();
-            let mut raw = 0;
-            let mut selected = 0;
-            for selector in selection.iter() {
-                if selector.row_count == 0 {
-                    continue;
-                }
-                runs.push((raw, selected, !selector.skip));
-                raw += selector.row_count;
-                if !selector.skip {
-                    selected += selector.row_count as u64;
-                }
-            }
-            // A selection shorter than the row group skips the trailing rows.
-            if raw < row_count {
-                runs.push((raw, selected, false));
-            }
-            runs
-        });
-        Self { runs }
-    }
-
-    /// The number of selected rows in `0..raw`.
-    fn selected_before(&self, raw: usize) -> u64 {
-        let Some(runs) = &self.runs else {
-            return raw as u64;
-        };
-        let idx = runs.partition_point(|(start, _, _)| *start < raw);
-        let Some(&(start, selected_before, selected)) = idx.checked_sub(1).map(|idx| &runs[idx])
-        else {
-            return 0;
-        };
-        if selected {
-            selected_before + (raw - start) as u64
-        } else {
-            selected_before
-        }
+            .map(|offset_index| offset_index.page_locations().as_slice());
+        let mut spans = vec![];
+        column_page_spans(
+            chunk,
+            locations,
+            fetch_selection,
+            self.rows,
+            self.row_count,
+            self.first_row,
+            &mut spans,
+        );
+        out.extend(spans.into_iter().map(|span| PlannedRange {
+            range: span.range,
+            first_row: span.first_row,
+            last_row: span.last_row,
+            row_group: self.row_group_idx,
+            column: column_idx,
+            kind: match span.kind {
+                SpanKind::Dictionary => PageKind::Dictionary,
+                SpanKind::Data => PageKind::Data,
+                SpanKind::ColumnChunk => PageKind::ColumnChunk,
+            },
+            stage,
+            conditional,
+        }));
     }
 }
 
@@ -688,7 +596,12 @@ mod tests {
             ),
         ];
         for (name, builder) in cases {
-            check_unfiltered(name, builder);
+            check_unfiltered(name, &builder);
+            // Batch granularity requests pages instead of column chunks: the
+            // same bytes.
+            check_unfiltered(name, || {
+                builder().with_fetch_granularity(FetchGranularity::Batch)
+            });
         }
     }
 
@@ -781,11 +694,38 @@ mod tests {
                 }
             };
             let plan: Vec<_> = builder().build().unwrap().scan_plan().collect();
-            let (requested, _) = demand(builder());
+            let (requested, rows) = demand(builder());
             assert!(
                 covers(&union(plan.iter().map(|p| p.range.clone())), &requested),
                 "limit {limit:?}: requested bytes are not planned"
             );
+
+            // With batch granularity the plan is ordered by rows, across
+            // stages, and still covers every requested byte.
+            let batch = || builder().with_fetch_granularity(FetchGranularity::Batch);
+            let batch_plan: Vec<_> = batch().build().unwrap().scan_plan().collect();
+            let (batch_requested, batch_rows) = demand(batch());
+            assert_eq!(batch_rows, rows);
+            assert!(
+                covers(
+                    &union(batch_plan.iter().map(|p| p.range.clone())),
+                    &batch_requested
+                ),
+                "limit {limit:?}: requested bytes are not planned"
+            );
+            for row_group in 0..2 {
+                let first_rows: Vec<_> = batch_plan
+                    .iter()
+                    .filter(|p| p.row_group == row_group)
+                    .map(|p| p.first_row)
+                    .collect();
+                assert!(first_rows.is_sorted(), "{first_rows:?}");
+            }
+            let mut sorted = plan.clone();
+            sorted.sort_by_key(|p| p.range.start);
+            let mut batch_sorted = batch_plan.clone();
+            batch_sorted.sort_by_key(|p| p.range.start);
+            assert_eq!(sorted, batch_sorted);
 
             for p in &plan {
                 let expected_stage = match p.column {
@@ -869,22 +809,5 @@ mod tests {
         // Only the first row group has been planned.
         assert!(plan.pending.as_slice().iter().all(|p| p.row_group == 0));
         assert_eq!(plan.next_row, 200);
-    }
-
-    #[test]
-    fn selected_rows_counts_selected_positions() {
-        let selection = RowSelection::from(vec![
-            RowSelector::skip(10),
-            RowSelector::select(5),
-            RowSelector::skip(3),
-            RowSelector::select(2),
-        ]);
-        let rows = SelectedRows::new(Some(&selection), 30);
-        let counts: Vec<_> = [0, 10, 12, 15, 18, 19, 20, 30]
-            .into_iter()
-            .map(|raw| rows.selected_before(raw))
-            .collect();
-        assert_eq!(counts, vec![0, 0, 2, 5, 5, 6, 7, 7]);
-        assert_eq!(SelectedRows::new(None, 30).selected_before(30), 30);
     }
 }

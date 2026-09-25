@@ -248,6 +248,8 @@ pub(crate) struct ScanPlanConfig {
     /// Predicate columns whose decoded values are cached for the output, if
     /// any. Their selection is expanded to batch boundaries when fetched.
     pub(crate) cache_projection: Option<ProjectionMask>,
+    /// How `try_decode` fetches row groups, which sets the decode order.
+    pub(crate) fetch_granularity: FetchGranularity,
 }
 
 /// Result of a state transition
@@ -1064,6 +1066,7 @@ impl RowGroupReaderBuilder {
             projection: self.projection.clone(),
             predicate_projections,
             cache_projection,
+            fetch_granularity: self.fetch_granularity,
         }
     }
 
