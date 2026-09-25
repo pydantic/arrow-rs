@@ -278,6 +278,10 @@ pub enum FetchGranularity {
     /// them. The decoder uses pushed bytes when it needs them, and releases
     /// them as described above.
     ///
+    /// When the decoder is built, including by [`ParquetPushDecoder::into_builder`],
+    /// it releases the pushed bytes that no row group it reads needs: for
+    /// example the bytes of row groups that a rebuilt decoder skips.
+    ///
     /// # Row-group boundaries
     ///
     /// When `try_decode` returns the last batch of a row group, the decoder
@@ -468,7 +472,7 @@ impl ParquetPushDecoderBuilder {
         );
 
         // Initialize the decoder with the configured options
-        let remaining_row_groups = RemainingRowGroups::new(
+        let mut remaining_row_groups = RemainingRowGroups::new(
             schema,
             parquet_metadata,
             row_group_plan,
@@ -476,6 +480,9 @@ impl ParquetPushDecoderBuilder {
             has_predicates,
             row_group_reader_builder,
         )?;
+        if fetch_granularity == FetchGranularity::Batch {
+            remaining_row_groups.release_unplanned_bytes();
+        }
 
         Ok(ParquetPushDecoder {
             state: ParquetDecoderState::ReadingRowGroup {
