@@ -23,6 +23,7 @@ mod incremental_tests;
 pub(crate) mod page_store;
 mod reader_builder;
 mod remaining;
+mod scan_plan;
 
 use crate::DecodeResult;
 pub use crate::arrow::arrow_reader::RowGroupSelection;
@@ -34,8 +35,10 @@ use crate::file::metadata::ParquetMetaData;
 pub use crate::util::push_buffers::PushBuffers;
 use arrow_array::RecordBatch;
 use bytes::Bytes;
-use reader_builder::{RowBudget, RowGroupReaderBuilder, RowGroupReaderBuilderParts};
+use reader_builder::{RowGroupReaderBuilder, RowGroupReaderBuilderParts};
 use remaining::{IncrementalStep, RemainingRowGroups, RemainingRowGroupsParts};
+use scan_plan::RowBudget;
+pub use scan_plan::{PageKind, PlannedRange, ScanPlan};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -776,6 +779,12 @@ impl ParquetPushDecoder {
         self.state.peek_next_row_group()
     }
 
+    /// Returns the byte ranges that this decoder may still read, in the order
+    /// that decoding needs them. See [`ScanPlan`].
+    pub fn scan_plan(&self) -> ScanPlan {
+        self.state.scan_plan()
+    }
+
     /// Decompose this decoder back into a [`ParquetPushDecoderBuilder`] for the
     /// row groups that have *not* yet been decoded.
     ///
@@ -1112,6 +1121,20 @@ impl ParquetDecoderState {
             // would require throwing that work away.
             ParquetDecoderState::DecodingRowGroup { .. } => false,
             ParquetDecoderState::Finished => false,
+        }
+    }
+
+    /// See [`ParquetPushDecoder::scan_plan`].
+    fn scan_plan(&self) -> ScanPlan {
+        match self {
+            ParquetDecoderState::ReadingRowGroup {
+                remaining_row_groups,
+            }
+            | ParquetDecoderState::DecodingRowGroup {
+                remaining_row_groups,
+                ..
+            } => remaining_row_groups.scan_plan(),
+            ParquetDecoderState::Finished => ScanPlan::empty(),
         }
     }
 
