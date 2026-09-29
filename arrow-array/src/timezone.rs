@@ -98,6 +98,46 @@ mod private {
         }
     }
 
+    impl Tz {
+        /// Returns `true` if this timezone's offset from UTC is zero at every instant.
+        ///
+        /// This holds for fixed offsets of zero (e.g. `+00:00`, `-00`, `+0000`) and
+        /// for the IANA aliases of UTC (e.g. `UTC`, `Etc/UTC`, `GMT`, `Zulu`).
+        /// Geographic zones such as `Europe/London` or `Africa/Abidjan` return
+        /// `false`, because their offset is zero for only part of the year or
+        /// part of their history.
+        ///
+        /// Converting between a timezone-naive timestamp and a timestamp in a
+        /// timezone for which this returns `true` never changes its value.
+        pub fn is_always_utc(&self) -> bool {
+            use chrono_tz::Tz as T;
+            match self.0 {
+                TzInner::Offset(offset) => offset.local_minus_utc() == 0,
+                TzInner::Timezone(tz) => matches!(
+                    tz,
+                    T::UTC
+                        | T::Etc__UTC
+                        | T::UCT
+                        | T::Etc__UCT
+                        | T::Universal
+                        | T::Etc__Universal
+                        | T::Zulu
+                        | T::Etc__Zulu
+                        | T::GMT
+                        | T::Etc__GMT
+                        | T::GMT0
+                        | T::Etc__GMT0
+                        | T::GMTPlus0
+                        | T::Etc__GMTPlus0
+                        | T::GMTMinus0
+                        | T::Etc__GMTMinus0
+                        | T::Greenwich
+                        | T::Etc__Greenwich
+                ),
+            }
+        }
+    }
+
     impl Display for Tz {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self.0 {
@@ -240,6 +280,53 @@ mod private {
         }
 
         #[test]
+        fn test_is_always_utc() {
+            for tz in [
+                "UTC",
+                "Etc/UTC",
+                "GMT",
+                "Etc/GMT",
+                "GMT+0",
+                "Etc/GMT-0",
+                "Zulu",
+                "Greenwich",
+                "+00:00",
+                "-0000",
+                "+00",
+            ] {
+                assert!(tz.parse::<Tz>().unwrap().is_always_utc(), "{tz}");
+            }
+            for tz in [
+                "Europe/London",
+                "Africa/Abidjan",
+                "Atlantic/Reykjavik",
+                "America/Los_Angeles",
+                "Etc/GMT+1",
+                "+00:01",
+                "-01",
+            ] {
+                assert!(!tz.parse::<Tz>().unwrap().is_always_utc(), "{tz}");
+            }
+        }
+
+        /// Checks `is_always_utc` against every zone chrono-tz knows, by sampling
+        /// its offset once a month from 1800 to 2200.
+        #[test]
+        fn test_is_always_utc_exhaustive() {
+            let instants: Vec<_> = (1800..2200)
+                .flat_map(|y| (1..=12).map(move |m| NaiveDate::from_ymd_opt(y, m, 1).unwrap()))
+                .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
+                .collect();
+            for zone in chrono_tz::TZ_VARIANTS {
+                let tz: Tz = zone.name().parse().unwrap();
+                let sampled_utc = instants
+                    .iter()
+                    .all(|t| tz.offset_from_utc_datetime(t).fix().local_minus_utc() == 0);
+                assert_eq!(tz.is_always_utc(), sampled_utc, "{}", zone.name());
+            }
+        }
+
+        #[test]
         fn test_timezone_display() {
             let test_cases = ["UTC", "America/Los_Angeles", "-08:00", "+05:30"];
             for &case in &test_cases {
@@ -276,6 +363,19 @@ mod private {
     /// An Arrow [`TimeZone`]
     #[derive(Debug, Copy, Clone)]
     pub struct Tz(FixedOffset);
+
+    impl Tz {
+        /// Returns `true` if this timezone's offset from UTC is zero at every instant.
+        ///
+        /// Without the `chrono-tz` feature only fixed offsets are supported, so
+        /// this holds for fixed offsets of zero (e.g. `+00:00`, `-00`, `+0000`).
+        ///
+        /// Converting between a timezone-naive timestamp and a timestamp in a
+        /// timezone for which this returns `true` never changes its value.
+        pub fn is_always_utc(&self) -> bool {
+            self.0.local_minus_utc() == 0
+        }
+    }
 
     impl FromStr for Tz {
         type Err = ArrowError;
@@ -354,5 +454,15 @@ mod tests {
 
         let err = "+9:00".parse::<Tz>().unwrap_err().to_string();
         assert!(err.contains("Invalid timezone"), "{}", err);
+    }
+
+    #[test]
+    fn test_is_always_utc_fixed_offset() {
+        for tz in ["+00:00", "-00:00", "+0000", "-00"] {
+            assert!(tz.parse::<Tz>().unwrap().is_always_utc(), "{tz}");
+        }
+        for tz in ["+00:01", "-01", "+0930"] {
+            assert!(!tz.parse::<Tz>().unwrap().is_always_utc(), "{tz}");
+        }
     }
 }
