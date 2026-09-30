@@ -41,8 +41,16 @@ use std::sync::Mutex;
 /// [`SerializedPageReader`]: crate::file::serialized_reader::SerializedPageReader
 #[derive(Debug, Default)]
 pub(crate) struct PageStore {
+    pages: Mutex<Pages>,
+}
+
+#[derive(Debug, Default)]
+struct Pages {
     /// file offset of the first byte -> bytes
-    pages: Mutex<BTreeMap<u64, Bytes>>,
+    by_start: BTreeMap<u64, Bytes>,
+    /// The total length of `by_start`, kept up to date so that
+    /// [`PageStore::buffered_bytes`] does not scan all pages.
+    bytes: u64,
 }
 
 impl PageStore {
@@ -51,17 +59,20 @@ impl PageStore {
     /// time only.
     pub(crate) fn insert(&self, range: Range<u64>, data: Bytes) {
         debug_assert_eq!(range.end - range.start, data.len() as u64);
-        self.pages
-            .lock()
-            .unwrap()
-            .entry(range.start)
-            .or_insert(data);
+        let mut pages = self.pages.lock().unwrap();
+        if let std::collections::btree_map::Entry::Vacant(entry) = pages.by_start.entry(range.start)
+        {
+            let len = data.len() as u64;
+            entry.insert(data);
+            pages.bytes += len;
+        }
     }
 
     /// Returns `true` if one entry contains all bytes of `range`.
     pub(crate) fn contains(&self, range: &Range<u64>) -> bool {
         let pages = self.pages.lock().unwrap();
         pages
+            .by_start
             .range(..=range.start)
             .next_back()
             .is_some_and(|(start, data)| start + data.len() as u64 >= range.end)
@@ -71,24 +82,26 @@ impl PageStore {
     /// if any.
     pub(crate) fn get(&self, start: u64) -> Option<Bytes> {
         let pages = self.pages.lock().unwrap();
-        let (entry_start, data) = pages.range(..=start).next_back()?;
+        let (entry_start, data) = pages.by_start.range(..=start).next_back()?;
         let offset = usize::try_from(start - entry_start).ok()?;
         (offset < data.len()).then(|| data.slice(offset..))
     }
 
     /// Remove all entries.
     pub(crate) fn clear(&self) {
-        self.pages.lock().unwrap().clear();
+        let mut pages = self.pages.lock().unwrap();
+        pages.by_start.clear();
+        pages.bytes = 0;
     }
 
     /// The total number of bytes in the store.
     pub(crate) fn buffered_bytes(&self) -> u64 {
-        self.pages
-            .lock()
-            .unwrap()
-            .values()
-            .map(|data| data.len() as u64)
-            .sum()
+        let pages = self.pages.lock().unwrap();
+        debug_assert_eq!(
+            pages.bytes,
+            pages.by_start.values().map(|d| d.len() as u64).sum::<u64>()
+        );
+        pages.bytes
     }
 }
 
