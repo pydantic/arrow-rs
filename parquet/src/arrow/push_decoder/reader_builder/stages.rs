@@ -74,6 +74,12 @@ impl StageSchedule {
         }
     }
 
+    /// Predicate columns whose decoded values are cached for the output, if
+    /// any.
+    pub(crate) fn cache_projection(&self) -> Option<&ProjectionMask> {
+        self.cache_projection.as_ref()
+    }
+
     /// What `stage` fetches.
     pub(crate) fn fetch(&self, stage: Stage) -> StageFetch<'_> {
         match stage {

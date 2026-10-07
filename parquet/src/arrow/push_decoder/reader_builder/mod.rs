@@ -432,8 +432,7 @@ impl RowGroupReaderBuilder {
                 }
 
                 // we have predicates to evaluate
-                let cache_projection =
-                    self.compute_cache_projection(row_group_info.row_group_idx, &filter);
+                let cache_projection = self.cache_projection(row_group_info.row_group_idx);
 
                 let cache_info = CacheInfo::new(
                     cache_projection,
@@ -760,20 +759,26 @@ impl RowGroupReaderBuilder {
     ///
     /// Returns the columns that are used by the filters *and* then used in the
     /// final projection, excluding any nested columns.
-    fn compute_cache_projection(&self, row_group_idx: usize, filter: &RowFilter) -> ProjectionMask {
-        let meta = self.metadata.row_group(row_group_idx);
-        let cache_projection = Self::compute_cache_projection_inner(
-            filter,
-            &self.projection,
-            &self.metadata,
-            self.max_predicate_cache_size,
-        );
-        match cache_projection {
-            Some(projection) => projection,
-            None => ProjectionMask::none(meta.columns().len()),
+    ///
+    /// The mask is computed once in [`Self::new`] and stored in the
+    /// [`StageSchedule`]; this only clones it (or builds an empty mask).
+    fn cache_projection(&self, row_group_idx: usize) -> ProjectionMask {
+        match self.stages.cache_projection() {
+            Some(projection) => projection.clone(),
+            None => {
+                let meta = self.metadata.row_group(row_group_idx);
+                ProjectionMask::none(meta.columns().len())
+            }
         }
     }
 
+    /// Computes the columns to cache: the union of all predicate projections
+    /// intersected with the output `projection`, excluding nested columns.
+    ///
+    /// Returns `None` if the predicate cache is disabled
+    /// (`max_predicate_cache_size == 0`), there are no predicates, or no
+    /// columns remain to be cached.
+    ///
     /// An associated function, so that [`Self::new`] can call it before the
     /// builder exists.
     fn compute_cache_projection_inner(
@@ -791,7 +796,8 @@ impl RowGroupReaderBuilder {
             cache_projection.union(predicate.projection());
         }
         cache_projection.intersect(projection);
-        // Exclude leaves belonging to roots that span multiple parquet leaves (i.e. nested columns)
+        // Exclude leaves belonging to nested (group) roots, including
+        // single-leaf groups
         cache_projection.without_nested_types(metadata.file_metadata().schema_descr())
     }
 
