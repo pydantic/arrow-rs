@@ -59,6 +59,16 @@ impl<S: Storage> Interner<S> {
     }
 
     /// Intern the value, returning the interned key, and if this was a new value
+    ///
+    /// This runs once per value written by a dictionary encoder, so the whole
+    /// call chain (this function, `HashTable::entry` and its probe loop) must
+    /// inline into the caller's loop. Without `#[inline]` here and hashbrown's
+    /// `inline-more` feature, each function has a single copy that rustc may place
+    /// in a different codegen unit from its caller, so whether it is inlined
+    /// depends on unrelated code elsewhere in the crate. An out-of-line call
+    /// reloads the hasher state and saves registers for every value, which made
+    /// writing low-cardinality columns 10-20% slower.
+    #[inline]
     pub fn intern(&mut self, value: &S::Value) -> S::Key {
         let hash = self.state.hash_one(value.as_bytes());
 
