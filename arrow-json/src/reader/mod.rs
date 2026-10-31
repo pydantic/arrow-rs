@@ -25,6 +25,13 @@
 //! parsing of sequences of one or more arbitrarily formatted JSON values, including
 //! but not limited to newline-delimited JSON.
 //!
+//! # Timestamps
+//!
+//! Timestamps are parsed with [`arrow_cast::parse::string_to_datetime`]. A
+//! timestamp without an explicit offset that falls in a daylight savings gap or
+//! overlap of the target timezone is resolved as described there, rather than
+//! returning an error.
+//!
 //! # Basic Usage
 //!
 //! [`Reader`] can be used directly with synchronous data sources, such as [`std::fs::File`]

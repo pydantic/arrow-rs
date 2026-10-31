@@ -42,6 +42,13 @@
 //! let batch = csv.next().unwrap().unwrap();
 //! ```
 //!
+//! # Timestamps
+//!
+//! Timestamps are parsed with [`arrow_cast::parse::string_to_datetime`]. A
+//! timestamp without an explicit offset that falls in a daylight savings gap or
+//! overlap of the target timezone is resolved as described there, rather than
+//! returning an error.
+//!
 //! # Example: Numeric calculations on CSV
 //! This code finds the maximum value in column 0 of a CSV file containing
 //! ```csv

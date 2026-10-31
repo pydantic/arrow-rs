@@ -28,12 +28,6 @@ use chrono::{DateTime, LocalResult, NaiveDateTime, Offset, TimeDelta, TimeZone};
 /// Returns the offset to use when interpreting `local` as a wall clock reading
 /// in `tz`, or `None` if it cannot be resolved.
 ///
-/// `None` is not expected in practice. With the current timezone database no
-/// reading reaches it, because every ambiguous or nonexistent reading resolves
-/// as described below. The `None` path is a safeguard against a future
-/// timezone database that breaks the assumptions of the gap handling. Callers
-/// then apply their usual error or null handling.
-///
 /// In an IANA timezone a wall clock reading does not always identify a unique
 /// instant, and this function picks one following the same rules as PostgreSQL
 /// and DuckDB:
@@ -55,6 +49,11 @@ use chrono::{DateTime, LocalResult, NaiveDateTime, Offset, TimeDelta, TimeZone};
 /// timezone whose transitions do not obey the assumptions given in the body
 /// (no gap longer than 24 hours, no two transitions closer than 24 hours), the
 /// result can be `None` or an incorrect offset.
+///
+/// `None` is therefore not expected in practice: with the current timezone
+/// database every ambiguous or nonexistent reading resolves as described
+/// above, and the `None` path is only a safeguard. Callers then apply their
+/// usual error or null handling.
 ///
 /// See <https://github.com/apache/arrow-rs/issues/11037> for the PostgreSQL and
 /// ICU (DuckDB) sources these rules are taken from.

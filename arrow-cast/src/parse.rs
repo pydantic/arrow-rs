@@ -171,10 +171,6 @@ impl TimestampParser {
 /// reading (the skipped hour when the clocks go forward) is shifted forward by
 /// the length of the gap.
 ///
-/// These rules also apply to the CSV and JSON readers, which call this
-/// function. They accept a timestamp in a daylight savings gap or overlap and
-/// resolve it as described above, rather than returning an error.
-///
 /// ```
 /// # use arrow_cast::parse::string_to_datetime;
 /// # use chrono::Utc;
