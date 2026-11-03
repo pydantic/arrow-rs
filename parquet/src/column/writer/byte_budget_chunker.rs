@@ -23,52 +23,6 @@ use crate::column::writer::encoder::ColumnValueEncoder;
 use crate::file::properties::ResolvedColumnProperties;
 use crate::schema::types::ColumnDescriptor;
 
-/// How [`write_granular_chunk`] should cut mini-batch windows in one chunk.
-///
-/// Cutting on exact value counts is the precise option and the expensive one:
-/// it roughly doubles the number of mini-batches on a nullable column, because
-/// the level:value ratio no longer rounds a window up to cover a second value.
-/// It is used only where that precision buys something.
-///
-/// [`write_granular_chunk`]: super::GenericColumnWriter::write_granular_chunk
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SubBatchStrategy {
-    /// Cut after exactly this many values, walking definition levels to find
-    /// the boundary.
-    ///
-    /// Used against the data page budget for encodings that compress a value
-    /// against its predecessor, where the round-up below costs whole values of
-    /// output: 16 MiB rather than 2 MiB for 128 values at one null in 16. See
-    /// [#10538] for the measurements.
-    ///
-    /// [#10538]: https://github.com/apache/arrow-rs/issues/10538
-    Values(usize),
-    /// Cut after this many levels: the value budget scaled by the chunk's
-    /// level:value ratio, rounded up.
-    ///
-    /// Used everywhere else, because everywhere else the round-up changes no
-    /// bytes — the *dictionary page* budget shrinks toward zero as the
-    /// dictionary fills, so a one-value budget is routine there for ordinary
-    /// values, and `PLAIN` and `DELTA_LENGTH_BYTE_ARRAY` values cost the same
-    /// wherever they land — while value-exact windows cost throughput
-    /// ([#10554]).
-    ///
-    /// The round-up must stay bounded for that price to be acceptable. The
-    /// level count alone does not bound it: the ratio is a chunk *average*,
-    /// so a window over a run of clustered values can hold far more than the
-    /// budget (28 values of 76 MiB followed by 996 nulls all land in a
-    /// 37-level window, [#11994]). Each window is therefore also capped at
-    /// `max_values` values, twice the value budget, so the page bound [#9972]
-    /// added holds whatever the null layout: two values per page rather than
-    /// one. The cap walks the window's definition levels, but adds no
-    /// mini-batches where nulls are evenly spread.
-    ///
-    /// [#9972]: https://github.com/apache/arrow-rs/pull/9972
-    /// [#10554]: https://github.com/apache/arrow-rs/pull/10554
-    /// [#11994]: https://github.com/apache/arrow-rs/issues/11994
-    Levels { levels: usize, max_values: usize },
-}
-
 /// Picks byte-budget-aware mini-batch sizes for one column.
 ///
 /// The parquet column writer checks the data page byte limit only *after*
@@ -140,9 +94,8 @@ impl ByteBudgetChunker {
     /// or the *dictionary* page while dictionary-encoding.
     ///
     /// `None` means the whole chunk fits in a single mini-batch — the common
-    /// case. `Some(_)` triggers granular sub-batching in
-    /// `write_batch_internal`; see [`SubBatchStrategy`] for why the data page and
-    /// dictionary page budgets get different windowing.
+    /// case. `Some(n)` triggers granular sub-batching in
+    /// `write_batch_internal`, cutting a window after every `n` values.
     ///
     /// While dictionary-encoding, the data page holds only small RLE indices,
     /// but the dictionary page accumulates the distinct values themselves —
@@ -165,14 +118,11 @@ impl ByteBudgetChunker {
         chunk_def: LevelDataRef<'_>,
         values_offset: usize,
         chunk_size: usize,
-    ) -> Option<SubBatchStrategy> {
+    ) -> Option<usize> {
         if chunk_size == 0 {
             return None;
         }
-        // The second element selects the windowing; see [`SubBatchStrategy`]. Only a
-        // constant data page budget under an encoding that compresses against
-        // the previous value is worth cutting exactly.
-        let (budget, value_exact) = if encoder.has_dictionary() {
+        let budget = if encoder.has_dictionary() {
             if self.static_dict_always_fits {
                 return None;
             }
@@ -181,15 +131,12 @@ impl ByteBudgetChunker {
             // An encoder that cannot size its dictionary page (`?`) leaves
             // the chunk unsplit.
             let used = encoder.estimated_dict_page_size()?;
-            (self.dict_page_byte_limit.saturating_sub(used), false)
+            self.dict_page_byte_limit.saturating_sub(used)
         } else {
             if self.static_always_fits {
                 return None;
             }
-            (
-                self.page_byte_limit,
-                encoder.compresses_against_previous_value(),
-            )
+            self.page_byte_limit
         };
         self.byte_budget_sub_batch::<E>(
             values,
@@ -198,7 +145,6 @@ impl ByteBudgetChunker {
             values_offset,
             chunk_size,
             budget,
-            value_exact,
         )
     }
 
@@ -217,8 +163,7 @@ impl ByteBudgetChunker {
         values_offset: usize,
         chunk_size: usize,
         budget: usize,
-        value_exact: bool,
-    ) -> Option<SubBatchStrategy> {
+    ) -> Option<usize> {
         // How many of this chunk's levels carry an actual value. For a
         // non-nullable, unrepeated column every level is a value, so
         // `value_count` is O(1) (`Absent`/`Uniform` def levels); only
@@ -246,28 +191,9 @@ impl ByteBudgetChunker {
             None => None,
             // All of the chunk's values fit in the budget — no sub-batching.
             Some(values_per_subbatch) if values_per_subbatch >= vals_in_chunk => None,
-            Some(values_per_subbatch) => {
-                // `count_values_within_byte_budget` never reports zero, but a
-                // zero-wide window would not advance `write_granular_chunk`.
-                let values_per_subbatch = values_per_subbatch.max(1);
-                Some(if value_exact {
-                    SubBatchStrategy::Values(values_per_subbatch)
-                } else {
-                    // Scale to a level count. Inexact on nullable chunks, and
-                    // deliberately so — see `SubBatchStrategy::Levels`.
-                    let levels_per_subbatch = if vals_in_chunk == chunk_size {
-                        values_per_subbatch
-                    } else {
-                        (values_per_subbatch * chunk_size)
-                            .div_ceil(vals_in_chunk)
-                            .max(1)
-                    };
-                    SubBatchStrategy::Levels {
-                        levels: chunk_size.min(levels_per_subbatch),
-                        max_values: values_per_subbatch.saturating_mul(2),
-                    }
-                })
-            }
+            // `count_values_within_byte_budget` never reports zero, but a
+            // zero-wide window would not advance `write_granular_chunk`.
+            Some(values_per_subbatch) => Some(values_per_subbatch.max(1)),
         }
     }
 }

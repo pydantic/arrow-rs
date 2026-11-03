@@ -55,7 +55,7 @@ mod byte_budget_chunker;
 pub(crate) mod encoder;
 pub(crate) mod min_max;
 
-use byte_budget_chunker::{ByteBudgetChunker, SubBatchStrategy};
+use byte_budget_chunker::ByteBudgetChunker;
 
 macro_rules! downcast_writer {
     ($e:expr, $i:ident, $b:expr) => {
@@ -680,7 +680,7 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
                         chunk_rep,
                     )?;
                 }
-                Some(sub_batch) => {
+                Some(values_per_subbatch) => {
                     values_offset += self.write_granular_chunk(
                         values,
                         values_offset,
@@ -688,7 +688,7 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
                         chunk_size,
                         chunk_def,
                         chunk_rep,
-                        sub_batch,
+                        values_per_subbatch,
                     )?;
                 }
             }
@@ -864,11 +864,8 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
     /// byte limit after each. This keeps the page size close to
     /// `data_page_size_limit` instead of overshooting it by a whole chunk.
     ///
-    /// [`SubBatchStrategy::Values`] windows are cut on value boundaries,
-    /// walking definition levels to find where the value budget is used up;
-    /// [`SubBatchStrategy::Levels`] windows are a fixed level count, capped
-    /// at a maximum number of values. See
-    /// [`SubBatchStrategy`] for which budget gets which and why.
+    /// Windows are cut after every `values_per_subbatch` values, walking
+    /// definition levels to find the boundary.
     ///
     /// For repeated/nested columns sub-batches then extend to the next
     /// `rep == 0` boundary so a record never spans data pages, matching the
@@ -890,40 +887,26 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         chunk_size: usize,
         chunk_def: LevelDataRef<'_>,
         chunk_rep: LevelDataRef<'_>,
-        sub_batch: SubBatchStrategy,
+        values_per_subbatch: usize,
     ) -> Result<usize> {
-        // The chunker always sizes a sub-batch to at least one value or one
-        // level, and a value-exact window spans at least one level, so each
-        // iteration below makes progress (`sub_end > sub_start`).
+        // The chunker always sizes a sub-batch to at least one value, and a
+        // window spans at least one level, so each iteration below makes
+        // progress (`sub_end > sub_start`).
         debug_assert!(
-            matches!(
-                sub_batch,
-                SubBatchStrategy::Values(n) | SubBatchStrategy::Levels { levels: n, max_values: _ }
-                    if n >= 1
-            ),
-            "chunker must size at least one value or level"
+            values_per_subbatch >= 1,
+            "chunker must size at least one value"
         );
         let max_def_level = self.descr.max_def_level();
         let mut values_consumed = 0;
         let mut sub_start = 0;
         while sub_start < chunk_size {
-            let window_end = match sub_batch {
-                SubBatchStrategy::Values(n) => {
-                    Self::window_end_for_values(chunk_def, chunk_size, max_def_level, sub_start, n)
-                }
-                SubBatchStrategy::Levels { levels, max_values } => {
-                    // Cap the ratio-sized window at `max_values` values so
-                    // clustered values cannot pile into one window.
-                    let level_end = (sub_start + levels).min(chunk_size);
-                    Self::window_end_for_values(
-                        chunk_def,
-                        level_end,
-                        max_def_level,
-                        sub_start,
-                        max_values,
-                    )
-                }
-            };
+            let window_end = Self::window_end_for_values(
+                chunk_def,
+                chunk_size,
+                max_def_level,
+                sub_start,
+                values_per_subbatch,
+            );
             let sub_end = match chunk_rep {
                 LevelDataRef::Materialized(levels) => {
                     // Extend the window to the next record boundary
