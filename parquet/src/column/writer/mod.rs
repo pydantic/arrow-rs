@@ -3413,20 +3413,11 @@ mod tests {
 
     #[test]
     fn test_column_writer_caps_page_size_with_sparse_nulls() {
-        // `PLAIN` keeps ratio-scaled windows, so a sparsely-null chunk puts
-        // *two* over-limit values on a page rather than one. That is the
-        // deliberate choice: value-exact windows would cut this to one, but
-        // `PLAIN` stores a value identically wherever it lands, so the output
-        // is byte for byte the same either way while the page count doubles.
-        //
-        // What has to hold is that the bound stays a small constant and does
-        // not scale with `write_batch_size` — the failure #9972 fixed, where
-        // a page took a whole mini-batch. A window spans
-        // `ceil(values * levels / values_in_chunk)` levels, which covers at
-        // most two values however sparse the nulls are, so two is the whole
-        // exposure. Assert it exactly: this test fails if the encoding gate
-        // on value-exact windows is dropped (pages would hold one value) as
-        // well as if the bound is lost (they would hold many).
+        // Windows are cut on exact value counts, so a sparsely-null chunk puts
+        // one over-limit value on each page however the nulls fall. What has
+        // to hold is that the bound stays one value and does not scale with
+        // `write_batch_size` — the failure #9972 fixed, where a page took a
+        // whole mini-batch.
         let value_size = 64 * 1024;
         let page_byte_limit = 16 * 1024;
         let num_values = 16;
@@ -3448,26 +3439,23 @@ mod tests {
         let pages =
             write_and_collect_pages::<ByteArrayType>(props, 1, 0, &data, Some(&def_levels), None);
 
-        // At most two values' payload on any page, and never a whole
-        // mini-batch's worth.
-        let upper_bound = 2 * value_size + 64;
+        // One value's payload on any page, plus at most the null before it.
+        let upper_bound = value_size + 64;
         for (size, n_levels) in &pages.data_pages {
             assert!(
                 *size <= upper_bound,
-                "page size {size} exceeds two-value bound ({upper_bound}B); pages {:?}",
+                "page size {size} exceeds one-value bound ({upper_bound}B); pages {:?}",
                 pages.data_pages,
             );
             assert!(
-                *n_levels <= 3,
-                "page holds {n_levels} levels, expected at most 3 (two values + a null); \
+                *n_levels <= 2,
+                "page holds {n_levels} levels, expected at most 2 (one value + a null); \
                  pages {:?}",
                 pages.data_pages,
             );
         }
-        // Two-level windows over 17 levels: eight pages carrying two levels
-        // and a ninth holding the remainder.
-        let num_levels: usize = num_values + 1;
-        assert_eq!(pages.data_pages.len(), num_levels.div_ceil(2));
+        // One page per value.
+        assert_eq!(pages.data_pages.len(), num_values);
     }
 
     #[test]
@@ -3736,9 +3724,9 @@ mod tests {
     fn test_column_writer_caps_dictionary_page_size_with_clustered_nulls() {
         // Regression test for #11994. Large distinct values followed by a run
         // of nulls: the chunk's average level:value ratio is ~36 levels per
-        // value, so a ratio-sized window over the leading values covers all
-        // of them. Each window must also be capped by value count, or every
-        // value lands in the dictionary page before its spill check runs.
+        // value, so a window sized from that ratio would cover all the
+        // leading values and land them in the dictionary page before its
+        // spill check runs. Windows are cut on value counts instead.
         let value_size = 64 * 1024;
         let num_values = 28;
         let num_nulls = 996;
@@ -3765,13 +3753,14 @@ mod tests {
             pages.dict_page_size > 0,
             "expected the column to dictionary-encode"
         );
-        // At most two values per window. Before the fix the dictionary page
-        // held all 28 values (~1.8 MiB).
+        // One value per window, so the dictionary spills after its first
+        // value. Before #11994 was fixed the dictionary page held all 28
+        // values (~1.8 MiB).
         assert!(
-            pages.dict_page_size <= 3 * value_size,
-            "dictionary page {} exceeds three values ({}B)",
+            pages.dict_page_size <= 2 * value_size,
+            "dictionary page {} exceeds two values ({}B)",
             pages.dict_page_size,
-            3 * value_size,
+            2 * value_size,
         );
     }
 
