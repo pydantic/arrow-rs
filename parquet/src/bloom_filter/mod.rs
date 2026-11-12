@@ -244,6 +244,22 @@ impl Block {
     }
 }
 
+impl Block {
+    /// Same result as [`Block::check`], but tests all 8 words without an early
+    /// exit. This has no data-dependent branch, so it is faster when many
+    /// hashes are checked in a loop.
+    #[cfg_attr(not(any(feature = "arrow", test)), expect(dead_code))]
+    #[inline(always)]
+    fn check_branch_free(&self, hash: u32) -> bool {
+        let mut missing = 0u32;
+        for (word, salt) in self.0.iter().zip(SALT) {
+            let bit = 1u32 << (hash.wrapping_mul(salt) >> 27);
+            missing |= !word & bit;
+        }
+        missing == 0
+    }
+}
+
 impl std::ops::Index<usize> for Block {
     type Output = u32;
 
@@ -543,7 +559,7 @@ impl Sbbf {
     /// (for example, a columnar hash of a multi-column key). [`Self::check`]
     /// only finds values whose hashes were computed as the Parquet
     /// specification requires (xxHash64, seed 0, of the plain encoding); use
-    /// [`Self::check_hash`] with the same hash function instead.
+    /// [`Self::check_hashes`] with the same hash function instead.
     pub fn insert_hash(&mut self, hash: u64) {
         let block_index = self.hash_to_block_index(hash);
         self.0[block_index].insert(hash as u32)
@@ -562,14 +578,31 @@ impl Sbbf {
         self.check_hash(hash_as_bytes(value))
     }
 
-    /// Checks a precomputed 64-bit hash (see [`Self::insert_hash`]).
-    ///
-    /// May return true for a hash that was never inserted ("false
-    /// positive"), but always returns false for a hash that was not
-    /// inserted.
-    pub fn check_hash(&self, hash: u64) -> bool {
+    /// Check if a hash is in the filter. May return
+    /// true for values that was never inserted ("false positive")
+    /// but will always return false if a hash has not been inserted.
+    fn check_hash(&self, hash: u64) -> bool {
         let block_index = self.hash_to_block_index(hash);
         self.0[block_index].check(hash as u32)
+    }
+
+    /// Same result as [`Self::check_hash`], without data-dependent branches.
+    #[cfg_attr(not(any(feature = "arrow", test)), expect(dead_code))]
+    #[inline(always)]
+    fn check_hash_branch_free(&self, hash: u64) -> bool {
+        let block_index = self.hash_to_block_index(hash);
+        self.0[block_index].check_branch_free(hash as u32)
+    }
+
+    /// Checks precomputed 64-bit hashes (see [`Self::insert_hash`]) in bulk,
+    /// without data-dependent branches.
+    ///
+    /// Bit `i` of the result is set if `hashes[i]` may be in the filter.
+    #[cfg(feature = "arrow")]
+    pub fn check_hashes(&self, hashes: &[u64]) -> arrow_buffer::BooleanBuffer {
+        arrow_buffer::BooleanBuffer::collect_bool(hashes.len(), |i| {
+            self.check_hash_branch_free(hashes[i])
+        })
     }
 
     /// Adds the values of `other` to this filter, so that afterwards it
@@ -916,16 +949,37 @@ mod tests {
             by_hash.insert_hash(hash_as_bytes(&i));
         }
         assert_eq!(bitset(&by_value), bitset(&by_hash));
-        for i in 0..5000u64 {
-            assert_eq!(by_value.check(&i), by_hash.check_hash(hash_as_bytes(&i)));
-        }
-        assert!((0..200u64).all(|i| by_hash.check_hash(hash_as_bytes(&i))));
     }
 
     fn bitset(f: &Sbbf) -> Vec<u8> {
         let mut out = vec![];
         f.write_bitset(&mut out).unwrap();
         out
+    }
+
+    #[test]
+    fn test_branch_free_check_matches_check() {
+        let mut filter = Sbbf::new_with_num_of_bytes(256);
+        for i in 0..200u64 {
+            filter.insert(&(i * 7));
+        }
+        for i in 0..5000u64 {
+            let h = hash_as_bytes(&i);
+            assert_eq!(filter.check_hash(h), filter.check_hash_branch_free(h));
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn test_check_hashes_matches_check_hash() {
+        let hashes: Vec<u64> = (0..5000u64).map(|i| hash_as_bytes(&i)).collect();
+        let mut filter = Sbbf::new_with_num_of_bytes(256);
+        insert_all(&mut filter, &hashes[..200]);
+        let result = filter.check_hashes(&hashes);
+        for (i, &h) in hashes.iter().enumerate() {
+            assert_eq!(result.value(i), filter.check_hash(h));
+        }
+        assert!((0..200).all(|i| result.value(i)));
     }
 
     #[test]
