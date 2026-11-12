@@ -601,9 +601,13 @@ impl Sbbf {
 
     /// Checks precomputed 64-bit hashes (see [`Self::insert_hashes`]).
     ///
-    /// Bit `i` of the result is set if `hashes[i]` may be in the filter. The
-    /// check has no data-dependent branches, which is much faster than
-    /// checking one hash at a time.
+    /// Bit `i` of the result is set if `hashes[i]` may be in the filter.
+    ///
+    /// Each check tests all 8 bits of its block without an early exit, so
+    /// it has no data-dependent branches. This is typically faster than
+    /// checking one hash at a time when hits and misses are mixed (and the
+    /// branch predictor cannot learn the pattern), and slightly slower when
+    /// nearly every hash misses, where the early exit pays off.
     #[cfg(feature = "arrow")]
     pub fn check_hashes(&self, hashes: &[u64]) -> arrow_buffer::BooleanBuffer {
         arrow_buffer::BooleanBuffer::collect_bool(hashes.len(), |i| {
@@ -621,9 +625,18 @@ impl Sbbf {
     /// inserting the values of both filters into one filter and folding it
     /// to this size. This lets independent filters (for example, one per
     /// thread) be built and then merged.
+    ///
+    /// Both filters must have been populated with the same hash function
+    /// (the Parquet xxHash64 used by [`Self::insert`], or the same function
+    /// used for [`Self::insert_hashes`]); otherwise the result is
+    /// meaningless. This cannot be checked.
+    ///
+    /// Returns an error if the sizes are incompatible, including if this
+    /// filter has no blocks.
     pub fn union(&mut self, other: &Sbbf) -> Result<(), ParquetError> {
         let (len, other_len) = (self.0.len(), other.0.len());
-        if other_len < len || other_len % len != 0 {
+        // `checked_rem` also rejects an empty `self` (`len == 0`).
+        if other_len < len || other_len.checked_rem(len) != Some(0) {
             return Err(ParquetError::General(format!(
                 "Cannot union a bloom filter of {other_len} blocks into one of {len} blocks"
             )));
@@ -988,6 +1001,16 @@ mod tests {
         assert_eq!(bitset(&small), bitset(&expected));
         // a smaller filter cannot be unioned into a larger one
         assert!(whole.clone().union(&small).is_err());
+    }
+
+    #[test]
+    fn test_union_empty_filter_is_error() {
+        let mut empty = Sbbf::new(&[]);
+        assert_eq!(empty.num_blocks(), 0);
+        let other = Sbbf::new_with_num_of_bytes(1024);
+        assert!(empty.union(&other).is_err());
+        assert!(empty.union(&Sbbf::new(&[])).is_err());
+        assert!(other.clone().union(&empty).is_err());
     }
 
     #[test]
