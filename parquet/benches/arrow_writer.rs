@@ -25,7 +25,9 @@ use arrow::datatypes::*;
 use arrow::util::bench_util::{create_f16_array, create_f32_array, create_f64_array};
 use arrow::util::test_util::seedable_rng;
 use arrow::{record_batch::RecordBatch, util::data_gen::*};
-use arrow_array::builder::{FixedSizeBinaryBuilder, Int32Builder, ListBuilder, StringBuilder};
+use arrow_array::builder::{
+    FixedSizeBinaryBuilder, Int32Builder, ListBuilder, StringBuilder, StringViewBuilder,
+};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Decimal128Array, DictionaryArray, FixedSizeBinaryArray,
     Float64Array, Int8Array, Int32Array, Int64Array, LargeBinaryArray, ListArray,
@@ -1660,6 +1662,143 @@ fn bench_all_writers(c: &mut Criterion) {
     }
 }
 
+/// Placement of the present values in a sparse column.
+#[derive(Clone, Copy)]
+enum SparseLayout {
+    /// Each row is present with probability 1%, independently.
+    Random,
+    /// The first 1% of the rows are present. The rest are null.
+    Clustered,
+}
+
+/// `size` optional strings of `value_len` bytes, about 1% of them present.
+fn create_sparse_strings(
+    size: usize,
+    value_len: usize,
+    layout: SparseLayout,
+) -> Vec<Option<String>> {
+    let mut rng = seedable_rng();
+    (0..size)
+        .map(|i| {
+            let present = match layout {
+                SparseLayout::Random => rng.random_bool(0.01),
+                SparseLayout::Clustered => i < size / 100,
+            };
+            present.then(|| {
+                (&mut rng)
+                    .sample_iter(Alphanumeric)
+                    .take(value_len)
+                    .map(char::from)
+                    .collect()
+            })
+        })
+        .collect()
+}
+
+fn create_sparse_string_bench_batch(
+    size: usize,
+    value_len: usize,
+    layout: SparseLayout,
+) -> Result<RecordBatch> {
+    let array: StringArray = create_sparse_strings(size, value_len, layout)
+        .into_iter()
+        .collect();
+    Ok(RecordBatch::try_from_iter([(
+        "col",
+        Arc::new(array) as ArrayRef,
+    )])?)
+}
+
+/// As [`create_sparse_string_bench_batch`], but as a `Utf8View` column.
+///
+/// Values longer than 12 bytes all live in one data buffer. That makes the
+/// largest data buffer a loose bound on the length of one value. Shorter
+/// values are inline in the views, so the array has no data buffer.
+fn create_sparse_string_view_bench_batch(
+    size: usize,
+    value_len: usize,
+    layout: SparseLayout,
+) -> Result<RecordBatch> {
+    let strings = create_sparse_strings(size, value_len, layout);
+    let data_bytes: usize = strings.iter().flatten().map(String::len).sum();
+    let mut builder = StringViewBuilder::with_capacity(size)
+        .with_fixed_block_size(data_bytes.max(1).try_into().unwrap());
+    for s in &strings {
+        builder.append_option(s.as_deref());
+    }
+    let array = builder.finish();
+    assert_eq!(array.data_buffers().len(), usize::from(value_len > 12));
+    Ok(RecordBatch::try_from_iter([(
+        "col",
+        Arc::new(array) as ArrayRef,
+    )])?)
+}
+
+/// Writes one nullable string column in which 99% of the rows are null.
+///
+/// A mini-batch of such a column holds about ten values, so the writer's
+/// per-mini-batch overhead dominates the encoding cost. Each group isolates
+/// one array representation, because the byte-budget chunker sizes them
+/// differently:
+///
+/// * `sparse_string`: `Utf8`, 8-byte values, random nulls.
+/// * `sparse_string_clustered`: `Utf8`, 8-byte values, all values first.
+/// * `sparse_string_view_inline`: `Utf8View`, 8-byte (inline) values, random
+///   nulls.
+/// * `sparse_string_view_shared_buffer`: `Utf8View`, 32-byte values in one
+///   data buffer, random nulls.
+fn bench_sparse_byte_array_writers(c: &mut Criterion) {
+    const ROWS: usize = 1024 * 1024;
+    use SparseLayout::{Clustered, Random};
+
+    type MakeBatch = fn() -> RecordBatch;
+    let batches: [(&str, MakeBatch); 4] = [
+        ("sparse_string", || {
+            create_sparse_string_bench_batch(ROWS, 8, Random).unwrap()
+        }),
+        ("sparse_string_clustered", || {
+            create_sparse_string_bench_batch(ROWS, 8, Clustered).unwrap()
+        }),
+        ("sparse_string_view_inline", || {
+            create_sparse_string_view_bench_batch(ROWS, 8, Random).unwrap()
+        }),
+        ("sparse_string_view_shared_buffer", || {
+            create_sparse_string_view_bench_batch(ROWS, 32, Random).unwrap()
+        }),
+    ];
+
+    let plain = WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .set_encoding(Encoding::PLAIN)
+        .build();
+    let dictionary = WriterProperties::builder()
+        .set_dictionary_enabled(true)
+        .build();
+    let plain_write_batch_64 = WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .set_encoding(Encoding::PLAIN)
+        .set_write_batch_size(64)
+        .build();
+
+    for (batch_name, make_batch) in batches {
+        let mut group = c.benchmark_group(batch_name);
+        group.throughput(Throughput::Elements(ROWS as u64));
+        // Build the input only if the filter selects a case of this group.
+        let batch = OnceCell::new();
+        for (prop_name, prop) in [
+            ("plain", &plain),
+            ("dictionary", &dictionary),
+            ("plain_write_batch_64", &plain_write_batch_64),
+        ] {
+            group.bench_function(prop_name, |b| {
+                let batch = batch.get_or_init(make_batch);
+                write_batch_with_option(b, batch, Some(prop.clone())).unwrap()
+            });
+        }
+        group.finish();
+    }
+}
+
 /// Writes BYTE_ARRAY columns of *small* string values with `DELTA_BYTE_ARRAY`,
 /// with `PLAIN` on the same data as a baseline.
 ///
@@ -2057,6 +2196,7 @@ fn bench_ndv(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_all_writers,
+    bench_sparse_byte_array_writers,
     bench_small_delta_byte_array_writers,
     bench_delta_byte_array_writers,
     bench_ndv,
